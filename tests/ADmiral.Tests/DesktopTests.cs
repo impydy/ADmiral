@@ -262,6 +262,28 @@ public sealed class DesktopDataDirTests
         Assert.Equal("x", DesktopLogic.ParseArgs(["--home=x"]).Home);
         Assert.Throws<ArgumentException>(() => DesktopLogic.ParseArgs(["--home"]));
         Assert.Throws<ArgumentException>(() => DesktopLogic.ParseArgs(["--home", "--self-test"]));
+        Assert.True(DesktopLogic.ParseArgs(["--elevated"]).Elevated);
+    }
+
+    [Fact]
+    public void WindowAlwaysRunsElevated()
+    {
+        DesktopArgs P(params string[] a) => DesktopLogic.ParseArgs(a);
+        Assert.Equal(DesktopLogic.Elevation.Run, DesktopLogic.ElevationNeeded(P(), isElevated: true));
+        Assert.Equal(DesktopLogic.Elevation.Restart, DesktopLogic.ElevationNeeded(P(), isElevated: false));
+        Assert.Equal(DesktopLogic.Elevation.Restart, DesktopLogic.ElevationNeeded(P("--debug"), isElevated: false));
+        // the elevated restart that is still not elevated (UAC off, standard user): refuse instead of looping
+        Assert.Equal(DesktopLogic.Elevation.Refuse, DesktopLogic.ElevationNeeded(P("--elevated"), isElevated: false));
+        // the service (its account was granted the data folder) and the CI checks never restart
+        Assert.Equal(DesktopLogic.Elevation.Run, DesktopLogic.ElevationNeeded(P("--retry-service"), isElevated: false));
+        Assert.Equal(DesktopLogic.Elevation.Run, DesktopLogic.ElevationNeeded(P("--self-test"), isElevated: false));
+        Assert.Equal(DesktopLogic.Elevation.Run, DesktopLogic.ElevationNeeded(P("--ui-test"), isElevated: false));
+
+        Assert.Equal(new[] { "--home", @"D:\x y", "--elevated" }, DesktopLogic.ElevatedArgs(["--home", @"D:\x y"]));
+        Assert.Equal(new[] { "--elevated" }, DesktopLogic.ElevatedArgs(["--elevated"]));
+        var text = DesktopLogic.NeedAdminText();
+        Assert.Contains("rendszergazda", text);
+        Assert.Contains("administrator", text);
     }
 
     [Fact]
@@ -364,6 +386,28 @@ public sealed class DesktopBridgeTests
         public void OpenFolder(string path) => Folders.Add(path);
         public void OpenUrl(Uri url) => Urls.Add(url);
         public void Quit() => Quitted = true;
+        public List<string> Themes { get; } = [];
+        public void SetTheme(string theme) => Themes.Add(theme);
+    }
+
+    [Fact]
+    public void SetThemeRepaintsTheTitleBar()
+    {
+        using var tmp = new CoreTemp();
+        var shell = new FakeShell(null);
+        var b = new DesktopBridge(shell, tmp.Path);
+        Assert.True(JsonNode.Parse(b.Handle("""{"id": 1, "method": "set_theme", "args": ["dark"]}"""))!["ok"]!.GetValue<bool>());
+        Assert.True(JsonNode.Parse(b.Handle("""{"id": 2, "method": "set_theme", "args": ["system"]}"""))!["ok"]!.GetValue<bool>());
+        Assert.False(JsonNode.Parse(b.Handle("""{"id": 3, "method": "set_theme", "args": ["pink"]}"""))!["ok"]!.GetValue<bool>());
+        Assert.Equal(["dark", "system"], shell.Themes);
+
+        Assert.True(DesktopLogic.TitleBarDark("dark", windowsDark: false));
+        Assert.False(DesktopLogic.TitleBarDark("light", windowsDark: true));
+        Assert.True(DesktopLogic.TitleBarDark("system", windowsDark: true));
+        Assert.False(DesktopLogic.TitleBarDark("system", windowsDark: false));
+        Assert.True(DesktopLogic.TitleBarDark(null, windowsDark: true));
+        Assert.Equal((0x2B2B2B, 0xE8E8E8), DesktopLogic.TitleBarColors(dark: true));
+        Assert.Equal((0xFFFFFF, 0x1B1B1B), DesktopLogic.TitleBarColors(dark: false));
     }
 
     [Fact]
@@ -414,7 +458,7 @@ public sealed class DesktopBridgeTests
     [Fact]
     public void ExposesExactlyThePythonBridgeMethods()
     {
-        Assert.Equal(["open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file"],
+        Assert.Equal(["open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file", "set_theme"],
                      DesktopLogic.BridgeMethods.Order(StringComparer.Ordinal));
         using var tmp = new CoreTemp();
         var b = new DesktopBridge(new FakeShell(null), tmp.Path, remoteAssist: _ => { }, logFolder: () => tmp.Path);

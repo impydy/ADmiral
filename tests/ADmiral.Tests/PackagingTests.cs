@@ -91,6 +91,23 @@ public sealed class PackagingTests : IDisposable
         Assert.Contains("DesktopLogic.AddDataUser(exeDir, \"*\" + sid.Value)", install);
     }
 
+    [Fact]
+    public void InstallerShowsTheGplNoticeNotAnEula()
+    {
+        // ADmiral is GPL-3.0: an information page (no "I accept"), the full text installed next to the program
+        Assert.DoesNotContain("LicenseFile", Iss);
+        Assert.Contains("InfoBeforeFile=license-en.txt", Iss);
+        Assert.Contains(@"InfoBeforeFile: ""license-hu.txt""", Iss);
+        Assert.Contains(@"Source: ""..\LICENSE""; DestDir: ""{app}""; DestName: ""LICENSE.txt""", Iss);
+        foreach (var name in new[] { "license-hu.txt", "license-en.txt" })
+        {
+            var text = File.ReadAllText(Path.Combine(RepoRoot.Path, "packaging", name));
+            Assert.Contains("GNU General Public License", text);
+            Assert.Contains("https://github.com/impydy/ADmiral", text);
+        }
+        Assert.Contains("GNU GENERAL PUBLIC LICENSE", File.ReadAllText(Path.Combine(RepoRoot.Path, "LICENSE")));
+    }
+
     [PwshFact]
     public void BuildScriptParses() =>
         PowerShellTests.AssertParses(File.ReadAllText(Path.Combine(RepoRoot.Path, "packaging", "build.ps1")), _tmp);

@@ -4,7 +4,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <!-- normal user rights; installing the service / updating asks for elevation where needed -->
+        <!-- asInvoker on purpose: the retry service runs this exe under its own account. The window restarts itself
+             elevated at start-up (Program.cs), so it always runs with administrator rights. -->
         <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>

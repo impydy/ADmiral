@@ -151,6 +151,8 @@ function applyTheme(theme) {
   S.theme = theme || "system";
   const dark = S.theme === "dark" || (S.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
+  // the desktop window repaints its title bar to match (the bridge exists only in ADmiral.exe)
+  if (isDesktop() && window.pywebview.api.set_theme) window.pywebview.api.set_theme(S.theme).catch(() => {});
 }
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => applyTheme(S.theme));
 
@@ -1530,6 +1532,8 @@ function renderSettings(el) {
             ${pw("proxy-pw", t("s.proxy_pw"), cfg.proxy.password_set)}
           </div>
           <div class="faint">${esc(t("s.proxy_hint"))}</div>
+          <div class="chk" style="gap:10px"><button class="btn" id="proxy-test" type="button" ${cfg.editable ? "" : "disabled"}>${icon("ping", 16)}${esc(t("s.proxy_test"))}</button></div>
+          <div id="proxy-test-out" class="muted" style="white-space:pre-line"></div>
         </div></div>
       <div class="section"><h3>${t("s.retry")}</h3><div class="in">
           <div class="grid2">${inp("retry-interval", t("s.retry_interval"), cfg.retry.interval_minutes, 'type="number" min="1" max="1440"')}</div>
@@ -1773,6 +1777,15 @@ function renderSettings(el) {
       const u = await api("GET", "/api/updates");
       $("#upd-status").innerHTML = u.error ? `<span class="st-bad">${esc(u.error)}</span>`
         : u.fetched_at ? esc(tText("s.upd_ok", { when: fmtDate(u.fetched_at), n: u.builds, months: u.months.join(", ") })) : esc(t("s.upd_never"));
+    });
+    $("#proxy-test").onclick = () => guard(async () => {
+      const out = $("#proxy-test-out");
+      out.className = "muted";
+      out.textContent = t("s.proxy_testing");
+      await api("PUT", "/api/settings", collect());      // test the proxy just typed in
+      const r = await api("POST", "/api/proxy/test");
+      out.className = r.ok ? "st-ok" : "st-bad";
+      out.textContent = r.message;
     });
     $("#upd-run").onclick = () => guard(async () => {
       await api("PUT", "/api/settings", collect());      // use the proxy just typed in

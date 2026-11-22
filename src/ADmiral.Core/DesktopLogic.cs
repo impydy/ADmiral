@@ -36,6 +36,8 @@ public sealed record DesktopEnv(string? ExeDir, Func<string, string?> GetEnv, bo
 public sealed record DesktopArgs(bool SelfTest = false, bool UiTest = false, bool RetryService = false, string? Home = null)
 {
     public bool Debug { get; init; }
+    /// <summary>This process is the elevated restart of a non-elevated start (<c>--elevated</c>): never restart again.</summary>
+    public bool Elevated { get; init; }
 }
 
 /// <summary>What the bridge needs from the window (WinForms in the app, a fake in tests).</summary>
@@ -52,6 +54,9 @@ public interface IDesktopShell
 
     /// <summary>Close the window.</summary>
     void Quit();
+
+    /// <summary>The page's theme changed ("system", "light" or "dark"): repaint the window frame (title bar) to match.</summary>
+    void SetTheme(string theme);
 }
 
 public static partial class DesktopLogic
@@ -318,6 +323,39 @@ public static partial class DesktopLogic
         return Convert.ToBase64String(raw).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     }
 
+    /// <summary>Marks the elevated restart of the window (see <see cref="ElevationNeeded"/>).</summary>
+    public const string ElevatedFlag = "--elevated";
+
+    /// <summary>What a start of ADmiral.exe must do about administrator rights. The window always runs elevated: the
+    /// data folder (C:\ProgramData\ADmiral) is only open to SYSTEM, Administrators and the accounts the installer
+    /// granted, so a normal user - or an administrator's filtered UAC token - cannot use it. The retry service (its
+    /// account was granted the folder) and the CI checks (--self-test / --ui-test) are never restarted.</summary>
+    public enum Elevation { Run, Restart, Refuse }
+
+    public static Elevation ElevationNeeded(DesktopArgs args, bool isElevated)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        if (isElevated || args.RetryService || args.SelfTest || args.UiTest) return Elevation.Run;
+        // already restarted once and still not elevated (UAC switched off for a standard user): no loop
+        return args.Elevated ? Elevation.Refuse : Elevation.Restart;
+    }
+
+    /// <summary>The arguments of the elevated restart: the same ones, plus <see cref="ElevatedFlag"/>.</summary>
+    public static List<string> ElevatedArgs(IReadOnlyList<string> argv)
+    {
+        ArgumentNullException.ThrowIfNull(argv);
+        var list = argv.ToList();
+        if (!list.Contains(ElevatedFlag)) list.Add(ElevatedFlag);
+        return list;
+    }
+
+    /// <summary>"Needs administrator rights" in both languages (the settings, and so the language, are not read yet).</summary>
+    public static string NeedAdminText()
+    {
+        var (hu, en) = I18n.Messages["err.need_admin"];
+        return hu + "\n\n" + en;
+    }
+
     /// <summary>Parse ADmiral.exe's arguments (<c>--self-test</c>, <c>--ui-test</c>, <c>--retry-service</c>,
     /// <c>--home &lt;dir&gt;</c>, <c>--debug</c>). Unknown arguments are ignored (a shortcut may pass anything);
     /// <c>--home</c> without a value throws <see cref="ArgumentException"/>.</summary>
@@ -333,6 +371,7 @@ public static partial class DesktopLogic
                 case "--ui-test": a = a with { UiTest = true }; break;
                 case RetryServiceFlag: a = a with { RetryService = true }; break;
                 case "--debug": a = a with { Debug = true }; break;
+                case ElevatedFlag: a = a with { Elevated = true }; break;
                 case "--home":
                     if (i + 1 >= argv.Count || argv[i + 1].Length == 0 || argv[i + 1].StartsWith("--", StringComparison.Ordinal))
                         throw new ArgumentException("--home needs a folder");
@@ -502,7 +541,23 @@ public static partial class DesktopLogic
     // ------------------------------------------------------------------ the JS bridge (window.pywebview.api)
     /// <summary>Methods the page may call (the same names the Python shell exposed).</summary>
     public static readonly IReadOnlyList<string> BridgeMethods =
-        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "remote_assist", "open_url"];
+        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "remote_assist", "open_url", "set_theme"];
+
+    // ------------------------------------------------------------------ the window frame (title bar)
+    /// <summary>Dark title bar? The ADmiral theme setting; "system" (or anything else) follows Windows' app mode.</summary>
+    public static bool TitleBarDark(string? theme, bool windowsDark) => theme switch
+    {
+        "dark" => true,
+        "light" => false,
+        _ => windowsDark,
+    };
+
+    /// <summary>Title bar background and text (0xRRGGBB): the page's --bar and --text colours (app.css), so the title
+    /// bar and the toolbar under it look like one surface (Windows 11; Windows 10 only switches light/dark).</summary>
+    public static (int Caption, int Text) TitleBarColors(bool dark) => dark ? (0x2B2B2B, 0xE8E8E8) : (0xFFFFFF, 0x1B1B1B);
+
+    /// <summary>The window background behind the page while it loads (the page's --win colour).</summary>
+    public static int WindowBackColor(bool dark) => dark ? 0x1F1F1F : 0xF0F0F0;
 
     /// <summary>Largest file the page may save through the bridge.</summary>
     public const int MaxSaveBytes = 64 * 1024 * 1024;
@@ -603,6 +658,11 @@ public sealed class DesktopBridge(IDesktopShell shell, string home, Action<strin
                 return null;
             case "open_url":
                 OpenUrl(arg(0));
+                return null;
+            case "set_theme":
+                var theme = arg(0);
+                if (theme is not ("system" or "light" or "dark")) throw new ArgumentException("theme must be 'system', 'light' or 'dark'");
+                shell.SetTheme(theme);
                 return null;
             case "open_data_folder":
                 shell.OpenFolder(home);

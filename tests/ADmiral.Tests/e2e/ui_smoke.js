@@ -204,6 +204,14 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.waitForSelector("#logwrap tbody tr");
     check((await p.locator("#logwrap tbody tr").count()) >= 5, "log entries");
   });
+  await step("users page renders and filters", async () => {
+    await p.click(".rail-it[data-sec='users']");
+    await p.waitForSelector("#ugrid table, #ugrid .empty");
+    await p.fill("#users-filter", "zz-no-such-user");
+    await p.waitForSelector("#ugrid .empty");
+    await p.fill("#users-filter", "");
+    await p.click(".rail-it[data-sec='devices']");
+  });
   await step("dark theme via menu", async () => {
     await p.evaluate(() => setPref("theme", "dark"));
     await p.waitForFunction(() => document.documentElement.dataset.theme === "dark", null, { timeout: 10000 });

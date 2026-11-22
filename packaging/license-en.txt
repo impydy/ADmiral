@@ -1,0 +1,21 @@
+﻿ADmiral - license (GNU GPL 3.0)
+
+Copyright (C) 2026 TidecrestLabs
+
+ADmiral is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License (GNU GPL) version 3, as published by the Free Software Foundation.
+
+In short, you are free to
+ - run the program for any purpose,
+ - study and change its source code,
+ - share copies of it,
+ - share your changed versions,
+as long as anything you pass on (original or changed) is also released under the GNU GPL 3.0, together with its source code. You do not have to accept any agreement to use the program.
+
+Source code: https://github.com/impydy/ADmiral
+The full text of the license is in the installation folder (LICENSE.txt) and at https://www.gnu.org/licenses/gpl-3.0.html
+
+NO WARRANTY
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See sections 15 and 16 of the GNU GPL for details. You are responsible for testing the program - in particular the software deployment and remote functions - before using it in production, and for keeping backups.
+
+DATA
+ADmiral works with the data of your own network. It stores its settings, database and logs on your computers and does not send them to anyone. The only connection it makes by itself to the publisher's site (https://tidecrestlabs.com/) is the optional update check, which you can switch off; vulnerability and update data come from public sources (NIST NVD, CISA, Microsoft MSRC). Details: PRIVACY.md in the source code. You are responsible for having the necessary authorisation, and for following data protection rules, before you collect information about computers and users with it.

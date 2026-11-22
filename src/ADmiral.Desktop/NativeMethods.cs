@@ -18,6 +18,14 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool AttachConsole(int processId);
 
+    // ------------------------------------------------------------------ dwmapi (title bar colours)
+    public const int DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19;     // Windows 10 before 20H1
+    public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    public const int DWMWA_CAPTION_COLOR = 35, DWMWA_TEXT_COLOR = 36;   // Windows 11
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
     // ------------------------------------------------------------------ Service Control Manager
     public const uint SC_MANAGER_CONNECT = 0x1, SC_MANAGER_CREATE_SERVICE = 0x2;
     public const uint SERVICE_QUERY_CONFIG = 0x1, SERVICE_CHANGE_CONFIG = 0x2, SERVICE_QUERY_STATUS = 0x4,

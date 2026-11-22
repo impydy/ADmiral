@@ -2,6 +2,7 @@
 using System.Drawing;
 using ADmiral.Core;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -29,6 +30,7 @@ internal sealed class MainForm : Form, IDesktopShell
     private bool _forceClose;
     private bool _uiTestStarted;
     private System.Threading.Timer? _watchdog;
+    private string _theme;
 
     /// <summary>The process exit code once the window closed (ui-test result, start-up failure).</summary>
     public int ExitCode { get; private set; }
@@ -50,10 +52,12 @@ internal sealed class MainForm : Form, IDesktopShell
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = LogicalToDeviceUnits(new Size(1360, 880));
         MinimumSize = LogicalToDeviceUnits(new Size(960, 620));
-        var bg = service.Settings.Theme == "dark" ? Color.FromArgb(0x1f, 0x1f, 0x1f) : Color.FromArgb(0xf0, 0xf0, 0xf0);
+        _theme = service.Settings.Theme;
+        var bg = Color.FromArgb(unchecked((int)0xFF000000) | DesktopLogic.WindowBackColor(DesktopLogic.TitleBarDark(_theme, WindowsDark())));
         BackColor = bg;
         _web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = bg };
         Controls.Add(_web);
+        SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;     // Windows light/dark switched
         Load += async (_, _) => await InitAsync().ConfigureAwait(true);
         FormClosing += OnFormClosing;
         if (uiTest)
@@ -107,6 +111,70 @@ internal sealed class MainForm : Form, IDesktopShell
             Close();
         }
     }
+
+    // ------------------------------------------------------------------ title bar follows the theme
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyTitleBar();
+    }
+
+    /// <summary>Called by the page (bridge "set_theme") whenever its theme changes, including the live preview.</summary>
+    public void SetTheme(string theme)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => SetTheme(theme));
+            return;
+        }
+        _theme = theme;
+        ApplyTitleBar();
+    }
+
+    private void OnUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category != UserPreferenceCategory.General || IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(ApplyTitleBar); }
+        catch (InvalidOperationException) { }                 // the window is closing
+    }
+
+    /// <summary>Windows' "app mode" (Settings → Personalisation → Colours): true = dark.</summary>
+    private static bool WindowsDark()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            return key?.GetValue("AppsUseLightTheme") is int v && v == 0;
+        }
+        catch (Exception exc) when (exc is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Dark or light title bar (Windows 10 20H1+ / 11); on Windows 11 also exactly the page's toolbar colours.</summary>
+    private void ApplyTitleBar()
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        var dark = DesktopLogic.TitleBarDark(_theme, WindowsDark());
+        var on = dark ? 1 : 0;
+        if (NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_USE_IMMERSIVE_DARK_MODE, ref on, sizeof(int)) != 0)
+            _ = NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, ref on, sizeof(int));
+        if (Environment.OSVersion.Version.Build >= 22000)
+        {
+            var (caption, text) = DesktopLogic.TitleBarColors(dark);
+            var c = ColorRef(caption);
+            var t = ColorRef(text);
+            _ = NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_CAPTION_COLOR, ref c, sizeof(int));
+            _ = NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_TEXT_COLOR, ref t, sizeof(int));
+        }
+        var bg = Color.FromArgb(unchecked((int)0xFF000000) | DesktopLogic.WindowBackColor(dark));
+        BackColor = bg;
+        _web.DefaultBackgroundColor = bg;
+    }
+
+    /// <summary>0xRRGGBB -> COLORREF (0x00BBGGRR).</summary>
+    private static int ColorRef(int rgb) => ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
 
     // ------------------------------------------------------------------ navigation restrictions
     private void OnNavigationStarting(CoreWebView2NavigationStartingEventArgs e, bool isMainFrame)
@@ -290,6 +358,7 @@ internal sealed class MainForm : Form, IDesktopShell
         if (disposing)
         {
             _watchdog?.Dispose();            // the window is closed: the watchdog must not fire later
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;   // a static event: never leave it holding the form
             _watchdog = null;
             _web.Dispose();
         }

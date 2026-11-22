@@ -1386,6 +1386,13 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
 
     // ------------------------------------------------------------------ security-update monitoring
     /// <summary>{enabled, builds, fetched_at, error, months}.</summary>
+    /// <summary>Settings → Proxy → "Test proxy" with the saved proxy settings: {ok, message}.</summary>
+    public Row TestProxy()
+    {
+        var (ok, message) = Updates.TestProxy(Settings.Proxy);
+        return new Row { ["ok"] = ok, ["message"] = Diag.Redact(message) };
+    }
+
     public Row UpdatesStatus()
     {
         var (builds, meta) = Store.UpdateReference();

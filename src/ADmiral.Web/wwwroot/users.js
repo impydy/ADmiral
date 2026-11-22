@@ -52,7 +52,7 @@ function drawUsers() {
   const head = `<th class="rn"></th>` + USER_COLS.map((c) => `<th data-usort="${c.id}">${esc(t("ucol." + c.id))}${US.sort.key === c.id ? `<span class="arr">${US.sort.dir > 0 ? "▲" : "▼"}</span>` : ""}</th>`).join("");
   const body = rows.slice(0, 2000).map((u, i) => `<tr data-ukey="${esc(u.key)}" data-i="${i}"${US.sel === u.key ? ' class="sel"' : ""}><td class="rn"></td>${USER_COLS.map((c) => `<td class="${c.num ? "num" : ""}">${c.html(u)}</td>`).join("")}</tr>`).join("");
   wrap.innerHTML = rows.length ? `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>` : `<div class="empty">${esc(t("u.empty"))}</div>`;
-  $("#users-count").textContent = tText("sb.users", { n: rows.length });
+  if (S.section === "users") $("#sb-left").textContent = tText("sb.users", { n: rows.length });   // the status bar shows the count
 }
 
 function renderUsersPage(el) {

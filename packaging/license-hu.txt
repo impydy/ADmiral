@@ -1,0 +1,21 @@
+﻿ADmiral - licenc (GNU GPL 3.0)
+
+Copyright (C) 2026 TidecrestLabs
+
+Az ADmiral szabad szoftver: terjesztheti és/vagy módosíthatja a Free Software Foundation által kiadott GNU General Public License (GNU GPL) 3. verziójának feltételei szerint.
+
+Ez röviden azt jelenti, hogy Ön szabadon
+ - bármilyen célra futtathatja a programot,
+ - tanulmányozhatja és módosíthatja a forráskódját,
+ - másolatokat terjeszthet belőle,
+ - terjesztheti a módosított változatait is,
+feltéve, hogy a továbbadott (eredeti vagy módosított) változatot szintén a GNU GPL 3.0 alatt, a forráskóddal együtt teszi elérhetővé. A program használatához nem kell semmilyen szerződést elfogadnia.
+
+A forráskód: https://github.com/impydy/ADmiral
+A licenc teljes (angol nyelvű) szövege a telepítési mappában található: LICENSE.txt, illetve: https://www.gnu.org/licenses/gpl-3.0.html
+
+SZAVATOSSÁG KIZÁRÁSA
+A programot abban a reményben terjesztjük, hogy hasznos lesz, de MINDENFÉLE GARANCIA NÉLKÜL, még a FORGALOMKÉPESSÉGRE vagy EGY ADOTT CÉLRA VALÓ ALKALMASSÁGRA vonatkozó vélelmezett garanciát is beleértve. A részleteket a GNU GPL 15. és 16. pontja tartalmazza. Ön felel azért, hogy a programot - különösen a szoftvertelepítési és távoli funkciókat - éles használat előtt kipróbálja, és hogy biztonsági mentést készítsen.
+
+ADATOK
+Az ADmiral az Ön saját hálózatának adataival dolgozik. A beállításokat, az adatbázist és a naplókat az Ön gépein tárolja, és nem küldi el senkinek. A kiadó oldalával (https://tidecrestlabs.com/) önállóan csak a kikapcsolható frissítés-ellenőrzés során létesít kapcsolatot; a sebezhetőségi és frissítési adatokat nyilvános forrásokból (NIST NVD, CISA, Microsoft MSRC) tölti le. Részletek: PRIVACY.md a forráskódban. Ön felel azért, hogy rendelkezzen a szükséges felhatalmazással, és betartsa az adatvédelmi szabályokat, mielőtt a programmal számítógépekről és felhasználókról adatot gyűjt.

@@ -9,7 +9,8 @@
 ;   * data (settings, database, log): C:\ProgramData\ADmiral, restricted to SYSTEM, Administrators and the
 ;     installing user (plus /DATAUSER=, e.g. a group "CORP\ADmiral-Admins"); never writable by every user,
 ;   * Start menu / desktop shortcuts.
-; Starts with the license agreement (eula-hu.txt / eula-en.txt, by the installer language).
+; Starts with the license information (license-hu.txt / license-en.txt, by the installer language): ADmiral is GPL-3.0,
+; so it is an information page (no "I accept"); the full license text is installed as {app}\LICENSE.txt.
 ; Unattended:
 ;   ADmiral-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR="D:\Apps\ADmiral" [/DATADIR="D:\ADmiral-adatok"]
 ;                     [/DATAUSER="CORP\ADmiral-Admins"] [/CURRENTUSER="CORP\jdoe" | /CURRENTUSER=none]
@@ -60,14 +61,14 @@ UninstallDisplayName={#AppName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-LicenseFile=eula-en.txt
+InfoBeforeFile=license-en.txt
 CloseApplications=yes
 ShowLanguageDialog=auto
 LanguageDetectionMethod=uilanguage
 
 [Languages]
-Name: "hu"; MessagesFile: "compiler:Languages\Hungarian.isl"; LicenseFile: "eula-hu.txt"
-Name: "en"; MessagesFile: "compiler:Default.isl"; LicenseFile: "eula-en.txt"
+Name: "hu"; MessagesFile: "compiler:Languages\Hungarian.isl"; InfoBeforeFile: "license-hu.txt"
+Name: "en"; MessagesFile: "compiler:Default.isl"; InfoBeforeFile: "license-en.txt"
 
 [CustomMessages]
 hu.LaunchApp=ADmiral indítása
@@ -95,6 +96,7 @@ Name: "{app}"; Permissions: admins-full system-full users-readexec
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 #ifexist "MicrosoftEdgeWebview2Setup.exe"
 Source: "MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: NeedsWebView2
 #endif

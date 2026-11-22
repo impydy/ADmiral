@@ -369,6 +369,7 @@ public static partial class WebApp
         app.MapGet("/api/vulnerabilities", () => J(a.Vulnerabilities()));
         app.MapGet("/api/vulnerabilities/{cve}", (string cve) => J(a.Vulnerability(cve)));
         app.MapGet("/api/updates", () => J(a.UpdatesStatus()));
+        app.MapPost("/api/proxy/test", () => J(a.TestProxy()));
         app.MapGet("/api/winupdates", () => J(a.WinUpdates()));
         app.MapGet("/api/users", () => J(a.Users()));
         app.MapPost("/api/users/refresh", () => J(Obj(("updated", a.SyncUsers(force: true)))));

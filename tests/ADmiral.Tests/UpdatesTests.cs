@@ -107,7 +107,7 @@ public class UpdatesTests
         var trusted = Updates.WebProxyFor(s)!;
         Assert.Equal(new Uri("http://proxy.corp:3128/"), trusted.GetProxy(new Uri("https://www.cisa.gov/x")));
         Assert.True(trusted.IsBypassed(new Uri("https://app.intranet.corp/")));
-        Assert.IsType<NetworkCredential>(trusted.Credentials);
+        Assert.Equal("bob", Assert.IsType<ProxyAccount>(trusted.Credentials).User);
         var untrusted = Updates.WebProxyFor(new ProxySettings { Pac = "http://wpad.corp/wpad.dat", User = "bob", Password = "pw" })!;
         Assert.Null(untrusted.Credentials);
     }
@@ -127,15 +127,102 @@ public class UpdatesTests
     {
         var wp = Assert.IsType<WebProxy>(Updates.WebProxyFor(new ProxySettings { Url = "http://u:p@proxy.corp:3128", User = "bob", Password = "pw" }));
         Assert.Equal("http://proxy.corp:3128/", wp.Address!.AbsoluteUri);
-        var cred = Assert.IsType<NetworkCredential>(wp.Credentials);
+        var cred = wp.Credentials!.GetCredential(wp.Address, "Basic")!;
         Assert.Equal("bob", cred.UserName);
         Assert.Equal("pw", cred.Password);
         var fromUrl = Assert.IsType<WebProxy>(Updates.WebProxyFor(new ProxySettings { Url = "http://al%40x:s%3Acret@proxy.corp:3128" }));
-        Assert.Equal("al@x", ((NetworkCredential)fromUrl.Credentials!).UserName);
-        Assert.Equal("s:cret", ((NetworkCredential)fromUrl.Credentials!).Password);
+        Assert.Equal("al@x", fromUrl.Credentials!.GetCredential(fromUrl.Address!, "Digest")!.UserName);
+        Assert.Equal("s:cret", fromUrl.Credentials!.GetCredential(fromUrl.Address!, "Digest")!.Password);
         var integrated = Assert.IsType<WebProxy>(Updates.WebProxyFor(new ProxySettings { Url = "proxy.corp:3128" }));
         Assert.Same(CredentialCache.DefaultCredentials, integrated.Credentials);
         Assert.Null(Updates.WebProxyFor(new ProxySettings()));                 // the system proxy
+    }
+
+    [Fact]
+    public void ProxyAccountKeepsTheNameForPasswordLoginsAndSplitsItForWindowsAuth()
+    {
+        var proxy = new Uri("http://proxy.corp:3128/");
+        foreach (var typed in new[] { "jdoe@corp.local", @"CORP\jdoe" })
+        {
+            var acc = new ProxyAccount(typed, "pw");
+            // Basic / Digest: exactly as typed (the proxy's own user list decides which form it knows)
+            foreach (var scheme in new[] { "Basic", "Digest", "digest" })
+            {
+                var c = acc.GetCredential(proxy, scheme);
+                Assert.Equal(typed, c.UserName);
+                Assert.Equal("", c.Domain);
+                Assert.Equal("pw", c.Password);
+            }
+            // NTLM / Negotiate / Kerberos: user + domain, as SSPI wants them
+            foreach (var scheme in new[] { "NTLM", "Negotiate", "Kerberos" })
+            {
+                var c = acc.GetCredential(proxy, scheme);
+                Assert.Equal("jdoe", c.UserName);
+                Assert.Equal(typed.Contains('@') ? "corp.local" : "CORP", c.Domain);
+                Assert.Equal("pw", c.Password);
+            }
+        }
+        var plain = new ProxyAccount("jdoe", "pw").GetCredential(proxy, "NTLM");
+        Assert.Equal(("jdoe", ""), (plain.UserName, plain.Domain));
+        Assert.Equal("x@", ProxyAccount.Split("x@", "").UserName);                 // nothing to split
+        Assert.Equal(@"\x", ProxyAccount.Split(@"\x", "").UserName);
+    }
+
+    [Fact]
+    public void SystemProxyGetsTheAccountWhenOneIsSet()
+    {
+        using var withAccount = Updates.CreateHandler(new ProxySettings { User = "jdoe@corp.local", Password = "pw" });
+        Assert.Equal("jdoe@corp.local", Assert.IsType<ProxyAccount>(withAccount.DefaultProxyCredentials).User);
+        using var integrated = Updates.CreateHandler(new ProxySettings());
+        Assert.Same(CredentialCache.DefaultCredentials, integrated.DefaultProxyCredentials);
+    }
+
+    private sealed class FixedProxy(Uri? proxy) : IWebProxy
+    {
+        public ICredentials? Credentials { get; set; }
+        public Uri? GetProxy(Uri destination) => proxy ?? destination;
+        public bool IsBypassed(Uri host) => proxy is null;
+    }
+
+    [Fact]
+    public void ProxyTestExplainsWhereTrafficGoesAndWhatTheProxyWants()
+    {
+        var target = new Uri(Updates.ProxyTestTarget);
+        Assert.Equal(("explicit", new Uri("http://proxy.corp:3128/")),
+                     Updates.ResolveProxy(new ProxySettings { Url = "http://u:p@proxy.corp:3128" }, target));
+        Assert.Equal(("system", new Uri("http://sys.corp:8080/")),
+                     Updates.ResolveProxy(new ProxySettings(), target, new FixedProxy(new Uri("http://sys.corp:8080/"))));
+        Assert.Equal(("none", (Uri?)null), Updates.ResolveProxy(new ProxySettings(), target, new FixedProxy(null)));
+
+        Assert.Equal(("account", "jdoe@corp.local"), Updates.ProxyCredentialKind(new ProxySettings { Url = "p:1", User = "jdoe@corp.local" }, "explicit"));
+        Assert.Equal(("account", "al@x"), Updates.ProxyCredentialKind(new ProxySettings { Url = "http://al%40x:pw@p:1" }, "explicit"));
+        Assert.Equal(("windows", (string?)null), Updates.ProxyCredentialKind(new ProxySettings { Url = "p:1" }, "explicit"));
+        Assert.Equal(("none", (string?)null), Updates.ProxyCredentialKind(new ProxySettings { Pac = "auto", User = "u" }, "pac"));
+
+        Assert.True(Updates.NeedsProxyAccount(["Digest"]));
+        Assert.True(Updates.NeedsProxyAccount(["Basic", "Digest"]));
+        Assert.False(Updates.NeedsProxyAccount(["Negotiate", "Basic"]));
+        Assert.False(Updates.NeedsProxyAccount([]));
+
+        // a Digest-only proxy and no account: the test names the missing account and fails, without a password in it
+        var refused = new FakeHttp(_ => FakeHttp.Status(HttpStatusCode.ProxyAuthenticationRequired));
+        var (ok, msg) = Updates.TestProxy(new ProxySettings { Url = "http://proxy.corp:3128" }, probe: (_, _) => ["Digest"],
+                                          client: refused.Client());
+        Assert.False(ok);
+        Assert.Contains("proxy.corp:3128", msg);
+        Assert.Contains("Digest", msg);
+        Assert.Contains(I18n.T("proxy.cred_windows"), msg);
+        Assert.Contains(I18n.T("proxy.need_account", ("schemes", "Digest")), msg);
+        Assert.Contains(I18n.T("err.proxy_407"), msg);
+
+        var fine = new FakeHttp(_ => FakeHttp.Status(HttpStatusCode.OK));
+        (ok, msg) = Updates.TestProxy(new ProxySettings { Url = "http://proxy.corp:3128", User = "jdoe@corp.local", Password = "s3cret-pw" },
+                                      probe: (_, _) => ["Digest"], client: fine.Client());
+        Assert.True(ok);
+        Assert.Contains("jdoe@corp.local", msg);
+        Assert.DoesNotContain("s3cret-pw", msg);
+        Assert.DoesNotContain(I18n.T("proxy.need_account", ("schemes", "Digest")), msg);
+        Assert.Contains(I18n.T("proxy.ok", ("target", "www.cisa.gov"), ("code", 200)), msg);
     }
 
     [Fact]

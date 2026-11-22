@@ -99,7 +99,7 @@ The Windows installer is built on Windows with `packaging\build.ps1` (needs Inno
 | `src/ADmiral.Cli` | the `admiral` command line |
 | `src/ADmiral.Desktop` | `ADmiral.exe`: the window (WinForms + WebView2) and the background retry service |
 | `tests/ADmiral.Tests` | xUnit tests |
-| `packaging/` | build script, Inno Setup installer, EULAs, release notes |
+| `packaging/` | build script, Inno Setup installer, license pages, release notes |
 | `scripts/` | the offline collector script and the release signing tool |
 
 ## Security, in short

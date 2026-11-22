@@ -12,7 +12,7 @@
 //   account) itself, so the pyspnego token adapter and the Windows PowerShell fallback are gone.
 // * One HttpClient per proxy setting is cached and shared (no socket exhaustion, connection reuse); TLS
 //   certificate validation is never switched off; every response has a size cap and every request a timeout.
-// * The proxy password is handed to the handler as a NetworkCredential, never put into a URL.
+// * The proxy password is handed to the handler as a credential (ProxyAccount), never put into a URL.
 
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -62,7 +62,7 @@ internal sealed class PacWebProxy(ProxySettings settings) : IWebProxy
     internal static ICredentials? PacCredentials(ProxySettings settings)
     {
         if (!Updates.PacTrusted(settings)) return null;
-        return settings.User.Length == 0 ? CredentialCache.DefaultCredentials : new NetworkCredential(settings.User, settings.Password);
+        return settings.User.Length == 0 ? CredentialCache.DefaultCredentials : new ProxyAccount(settings.User, settings.Password);
     }
 
     private string? Chosen(Uri destination)
@@ -75,6 +75,32 @@ internal sealed class PacWebProxy(ProxySettings settings) : IWebProxy
     public Uri? GetProxy(Uri destination) => Chosen(destination) is { } p ? new Uri(p) : null;
 
     public bool IsBypassed(Uri host) => Chosen(host) is null;
+}
+
+/// <summary>The proxy account. Password logins (Basic, Digest) get the user name exactly as typed - <c>user@domain</c>
+/// or <c>DOMAIN\user</c>, whichever the proxy's user list holds. Windows authentication (NTLM, Negotiate, Kerberos) gets
+/// it split into user name + domain, the way SSPI expects it. .NET asks for the credential per challenge scheme.</summary>
+public sealed class ProxyAccount(string user, string password) : ICredentials
+{
+    public string User { get; } = user;
+
+    public NetworkCredential GetCredential(Uri uri, string authType) =>
+        IsWindowsAuth(authType) ? Split(User, password) : new NetworkCredential(User, password);
+
+    public static bool IsWindowsAuth(string? authType) =>
+        authType is not null && (authType.Equals("NTLM", StringComparison.OrdinalIgnoreCase)
+                                 || authType.Equals("Negotiate", StringComparison.OrdinalIgnoreCase)
+                                 || authType.Equals("Kerberos", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary><c>DOMAIN\user</c> and <c>user@domain</c> -> user name + domain; anything else unchanged.</summary>
+    public static NetworkCredential Split(string user, string password)
+    {
+        var bs = user.IndexOf('\\');
+        if (bs > 0 && bs < user.Length - 1) return new NetworkCredential(user[(bs + 1)..], password, user[..bs]);
+        var at = user.LastIndexOf('@');
+        if (at > 0 && at < user.Length - 1) return new NetworkCredential(user[..at], password, user[(at + 1)..]);
+        return new NetworkCredential(user, password);
+    }
 }
 
 public static partial class Updates
@@ -101,6 +127,131 @@ public static partial class Updates
             || exc is HttpRequestException { StatusCode: HttpStatusCode.ProxyAuthenticationRequired })
             text += " - " + I18n.T("err.proxy_407");
         return text;
+    }
+
+    // ------------------------------------------------------------------ the proxy test (Settings → Proxy)
+    /// <summary>The address the proxy test opens (the CISA list the vulnerability job downloads lives there too).</summary>
+    public const string ProxyTestTarget = "https://www.cisa.gov/";
+
+    /// <summary>Which proxy a request to <paramref name="target"/> goes through: source "explicit" (the proxy address
+    /// setting), "pac", "system" (Windows' proxy settings) or "none" (direct), and the proxy (no account in it).</summary>
+    public static (string Source, Uri? Proxy) ResolveProxy(ProxySettings p, Uri target, IWebProxy? systemProxy = null)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        ArgumentNullException.ThrowIfNull(target);
+        if (p.Url.Trim().Length > 0)
+            return ("explicit", ((WebProxy)WebProxyFor(p)!).Address);
+        if ((p.Pac ?? "").Trim().Length > 0)
+        {
+            var chosen = global::ADmiral.Core.Pac.ProxyFor(p.Pac!, target.AbsoluteUri);          // throws PacError
+            if (chosen is null) return ("none", null);
+            return ("pac", new Uri(chosen.Contains("://", StringComparison.Ordinal) ? chosen : "http://" + chosen));
+        }
+        var sys = systemProxy ?? HttpClient.DefaultProxy;
+        if (sys.IsBypassed(target)) return ("none", null);
+        var px = sys.GetProxy(target);
+        return px is null || px == target ? ("none", null) : ("system", px);
+    }
+
+    /// <summary>What the proxy is given: "account" (the user name, shown), "windows" (integrated Kerberos / NTLM) or
+    /// "none" (a proxy from an untrusted PAC file gets nothing).</summary>
+    public static (string Kind, string? User) ProxyCredentialKind(ProxySettings p, string source)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        if (source == "pac" && !PacTrusted(p)) return ("none", null);
+        if (p.User.Length > 0) return ("account", p.User);
+        if (source == "explicit")
+        {
+            var url = p.Url.Trim();
+            var uri = new Uri(url.Contains("://", StringComparison.Ordinal) ? url : "http://" + url);
+            if (uri.UserInfo.Length > 0) return ("account", Uri.UnescapeDataString(Partition(uri.UserInfo, ':').Item1));
+        }
+        return ("windows", null);
+    }
+
+    /// <summary>The authentication schemes the proxy offers (its Proxy-Authenticate header), read from a plain-http
+    /// request sent through it without any credentials; empty = it let the request through without a login.</summary>
+    public static List<string> ProbeProxySchemes(Uri proxy, Uri target)
+    {
+        ArgumentNullException.ThrowIfNull(proxy);
+        ArgumentNullException.ThrowIfNull(target);
+        using var h = new SocketsHttpHandler
+        {
+            UseProxy = true, Proxy = new WebProxy(proxy) { Credentials = null }, ConnectTimeout = ConnectTimeout,
+            AllowAutoRedirect = false, PreAuthenticate = false,
+        };
+        using var c = new HttpClient(h) { Timeout = TimeSpan.FromSeconds(20) };
+        var probe = new UriBuilder(target) { Scheme = "http", Port = -1 }.Uri;       // http: the 407 comes back as a response
+        using var req = Request(HttpMethod.Get, probe.AbsoluteUri, "*/*", null);
+        using var resp = c.Send(req, HttpCompletionOption.ResponseHeadersRead);
+        if (resp.StatusCode != HttpStatusCode.ProxyAuthenticationRequired) return [];
+        return [.. resp.Headers.ProxyAuthenticate.Select(a => a.Scheme).Distinct(StringComparer.OrdinalIgnoreCase)];
+    }
+
+    /// <summary>True when every scheme the proxy offers needs a password typed in (Basic / Digest): the Windows logon
+    /// cannot be used for them, so without a proxy account every request ends in 407.</summary>
+    public static bool NeedsProxyAccount(IReadOnlyList<string>? schemes) =>
+        schemes is { Count: > 0 } && schemes.All(s => !ProxyAccount.IsWindowsAuth(s));
+
+    /// <summary>The proxy test: where the traffic goes, what the proxy asks for, what ADmiral gives it, and whether an
+    /// https request through it works. Never throws; the text is shown on the settings page (no password in it).</summary>
+    public static (bool Ok, string Message) TestProxy(ProxySettings p, string target = ProxyTestTarget,
+                                                    Func<Uri, Uri, IReadOnlyList<string>>? probe = null, HttpClient? client = null,
+                                                    IWebProxy? systemProxy = null)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        var uri = new Uri(target);
+        var lines = new List<string>();
+        string source;
+        Uri? proxy;
+        try
+        {
+            (source, proxy) = ResolveProxy(p, uri, systemProxy);
+        }
+        catch (Exception exc) when (exc is PacError or UriFormatException or ArgumentException or IOException or HttpRequestException)
+        {
+            return (false, "✗ " + ExplainError(exc));
+        }
+        IReadOnlyList<string>? schemes = null;
+        if (proxy is null)
+        {
+            lines.Add(I18n.T("proxy.none"));
+        }
+        else
+        {
+            lines.Add(I18n.T("proxy.source_" + source, ("proxy", proxy.GetLeftPart(UriPartial.Authority))));
+            try
+            {
+                schemes = (probe ?? ProbeProxySchemes)(proxy, uri);
+                lines.Add(schemes.Count == 0 ? I18n.T("proxy.no_auth") : I18n.T("proxy.schemes", ("schemes", string.Join(", ", schemes))));
+            }
+            catch (Exception exc) when (exc is HttpRequestException or IOException or TaskCanceledException or InvalidOperationException)
+            {
+                lines.Add(I18n.T("proxy.schemes_unknown", ("err", exc.Message)));
+            }
+            var (kind, user) = ProxyCredentialKind(p, source);
+            lines.Add(kind == "account" ? I18n.T("proxy.cred_account", ("user", user)) : I18n.T("proxy.cred_" + kind));
+            if (kind != "account" && NeedsProxyAccount(schemes))
+                lines.Add(I18n.T("proxy.need_account", ("schemes", string.Join(", ", schemes!))));
+        }
+        var ok = false;
+        try
+        {
+            Prepare(p, direct: false, target);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var req = Request(HttpMethod.Get, target, "*/*", null);
+            using var resp = (client ?? Client(p)).SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token).GetAwaiter().GetResult();
+            if (resp.StatusCode == HttpStatusCode.ProxyAuthenticationRequired)
+                throw new HttpRequestException("407 Proxy Authentication Required", null, HttpStatusCode.ProxyAuthenticationRequired);
+            ok = true;
+            lines.Add(I18n.T("proxy.ok", ("target", uri.Host), ("code", (int)resp.StatusCode)));
+        }
+        catch (Exception exc) when (exc is HttpRequestException or IOException or TaskCanceledException or OperationCanceledException
+                                        or PacError or InvalidOperationException)
+        {
+            lines.Add(I18n.T("proxy.failed", ("err", ExplainError(exc))));
+        }
+        return (ok, string.Join("\n", lines));
     }
 
     /// <summary>True if a proxy address or a PAC file is configured (else the system proxy is used).</summary>
@@ -171,11 +322,11 @@ public static partial class Updates
         if (!url.Contains("://", StringComparison.Ordinal)) url = "http://" + url;
         var uri = new Uri(url);
         ICredentials cred;
-        if (p.User.Length > 0) cred = new NetworkCredential(p.User, p.Password);
+        if (p.User.Length > 0) cred = new ProxyAccount(p.User, p.Password);
         else if (uri.UserInfo.Length > 0)
         {
             var (u, _, pw) = Partition(uri.UserInfo, ':');
-            cred = new NetworkCredential(Uri.UnescapeDataString(u), Uri.UnescapeDataString(pw));
+            cred = new ProxyAccount(Uri.UnescapeDataString(u), Uri.UnescapeDataString(pw));
         }
         else cred = CredentialCache.DefaultCredentials;      // integrated (Kerberos / NTLM) proxy authentication
         var clean = new UriBuilder(uri) { UserName = "", Password = "" }.Uri;
@@ -209,7 +360,8 @@ public static partial class Updates
         var proxy = WebProxyFor(p);
         h.UseProxy = true;
         if (proxy is not null) h.Proxy = proxy;
-        else h.DefaultProxyCredentials = CredentialCache.DefaultCredentials;   // the system proxy, integrated auth
+        // the system proxy: the proxy account when one is set (the proxy address field left empty), else integrated auth
+        else h.DefaultProxyCredentials = p.User.Length > 0 ? new ProxyAccount(p.User, p.Password) : CredentialCache.DefaultCredentials;
         return h;
     }
 
