@@ -2,7 +2,7 @@
 ;
 ; Build after the self-contained folder build (see packaging\build.ps1):
 ;   dotnet publish src\ADmiral.Desktop -c Release -r win-x64 --self-contained -o dist\ADmiral
-;   ISCC packaging\installer.iss /DAppVersion=0.6.0 [/DSourceDir=<publish folder>]
+;   ISCC packaging\installer.iss /DAppVersion=0.6.1 [/DSourceDir=<publish folder>]
 ;
 ; The installer always installs for all users (administrator rights, one UAC prompt):
 ;   * program folder: Program Files\ADmiral (can be changed on the folder page),
@@ -26,7 +26,7 @@
 
 #define AppName "ADmiral"
 #ifndef AppVersion
-  #define AppVersion "0.6.0"
+  #define AppVersion "0.6.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\dist\ADmiral"
