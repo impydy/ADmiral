@@ -52,6 +52,7 @@ public static partial class I18n
         ["proxy.cred_account"] = ("A program ezt a fiókot küldi a proxynak: {user}", "ADmiral sends this account to the proxy: {user}"),
         ["proxy.cred_windows"] = ("Nincs megadva proxyfiók: a program a Windows-bejelentkezést (Kerberos / NTLM) használja.", "No proxy account is set: ADmiral uses the Windows logon (Kerberos / NTLM)."),
         ["proxy.cred_none"] = ("A PAC fájl nem megbízható helyről jön (auto / http), ezért a program semmilyen fiókot nem küld ennek a proxynak.", "The PAC file comes from an untrusted place (auto / http), so ADmiral sends no account to this proxy."),
+        ["proxy.untrusted_pac_on"] = ("Figyelem: a nem megbízható helyről (auto / http) érkező PAC fájl proxyja is megkapja a bejelentkezési adatokat (Beállítások → Proxy).", "Warning: a proxy chosen by a PAC file from an untrusted place (auto / http) also receives the login details (Settings → Proxy)."),
         ["proxy.need_account"] = ("A proxy csak jelszavas bejelentkezést fogad ({schemes}): adja meg fent a felhasználónevet (felhasználó@tartomány vagy TARTOMÁNY\\felhasználó) és a jelszót.", "The proxy only accepts a password login ({schemes}): enter the user name (user@domain or DOMAIN\\user) and the password above."),
         ["proxy.ok"] = ("✓ A kapcsolat működik ({target}, HTTP {code}).", "✓ The connection works ({target}, HTTP {code})."),
         ["proxy.failed"] = ("✗ A kapcsolat nem sikerült: {err}", "✗ The connection failed: {err}"),

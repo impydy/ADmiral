@@ -377,6 +377,22 @@ public sealed class ServiceTests : IDisposable
     }
 
     [Fact]
+    public void UntrustedPacSwitchIsSavedAndShown()
+    {
+        using var f = new ServiceFixture(editable: true);
+        var app = f.App;
+        Assert.False((bool)((Row)app.SettingsView()["proxy"]!)["allow_untrusted_pac"]!);       // off by default
+        app.UpdateSettings(new JsonObject { ["proxy"] = new JsonObject { ["pac"] = "auto", ["user"] = "jdoe@corp.local", ["password"] = "pw", ["allow_untrusted_pac"] = true } });
+        Assert.True(app.Settings.Proxy.AllowUntrustedPac);
+        Assert.True((bool)((Row)app.SettingsView()["proxy"]!)["allow_untrusted_pac"]!);
+        Assert.Contains("allow_untrusted_pac = true", File.ReadAllText(f.Temp.File("admiral.toml")));
+        // switching it off keeps the saved proxy password (it is not tied to the switch)
+        app.UpdateSettings(new JsonObject { ["proxy"] = new JsonObject { ["pac"] = "auto", ["user"] = "jdoe@corp.local", ["allow_untrusted_pac"] = false } });
+        Assert.False(app.Settings.Proxy.AllowUntrustedPac);
+        Assert.Equal("pw", app.Settings.Proxy.Password);
+    }
+
+    [Fact]
     public void SettingsViewMasksSecretsAndOnlyEditableFieldsChange()
     {
         using var f = new ServiceFixture(editable: true);

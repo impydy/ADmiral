@@ -52,7 +52,8 @@ public sealed class ResponseTooLargeException(string message) : IOException(mess
 /// authentication) are only given to a proxy chosen by a <i>trusted</i> PAC file (<see cref="Updates.PacTrusted"/>: a local
 /// file or an https URL). A proxy picked by WPAD (<c>auto</c>) or a PAC fetched over plain http could be chosen by
 /// anyone on the network (a spoofed wpad name / answer), and offering it integrated authentication would hand them a
-/// NetNTLM response to crack or relay; such a proxy gets no credentials at all.</summary>
+/// NetNTLM response to crack or relay; such a proxy gets no credentials at all - unless the administrator explicitly
+/// accepted that risk with <see cref="ProxySettings.AllowUntrustedPac"/> (<see cref="Updates.PacCredentialsAllowed"/>).</summary>
 internal sealed class PacWebProxy(ProxySettings settings) : IWebProxy
 {
     private readonly string _pac = settings.Pac.Trim();
@@ -61,7 +62,7 @@ internal sealed class PacWebProxy(ProxySettings settings) : IWebProxy
 
     internal static ICredentials? PacCredentials(ProxySettings settings)
     {
-        if (!Updates.PacTrusted(settings)) return null;
+        if (!Updates.PacCredentialsAllowed(settings)) return null;
         return settings.User.Length == 0 ? CredentialCache.DefaultCredentials : new ProxyAccount(settings.User, settings.Password);
     }
 
@@ -158,7 +159,7 @@ public static partial class Updates
     public static (string Kind, string? User) ProxyCredentialKind(ProxySettings p, string source)
     {
         ArgumentNullException.ThrowIfNull(p);
-        if (source == "pac" && !PacTrusted(p)) return ("none", null);
+        if (source == "pac" && !PacCredentialsAllowed(p)) return ("none", null);
         if (p.User.Length > 0) return ("account", p.User);
         if (source == "explicit")
         {
@@ -229,6 +230,8 @@ public static partial class Updates
             {
                 lines.Add(I18n.T("proxy.schemes_unknown", ("err", exc.Message)));
             }
+            // the administrator chose to trust an untrusted PAC file: say so every time the proxy is tested
+            if (source == "pac" && !PacTrusted(p) && p.AllowUntrustedPac) lines.Add(I18n.T("proxy.untrusted_pac_on"));
             var (kind, user) = ProxyCredentialKind(p, source);
             lines.Add(kind == "account" ? I18n.T("proxy.cred_account", ("user", user)) : I18n.T("proxy.cred_" + kind));
             if (kind != "account" && NeedsProxyAccount(schemes))
@@ -266,6 +269,15 @@ public static partial class Updates
         return src.Length > 0 && src != "auto" && !src.StartsWith("http://", StringComparison.Ordinal);
     }
 
+    /// <summary>May a proxy chosen by the PAC file get credentials? Yes for a trusted PAC (<see cref="PacTrusted"/>);
+    /// for an untrusted one (auto / http) only when the administrator turned on
+    /// <see cref="ProxySettings.AllowUntrustedPac"/> and confirmed the risk on the settings screen.</summary>
+    public static bool PacCredentialsAllowed(ProxySettings p)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        return PacTrusted(p) || p.AllowUntrustedPac;
+    }
+
     /// <summary><c>http://user:pass@host:port</c> (credentials URL-encoded), or null for the system proxy / DIRECT.
     /// With no address but a PAC file, the proxy the PAC picks for <paramref name="target"/> is used.
     /// (For display and checks: the HTTP client itself gets the account as a credential, not in a URL.)</summary>
@@ -282,7 +294,7 @@ public static partial class Updates
         if (!url.Contains("://", StringComparison.Ordinal)) url = "http://" + url;
         var uri = new Uri(url);
         var hostPort = uri.IsDefaultPort && !HasExplicitPort(url) ? uri.Host : $"{uri.Host}:{uri.Port.ToString(CultureInfo.InvariantCulture)}";
-        if (p.User.Length > 0 && fromPac && !PacTrusted(p))
+        if (p.User.Length > 0 && fromPac && !PacCredentialsAllowed(p))
         {
             Log.Logger.LogWarning("Proxy {Host} comes from an untrusted PAC file ({Pac}): the proxy account is not sent to it", uri.Host, p.Pac);
         }
@@ -380,7 +392,8 @@ public static partial class Updates
 
     private static string ClientKey(ProxySettings p)
     {
-        var raw = string.Join("\n", p.Url.Trim(), (p.Pac ?? "").Trim(), p.User, p.Password);
+        // the trust switch changes what the proxy is given, so it gets its own client (and connection pool)
+        var raw = string.Join("\n", p.Url.Trim(), (p.Pac ?? "").Trim(), p.User, p.Password, p.AllowUntrustedPac ? "1" : "0");
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw)));
     }
 

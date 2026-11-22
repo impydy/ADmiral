@@ -1147,7 +1147,8 @@ function dialog(title, body, buttons) {
 function closeDialog() { $("#dlg").hidden = true; }
 
 /* Own confirmation window (instead of the browser's confirm()); a separate layer, so it can open on top of
-   another dialog. Resolves true on OK / Enter, false on Cancel / Esc / click outside. */
+   another dialog. Resolves true on OK / Enter, false on Cancel / Esc / click outside.
+   opts.safe: a risky choice - Cancel has the focus and Enter means Cancel, so only a click on OK accepts. */
 function confirmDialog(text, opts = {}) {
   return new Promise((resolve) => {
     const layer = document.createElement("div");
@@ -1160,14 +1161,14 @@ function confirmDialog(text, opts = {}) {
     const done = (v) => { document.removeEventListener("keydown", onKey, true); layer.remove(); resolve(v); };
     const onKey = (e) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
-      else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); done(true); }
+      else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); done(!opts.safe); }
     };
     layer.querySelector("[data-no]").onclick = () => done(false);
     layer.querySelector("[data-yes]").onclick = () => done(true);
     layer.addEventListener("mousedown", (e) => { if (e.target === layer) done(false); });
     document.addEventListener("keydown", onKey, true);
     document.body.appendChild(layer);
-    layer.querySelector("[data-yes]").focus();
+    layer.querySelector(opts.safe ? "[data-no]" : "[data-yes]").focus();
   });
 }
 
@@ -1532,6 +1533,7 @@ function renderSettings(el) {
             ${pw("proxy-pw", t("s.proxy_pw"), cfg.proxy.password_set)}
           </div>
           <div class="faint">${esc(t("s.proxy_hint"))}</div>
+          <div class="chk">${chk("proxy-untrusted-pac", t("s.proxy_untrusted_pac"), cfg.proxy.allow_untrusted_pac)}</div>
           <div class="chk" style="gap:10px"><button class="btn" id="proxy-test" type="button" ${cfg.editable ? "" : "disabled"}>${icon("ping", 16)}${esc(t("s.proxy_test"))}</button></div>
           <div id="proxy-test-out" class="muted" style="white-space:pre-line"></div>
         </div></div>
@@ -1616,7 +1618,7 @@ function renderSettings(el) {
         logins: { enabled: c("lg-track"), path: v("lg-path").trim(), interval_minutes: Number(v("lg-interval")) },
         packages: { folder: v("pk-folder").trim() },
         deploy: { timeout_minutes: Number(v("dep-timeout")) },
-        proxy: { url: v("proxy-url").trim(), pac: v("proxy-pac").trim(), user: v("proxy-user").trim() },
+        proxy: { url: v("proxy-url").trim(), pac: v("proxy-pac").trim(), user: v("proxy-user").trim(), allow_untrusted_pac: c("proxy-untrusted-pac") },
         appupdate: { enabled: c("au-enabled"), use_proxy: c("au-proxy") },
         updates: { enabled: c("upd-enabled"), refresh_hours: Number(v("upd-hours")), grace_days: Number(v("upd-grace")) },
         retry: { interval_minutes: Number(v("retry-interval")), offline: c("retry-offline"), failed: c("retry-failed") },
@@ -1778,6 +1780,13 @@ function renderSettings(el) {
       $("#upd-status").innerHTML = u.error ? `<span class="st-bad">${esc(u.error)}</span>`
         : u.fetched_at ? esc(tText("s.upd_ok", { when: fmtDate(u.fetched_at), n: u.builds, months: u.months.join(", ") })) : esc(t("s.upd_never"));
     });
+    // Trusting an untrusted PAC file (auto / http) hands the proxy credentials to whoever answers that request on the
+    // network: ticking the box needs an explicit confirmation of the risk; "Cancel" leaves it unticked.
+    $("#proxy-untrusted-pac").onchange = async (e) => {
+      if (!e.target.checked) return;
+      const ok = await confirmDialog(t("s.proxy_untrusted_pac_warn"), { title: t("s.proxy_untrusted_pac_title"), yes: t("s.proxy_untrusted_pac_yes"), safe: true });
+      if (!ok) e.target.checked = false;
+    };
     $("#proxy-test").onclick = () => guard(async () => {
       const out = $("#proxy-test-out");
       out.className = "muted";

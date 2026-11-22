@@ -108,6 +108,11 @@ public sealed class ProxySettings
     [JsonPropertyName("user")] public string User { get; set; } = "";
     /// <summary>kept in the encrypted secret store, never in admiral.toml</summary>
     [JsonPropertyName("password")] public string Password { get; set; } = "";
+    /// <summary>Also give the proxy account (or, without one, the Windows logon) to a proxy chosen by an untrusted PAC
+    /// file (<c>auto</c> / plain http). Off by default: anyone on the network who can answer the WPAD / http request
+    /// can name their own machine as the proxy and receive the credentials. The settings screen only turns it on after
+    /// the administrator confirmed this risk (see <see cref="Updates.PacCredentialsAllowed"/>).</summary>
+    [JsonPropertyName("allow_untrusted_pac")] public bool AllowUntrustedPac { get; set; }
 }
 
 /// <summary>Monitoring of the security-update state of the computers.</summary>
@@ -258,7 +263,7 @@ public static class Config
         ["collect"] = ["method", "winrm_fallback", "smb_timeout", "response_timeout", "cleanup_delay"],
         ["scan"] = ["ports", "timeout", "workers", "interval_minutes"],
         ["retry"] = ["interval_minutes", "offline", "failed"],
-        ["proxy"] = ["url", "pac", "user"],
+        ["proxy"] = ["url", "pac", "user", "allow_untrusted_pac"],
         ["updates"] = ["enabled", "refresh_hours", "grace_days"],
         ["appupdate"] = ["enabled", "use_proxy"],
         ["logins"] = ["enabled", "path", "interval_minutes"],
@@ -599,6 +604,9 @@ public static class Config
         # Used when url is empty; the proxy is then chosen per address by the PAC script.
         pac = ""
         user = ""
+        # Send the proxy account (or the Windows logon) to a proxy picked by an "auto" (WPAD) or plain-http PAC file too.
+        # Off by default: whoever answers that request on the network could name their own proxy and get the credentials.
+        allow_untrusted_pac = false
 
         [updates]
         # Monitoring of the security-update state: ADmiral compares each computer's Windows build with the

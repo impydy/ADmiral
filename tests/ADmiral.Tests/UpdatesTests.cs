@@ -123,6 +123,30 @@ public class UpdatesTests
     }
 
     [Fact]
+    public void UntrustedPacGetsCredentialsOnlyWhenTheAdministratorAllowedIt()
+    {
+        foreach (var pac in new[] { "auto", "http://wpad/wpad.dat" })
+        {
+            var off = new ProxySettings { Pac = pac, User = "jdoe@corp.local", Password = "pw" };
+            Assert.False(Updates.PacCredentialsAllowed(off));
+            Assert.Null(Updates.WebProxyFor(off)!.Credentials);
+            Assert.Equal(("none", (string?)null), Updates.ProxyCredentialKind(off, "pac"));
+
+            var on = new ProxySettings { Pac = pac, User = "jdoe@corp.local", Password = "pw", AllowUntrustedPac = true };
+            Assert.True(Updates.PacCredentialsAllowed(on));
+            Assert.False(Updates.PacTrusted(on));                         // the source itself is still untrusted
+            Assert.Equal("jdoe@corp.local", Assert.IsType<ProxyAccount>(Updates.WebProxyFor(on)!.Credentials).User);
+            Assert.Equal(("account", "jdoe@corp.local"), Updates.ProxyCredentialKind(on, "pac"));
+            // no account: the Windows logon, as for a trusted PAC
+            Assert.Same(CredentialCache.DefaultCredentials, Updates.WebProxyFor(new ProxySettings { Pac = pac, AllowUntrustedPac = true })!.Credentials);
+            // the switch changes what the proxy gets: never the same cached client
+            Assert.NotSame(Updates.Client(off), Updates.Client(on));
+        }
+        Assert.True(Updates.PacCredentialsAllowed(new ProxySettings { Pac = "https://cfg.corp/proxy.pac" }));
+        Assert.False(new ProxySettings().AllowUntrustedPac);                 // off by default
+    }
+
+    [Fact]
     public void ExplicitProxyGetsTheAccountAsCredentialNotInTheUrl()
     {
         var wp = Assert.IsType<WebProxy>(Updates.WebProxyFor(new ProxySettings { Url = "http://u:p@proxy.corp:3128", User = "bob", Password = "pw" }));

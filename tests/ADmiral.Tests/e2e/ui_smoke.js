@@ -232,6 +232,21 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.waitForFunction(() => document.querySelector("#st-test-out").textContent.includes("✓"));
     check((await p.inputValue("#st-theme")) === "dark", "theme persisted");
   });
+  await step("untrusted PAC switch asks for confirmation", async () => {
+    // Cancel (and Enter, which means Cancel here) leaves it off; only the explicit button turns it on
+    await p.click("#proxy-untrusted-pac");
+    await p.waitForSelector(".cfm-layer");
+    await p.keyboard.press("Enter");
+    await p.waitForSelector(".cfm-layer", { state: "detached" });
+    check(!(await p.isChecked("#proxy-untrusted-pac")), "Enter must not accept the risk");
+    await p.click("#proxy-untrusted-pac");
+    await p.click(".cfm-layer [data-yes]");
+    await p.waitForSelector(".cfm-layer", { state: "detached" });
+    check(await p.isChecked("#proxy-untrusted-pac"), "confirmed: switch on");
+    await p.click("#proxy-untrusted-pac");                     // turning it off needs no confirmation
+    check(!(await p.locator(".cfm-layer").count()), "no dialog when switching off");
+    check(!(await p.isChecked("#proxy-untrusted-pac")), "switch off");
+  });
   await step("F5 refresh keeps the page", async () => {
     await p.click(".rail-it[data-sec='devices']");
     await p.click(".tn[data-node='all']");
