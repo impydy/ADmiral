@@ -1,0 +1,223 @@
+name: Build ADmiral.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish GitHub Release v<Version in Directory.Build.props> (creates the tag)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      HAS_SIGNING: ${{ secrets.SIGN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4.3.1
+        with:
+          dotnet-version: "10.0.x"
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content Directory.Build.props)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          if (-not $version) { throw "Version not found in Directory.Build.props" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "ADmiral $version"
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build ADmiral.slnx -c Release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Test
+        # the full suite, including the [WindowsFact] tests that are skipped on Linux
+        shell: pwsh
+        run: |
+          dotnet test tests/ADmiral.Tests -c Release --no-build --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Publish (self-contained folder used by the installer)
+        shell: pwsh
+        run: |
+          dotnet publish src/ADmiral.Desktop -c Release -r win-x64 --self-contained -o dist\ADmiral
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($f in 'ADmiral.exe', 'WebView2Loader.dll', 'wwwroot\index.html', 'wwwroot\app.js') {
+            if (-not (Test-Path "dist\ADmiral\$f")) { throw "$f missing from the publish folder" }
+          }
+          "{0:N1} MB in {1} files" -f ((Get-ChildItem dist\ADmiral -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), (Get-ChildItem dist\ADmiral -Recurse -File).Count
+      - name: Sign ADmiral.exe
+        if: env.HAS_SIGNING == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          # Authenticode signature with the certificate in the repository secrets (skipped without one):
+          # SIGN_PFX_BASE64 = the .pfx file as base64, SIGN_PFX_PASSWORD = its password
+          function Sign-Files([string[]]$files) {
+            $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+            $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+            try {
+              & $tool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:SIGN_PFX_PASSWORD @files
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+            } finally { Remove-Item $pfx -Force }
+          }
+          Sign-Files @("dist\ADmiral\ADmiral.exe", "dist\ADmiral\ADmiral.dll", "dist\ADmiral\ADmiral.Core.dll", "dist\ADmiral\ADmiral.Web.dll")
+      - name: Self-test of the published folder
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\ADmiral\ADmiral.exe -ArgumentList '--self-test' -Wait -PassThru
+          $log = Join-Path $env:APPDATA 'ADmiral\logs\admiral.log'
+          Select-String -Path $log -Pattern "self-test" -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
+          if ($p.ExitCode -ne 0) { throw "ADmiral.exe --self-test failed (exit $($p.ExitCode))" }
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          # Bundle Microsoft's WebView2 bootstrapper; setup runs it only when WebView2 is missing.
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile packaging\MicrosoftEdgeWebview2Setup.exe
+          & $iscc /Qp "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$((Resolve-Path dist\ADmiral).Path)" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem dist\ADmiral-Setup-*.exe
+      - name: Sign installer
+        if: env.HAS_SIGNING == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          function Sign-Files([string[]]$files) {
+            $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+            $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+            try {
+              & $tool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:SIGN_PFX_PASSWORD @files
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+            } finally { Remove-Item $pfx -Force }
+          }
+          Sign-Files @((Get-ChildItem dist\ADmiral-Setup-*.exe).FullName)
+      - name: Test installer (silent install to a custom folder, run, uninstall)
+        shell: pwsh
+        run: |
+          # Start ADmiral without ShellExecute: Start-Process would show Windows' "Open File -
+          # Security Warning" for an exe marked as downloaded and wait forever for a click.
+          function Invoke-Admiral([string]$exe, [string]$arg, [string]$log) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $exe, $arg
+            $psi.UseShellExecute = $false
+            $psi.WorkingDirectory = Split-Path $exe
+            $p = [System.Diagnostics.Process]::Start($psi)
+            if (-not $p.WaitForExit(180000)) { $p.Kill($true); Get-Content $log -ErrorAction SilentlyContinue; throw "ADmiral $arg timed out" }
+            Select-String -Path $log -Pattern "ui-test|self-test" -ErrorAction SilentlyContinue | ForEach-Object { $_.Line }
+            if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "ADmiral $arg failed (exit $($p.ExitCode))" }
+          }
+          $setup = (Get-ChildItem dist\ADmiral-Setup-*.exe).FullName
+          $app = "C:\ADmiral Teszt\Program"
+          $data = "C:\ADmiral Teszt\Közös adatok"
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=""$app""","/DATADIR=""$data""",'/LOG=setup.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content setup.log; exit 1 }
+          if (-not (Test-Path "$app\ADmiral.exe")) { throw "ADmiral.exe not installed to $app" }
+          $pointer = (Get-Content "$app\admiral-data.txt" -Encoding utf8).Trim()
+          if ($pointer -ne $data) { throw "admiral-data.txt = '$pointer', expected '$data'" }
+          # the data folder must not be writable by every user (Everyone, Authenticated Users, Users)
+          $acl = Get-Acl -LiteralPath $data
+          $broad = $acl.Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and ([int]$_.FileSystemRights -band 0x116) -and
+            ($_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4') }
+          if ($broad) { $acl.Access | Format-Table -AutoSize | Out-String | Write-Host; throw "the data folder is writable by every user" }
+          $lnk = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'ADmiral.lnk'
+          if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing: $lnk" }
+          Invoke-Admiral "$app\ADmiral.exe" '--self-test' "$data\logs\admiral.log"
+          if (-not (Test-Path "$data\logs\admiral.log")) { throw "installed app did not use the chosen data folder" }
+          Invoke-Admiral "$app\ADmiral.exe" '--ui-test' "$data\logs\admiral.log"
+          $p = Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          # the uninstaller re-launches itself from %TEMP%; wait for it to finish
+          for ($i = 0; $i -lt 60 -and (Test-Path "$app\ADmiral.exe"); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path "$app\ADmiral.exe") { throw "uninstall left ADmiral.exe behind" }
+          if (Test-Path $lnk) { throw "uninstall left the Start menu shortcut" }
+          if (-not (Test-Path "$data\logs\admiral.log")) { throw "silent uninstall must keep user data" }
+          "installer OK"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ADmiral-setup
+          path: dist/ADmiral-Setup-*.exe
+          if-no-files-found: error
+
+  release:
+    # Runs for a pushed version tag (git push origin v0.6.0), or from the Actions tab
+    # ("Run workflow" with "release" ticked), which creates the tag v<version> itself.
+    # Only after every test and the installer test passed. Publishes the GitHub Release
+    # with the installer and SHA256 checksums.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    needs: [windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Release tag = v<program version>
+        id: ver
+        run: |
+          version=$(python3 -c "import re; print(re.search(r'<Version>(.+?)</Version>', open('Directory.Build.props').read()).group(1))")
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match <Version> $version in Directory.Build.props"; exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "pre=true" >> "$GITHUB_OUTPUT" ;; *) echo "pre=false" >> "$GITHUB_OUTPUT" ;; esac
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: artifacts
+      - name: Collect release files
+        run: |
+          mkdir release
+          cp artifacts/ADmiral-setup/ADmiral-Setup-*.exe release/
+          cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt && ls -l
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          name: ADmiral ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.ver.outputs.pre }}
+          make_latest: ${{ steps.ver.outputs.pre == 'true' && 'false' || 'true' }}
+          body_path: packaging/release-notes.md
+          files: release/*
+          fail_on_unmatched_files: true
+      - name: Remove self-extracting portable exe from older releases
+        # Runs only after the new release was published. Idempotent: a release without
+        # *-portable.exe assets is left alone; the note is prepended once.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT: ${{ steps.ver.outputs.tag }}
+        run: |
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
+            [ "$tag" = "$CURRENT" ] && continue
+            assets=$(gh release view "$tag" --json assets --jq '.assets[].name | select(endswith("-portable.exe"))')
+            [ -z "$assets" ] && continue
+            for a in $assets; do
+              echo "Removing $a from $tag"
+              gh release delete-asset "$tag" "$a" --yes
+            done
+            gh release view "$tag" --json body --jq .body > old-notes.md
+            if ! grep -q "hordozható \`.exe\` fájlt eltávolítottuk" old-notes.md; then
+              cat packaging/portable-exe-removed.md old-notes.md > new-notes.md
+              gh release edit "$tag" --notes-file new-notes.md
+            fi
+          done

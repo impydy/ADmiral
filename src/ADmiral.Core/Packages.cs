@@ -1,0 +1,514 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+
+namespace ADmiral.Core;
+
+[SuppressMessage("Naming", "CA1710", Justification = "Mirrors the Python PackageError")]
+public sealed class PackageError(string message, Exception? inner = null) : Exception(message, inner);
+
+/// <summary>One stored file of a package (<c>path</c> is relative to the library folder, always with '/').</summary>
+public sealed class PackageFile
+{
+    [JsonPropertyName("path")] public string Path { get; set; } = "";
+    /// <summary>The version the file belongs to; null in older registers (then it is the folder name).</summary>
+    [JsonPropertyName("version")] public string? Version { get; set; }
+    [JsonPropertyName("added")] public string? Added { get; set; }
+    [JsonPropertyName("size")] public long Size { get; set; }
+    [JsonPropertyName("sha256")] public string Sha256 { get; set; } = "";
+    [JsonPropertyName("kind")] public string Kind { get; set; } = "installer";
+    [JsonPropertyName("vendor_checked")] public bool VendorChecked { get; set; }
+
+    public PackageFile Copy() => (PackageFile)MemberwiseClone();
+}
+
+public sealed class PackageEntry
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("name")] public string Name { get; set; } = "";
+    [JsonPropertyName("publisher")] public string Publisher { get; set; } = "";
+    [JsonPropertyName("version")] public string Version { get; set; } = "";
+    [JsonPropertyName("added")] public string? Added { get; set; }
+    [JsonPropertyName("downloaded")] public string? Downloaded { get; set; }
+    [JsonPropertyName("verified")] public string? Verified { get; set; }
+    [JsonPropertyName("verify_ok")] public bool? VerifyOk { get; set; }
+    [JsonPropertyName("source_hash_checked")] public bool? SourceHashChecked { get; set; }
+    [JsonPropertyName("files")] public List<PackageFile> Files { get; set; } = [];
+}
+
+public sealed class PackageManifest
+{
+    [JsonPropertyName("format")] public int Format { get; set; } = 1;
+    [JsonPropertyName("updated")] public string? Updated { get; set; }
+    [JsonPropertyName("packages")] public List<PackageEntry> Packages { get; set; } = [];
+}
+
+public sealed record PackageProblem([property: JsonPropertyName("path")] string Path, [property: JsonPropertyName("problem")] string Problem);
+
+public sealed record PackageVerifyResult(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("ok")] bool Ok,
+    [property: JsonPropertyName("problems")] IReadOnlyList<PackageProblem> Problems);
+
+public sealed record PackageVersionRow(
+    [property: JsonPropertyName("version")] string Version,
+    [property: JsonPropertyName("files")] int Files,
+    [property: JsonPropertyName("size")] long Size,
+    [property: JsonPropertyName("added")] string Added);
+
+/// <summary>A package as the UI lists it.</summary>
+public sealed record PackageRow(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("publisher")] string Publisher,
+    [property: JsonPropertyName("version")] string Version,
+    [property: JsonPropertyName("added")] string? Added,
+    [property: JsonPropertyName("downloaded")] string? Downloaded,
+    [property: JsonPropertyName("verified")] string? Verified,
+    [property: JsonPropertyName("verify_ok")] bool? VerifyOk,
+    [property: JsonPropertyName("source_hash_checked")] bool? SourceHashChecked,
+    [property: JsonPropertyName("size")] long Size,
+    [property: JsonPropertyName("versions")] IReadOnlyList<PackageVersionRow> Versions,
+    [property: JsonPropertyName("files")] IReadOnlyList<PackageFile> Files);
+
+/// <summary>Package library: application installers added by hand into a folder, with versions and a hash register.
+/// <para>Files are stored under <c>&lt;folder&gt;/&lt;id&gt;/&lt;version&gt;/</c> and <c>&lt;folder&gt;/packages.json</c>
+/// records every file with its version, size and SHA-256 (and whether the vendor's published SHA-256 was checked).
+/// <see cref="Verify"/> re-hashes the files and reports anything missing or changed. Nothing is installed anywhere by
+/// the library itself: it only holds files. The register is a plain JSON file that could have been edited, so every
+/// path read from it is checked to stay inside the library folder (<see cref="File"/>).</para></summary>
+public sealed partial class PackageLibrary(string folder)
+{
+    public const string Manifest = "packages.json";
+    public const long MaxManifestBytes = 64L * 1024 * 1024;
+    /// <summary>Upper bound for one uploaded file.</summary>
+    public static long MaxUploadBytes { get; set; } = 16L * 1024 * 1024 * 1024;
+
+    internal static readonly Lock Sync = new();                      // one library writer at a time (process-wide)
+
+    private static readonly JsonSerializerOptions Json = new()
+    {
+        WriteIndented = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never,
+    };
+
+    public string Folder { get; } = System.IO.Path.GetFullPath(folder);
+    public string ManifestPath => System.IO.Path.Combine(Folder, Manifest);
+
+    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")]
+    private static partial Regex IdRe();
+
+    [GeneratedRegex(@"^[0-9a-f]{64}$")]
+    internal static partial Regex ShaRe();
+
+    [GeneratedRegex(@"[^\w.+-]")]
+    private static partial Regex Unsafe();
+
+    private static readonly StringComparison PathCmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    public static string ValidId(string? pkgId)
+    {
+        var pid = (pkgId ?? "").Trim();
+        if (!IdRe().IsMatch(pid)) throw new PackageError($"Not a valid package ID: '{pkgId}'");
+        return pid;
+    }
+
+    internal static string Now() => DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'+00:00'", CultureInfo.InvariantCulture);
+
+    public static string Sha256File(string path)
+    {
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
+        return Convert.ToHexStringLower(SHA256.HashData(f));
+    }
+
+    /// <summary>A file/folder name made of safe characters; never "." or "..".</summary>
+    internal static string Safe(string part)
+    {
+        var s = LooseValue.Cut(Unsafe().Replace(part, "_"), 80);
+        return s is "" or "." or ".." ? "_" : s;
+    }
+
+    /// <summary>The version a stored file belongs to (older registers did not record it: it is the folder name).</summary>
+    public static string FileVersion(PackageEntry entry, PackageFile rec)
+    {
+        if (rec.Version is not null) return rec.Version;
+        var parts = rec.Path.Split('/');
+        return parts.Length >= 3 && parts[1] != "manual" ? parts[1] : entry.Version ?? "";
+    }
+
+    private static readonly HashSet<string> Reserved = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    };
+
+    /// <summary>A file of the library by its register path; never anything outside the library folder. Absolute paths,
+    /// drive letters, '..' segments, alternate data streams, device names and links that lead outside are refused.</summary>
+    public string File(string rel)
+    {
+        var r = rel ?? "";
+        if (r.Length == 0 || r.Length > 1024 || r.Contains('\0') || r.Contains(':') || System.IO.Path.IsPathRooted(r)
+            || r.StartsWith('/') || r.StartsWith('\\'))
+            throw new PackageError($"'{rel}' is outside the package library");
+        var segments = r.Split('/', '\\');
+        foreach (var seg in segments)
+        {
+            var stem = seg.Split('.')[0];
+            if (seg is "" or "." or ".." || seg.EndsWith(' ') || Reserved.Contains(stem))
+                throw new PackageError($"'{rel}' is outside the package library");
+        }
+        var baseDir = RealPath(Folder);
+        var full = System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDir, System.IO.Path.Combine(segments)));
+        if (!IsInside(baseDir, full)) throw new PackageError($"'{rel}' is outside the package library");
+        // a link (symlink / junction) inside the library must not lead outside of it either
+        var cur = baseDir;
+        foreach (var seg in segments)
+        {
+            cur = System.IO.Path.Combine(cur, seg);
+            FileSystemInfo info = Directory.Exists(cur) ? new DirectoryInfo(cur) : new FileInfo(cur);
+            if (!info.Exists) break;
+            if (info.LinkTarget is not null)
+            {
+                var target = info.ResolveLinkTarget(returnFinalTarget: true)?.FullName;
+                if (target is null || !IsInside(baseDir, System.IO.Path.GetFullPath(target)))
+                    throw new PackageError($"'{rel}' is outside the package library");
+            }
+        }
+        return full;
+    }
+
+    private static string RealPath(string dir)
+    {
+        try
+        {
+            var di = new DirectoryInfo(dir);
+            if (di.Exists && di.LinkTarget is not null && di.ResolveLinkTarget(true) is { } t) return System.IO.Path.GetFullPath(t.FullName);
+        }
+        catch (IOException) { }
+        return System.IO.Path.TrimEndingDirectorySeparator(dir);
+    }
+
+    private static bool IsInside(string baseDir, string full)
+    {
+        var b = System.IO.Path.TrimEndingDirectorySeparator(baseDir) + System.IO.Path.DirectorySeparatorChar;
+        return full.StartsWith(b, PathCmp) && full.Length > b.Length;
+    }
+
+    // ---------------------------------------------------------------- register
+    public PackageManifest Load()
+    {
+        lock (Sync)
+        {
+            try
+            {
+                var fi = new FileInfo(ManifestPath);
+                if (!fi.Exists) return new PackageManifest();
+                if (fi.Length > MaxManifestBytes) throw new PackageError($"{ManifestPath} cannot be read: too large");
+                var data = JsonSerializer.Deserialize<PackageManifest>(System.IO.File.ReadAllBytes(ManifestPath)) ?? new PackageManifest();
+                data.Packages ??= [];
+                foreach (var p in data.Packages) p.Files ??= [];
+                data.Packages.RemoveAll(p => p is null || string.IsNullOrEmpty(p.Id));
+                return data;
+            }
+            catch (Exception exc) when (exc is IOException or UnauthorizedAccessException or JsonException)
+            {
+                throw new PackageError($"{ManifestPath} cannot be read: {exc.Message}", exc);
+            }
+        }
+    }
+
+    public void Save(PackageManifest data)
+    {
+        lock (Sync)
+        {
+            Directory.CreateDirectory(Folder);
+            data.Updated = Now();
+            var tmp = System.IO.Path.ChangeExtension(ManifestPath, ".tmp");
+            System.IO.File.WriteAllBytes(tmp, JsonSerializer.SerializeToUtf8Bytes(data, Json));
+            System.IO.File.Move(tmp, ManifestPath, overwrite: true);
+        }
+    }
+
+    private static PackageEntry? Find(PackageManifest data, string pkgId) =>
+        data.Packages.FirstOrDefault(p => string.Equals(p.Id, pkgId, StringComparison.OrdinalIgnoreCase));
+
+    public PackageEntry? Get(string pkgId) => Find(Load(), pkgId ?? "");
+
+    // ---------------------------------------------------------------- changes
+    public void Remove(string pkgId, bool deleteFiles = true)
+    {
+        string id;
+        lock (Sync)
+        {
+            var data = Load();
+            var entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId} is not in the library.");
+            id = entry.Id;
+            data.Packages.Remove(entry);
+            Save(data);
+        }
+        if (!deleteFiles) return;
+        string dir;
+        try { dir = File(Safe(id)); }
+        catch (PackageError) { return; }                                     // never delete outside the library
+        try
+        {
+            var di = new DirectoryInfo(dir);
+            if (di.LinkTarget is not null) di.Delete();                      // a link: remove the link, not its target
+            else if (di.Exists) di.Delete(recursive: true);
+        }
+        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Remove one stored file (e.g. an old version) from the library and the disk.</summary>
+    public PackageEntry RemoveFile(string pkgId, string path)
+    {
+        PackageEntry entry;
+        PackageFile rec;
+        lock (Sync)
+        {
+            var data = Load();
+            entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId}: no such file in the package.");
+            rec = entry.Files.FirstOrDefault(f => f.Path == path) ?? throw new PackageError($"{pkgId}: no such file in the package.");
+            entry.Files = entry.Files.Where(f => f.Path != path).ToList();
+            PackageFile? newest = null;
+            foreach (var f in entry.Files)
+                if (newest is null || string.CompareOrdinal(f.Added ?? "", newest.Added ?? "") > 0) newest = f;
+            entry.Version = newest is not null ? FileVersion(entry, newest) : "";
+            entry.SourceHashChecked = entry.Files.Count > 0 && entry.Files.All(f => f.VendorChecked);
+            Save(data);
+        }
+        var target = File(rec.Path);
+        try
+        {
+            System.IO.File.Delete(target);
+            var parent = System.IO.Path.GetDirectoryName(target);
+            if (parent is not null && IsInside(RealPath(Folder), parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
+                Directory.Delete(parent);                                     // the version folder, once empty
+        }
+        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException) { }
+        return entry;
+    }
+
+    /// <summary>Store a file the user supplies: <c>using var u = lib.Upload(...); u.Write(chunk); ...; u.Commit();</c>.
+    /// The file is hashed while it is written and registered by <see cref="PackageUpload.Commit"/>; disposing without
+    /// a commit discards it.</summary>
+    public PackageUpload Upload(string pkgId, string filename, string version = "", string title = "", string sha256 = "")
+        => new(this, ValidId(pkgId), filename ?? "", LooseValue.Cut((version ?? "").Trim(), 60),
+            LooseValue.Cut((title ?? "").Trim(), 120), (sha256 ?? "").Trim().ToLowerInvariant());
+
+    /// <summary>Compare the SHA-256 published by the vendor with a stored file (hashed again now). A match marks the file
+    /// as vendor-verified; a mismatch throws and changes nothing.</summary>
+    public PackageEntry CheckVendorHash(string pkgId, string path, string sha256)
+    {
+        var sha = (sha256 ?? "").Trim().ToLowerInvariant();
+        if (!ShaRe().IsMatch(sha)) throw new PackageError("The SHA-256 must be 64 hexadecimal characters.");
+        lock (Sync)
+        {
+            var data = Load();
+            var entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId}: no such file in the package.");
+            var rec = entry.Files.FirstOrDefault(f => f.Path == path) ?? throw new PackageError($"{pkgId}: no such file in the package.");
+            var f = File(rec.Path);
+            if (!System.IO.File.Exists(f)) throw new PackageError($"{rec.Path} is missing from the library.");
+            var actual = Sha256File(f);
+            if (actual != sha) throw new PackageError($"SHA-256 mismatch for {rec.Path}: the vendor's value is {sha}, the file's is {actual}.");
+            rec.Sha256 = actual;
+            rec.VendorChecked = true;
+            entry.SourceHashChecked = entry.Files.All(x => x.VendorChecked);
+            Save(data);
+            return entry;
+        }
+    }
+
+    // ---------------------------------------------------------------- verification
+    /// <summary>Re-hash the files of one package.</summary>
+    public (bool Ok, List<PackageProblem> Problems) VerifyEntry(PackageEntry entry)
+    {
+        if (entry.Files.Count == 0) return (false, [new PackageProblem("", "not_downloaded")]);
+        var problems = new List<PackageProblem>();
+        foreach (var r in entry.Files)
+        {
+            var p = File(r.Path);
+            var fi = new FileInfo(p);
+            if (!fi.Exists) problems.Add(new PackageProblem(r.Path, "missing"));
+            else if (fi.Length != r.Size || Sha256File(p) != r.Sha256) problems.Add(new PackageProblem(r.Path, "changed"));
+        }
+        return (problems.Count == 0, problems);
+    }
+
+    public List<PackageVerifyResult> Verify(string? pkgId = null)
+    {
+        var outp = new List<PackageVerifyResult>();
+        lock (Sync)
+        {
+            var data = Load();
+            foreach (var p in data.Packages)
+            {
+                if (!string.IsNullOrEmpty(pkgId) && !string.Equals(p.Id, pkgId, StringComparison.OrdinalIgnoreCase)) continue;
+                var (ok, problems) = VerifyEntry(p);
+                if (p.Files.Count > 0)
+                {
+                    p.Verified = Now();
+                    p.VerifyOk = ok;
+                }
+                outp.Add(new PackageVerifyResult(p.Id, ok, problems));
+            }
+            Save(data);
+        }
+        return outp;
+    }
+
+    /// <summary>Packages for the UI. Hashes are not recomputed here (see <see cref="Verify"/>); <c>verify_ok</c> is the last result.</summary>
+    public List<PackageRow> Rows()
+    {
+        var rows = new List<PackageRow>();
+        foreach (var p in Load().Packages)
+        {
+            var files = p.Files.Select(f =>
+            {
+                var c = f.Copy();
+                c.Version = FileVersion(p, f);
+                return c;
+            }).ToList();
+            var versions = new List<(string Version, int Files, long Size, string Added)>();
+            foreach (var f in files)
+            {
+                var i = versions.FindIndex(v => v.Version == f.Version);
+                if (i < 0)
+                {
+                    versions.Add((f.Version!, 0, 0, ""));
+                    i = versions.Count - 1;
+                }
+                var v = versions[i];
+                var added = f.Added ?? p.Downloaded ?? "";
+                versions[i] = (v.Version, v.Files + 1, v.Size + f.Size, string.CompareOrdinal(added, v.Added) > 0 ? added : v.Added);
+            }
+            rows.Add(new PackageRow(p.Id, string.IsNullOrEmpty(p.Name) ? p.Id : p.Name, p.Publisher ?? "", p.Version ?? "",
+                p.Added, p.Downloaded, p.Verified, p.VerifyOk ?? (files.Count > 0 ? true : null), p.SourceHashChecked,
+                files.Where(f => f.Kind != "manifest").Sum(f => f.Size),
+                versions.OrderByDescending(v => v.Added, StringComparer.Ordinal).Select(v => new PackageVersionRow(v.Version, v.Files, v.Size, v.Added)).ToList(),
+                files));
+        }
+        return rows;
+    }
+}
+
+/// <summary>An upload in progress (see <see cref="PackageLibrary.Upload"/>).</summary>
+public sealed partial class PackageUpload : IDisposable
+{
+    private readonly PackageLibrary _lib;
+    private readonly string _pid, _version, _title, _expected;
+    private readonly string _tmp;
+    private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    private FileStream? _file;
+    private bool _done;
+
+    public string Name { get; }
+    public long Size { get; private set; }
+
+    [GeneratedRegex("[\\\\/:*?\"<>|\\x00-\\x1f]")]
+    private static partial Regex BadChars();
+
+    internal PackageUpload(PackageLibrary lib, string pid, string filename, string version, string title, string sha256)
+    {
+        var baseName = filename.Replace('\\', '/');
+        baseName = baseName[(baseName.LastIndexOf('/') + 1)..];
+        var name = BadChars().Replace(baseName, "_").Trim(' ', '.');
+        var stem = name.Split('.')[0];
+        if (name.Length == 0 || name.Length > 200 || name.Equals(PackageLibrary.Manifest, StringComparison.OrdinalIgnoreCase)
+            || stem.ToUpperInvariant() is "CON" or "PRN" or "AUX" or "NUL" || System.Text.RegularExpressions.Regex.IsMatch(stem, "^(?i:COM|LPT)[1-9]$"))
+            throw new PackageError("Not a valid file name.");
+        if (sha256.Length > 0 && !PackageLibrary.ShaRe().IsMatch(sha256)) throw new PackageError("The SHA-256 must be 64 hexadecimal characters.");
+        (_lib, _pid, Name, _version, _title, _expected) = (lib, pid, name, version, title, sha256);
+        var dl = Path.Combine(lib.Folder, "_download");
+        Directory.CreateDirectory(dl);
+        _tmp = Path.Combine(dl, $"upload-{Guid.NewGuid():N}-{PackageLibrary.Safe(name)}");
+        _file = new FileStream(_tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+    }
+
+    public void Write(ReadOnlySpan<byte> chunk)
+    {
+        ObjectDisposedException.ThrowIf(_file is null, this);
+        if (Size + chunk.Length > PackageLibrary.MaxUploadBytes) throw new PackageError("The file is too large.");
+        _file.Write(chunk);
+        _hash.AppendData(chunk);
+        Size += chunk.Length;
+    }
+
+    public void Write(byte[] chunk) => Write(chunk.AsSpan());
+
+    /// <summary>Check the hash and register the file (the newest version added becomes the package's current one).</summary>
+    public PackageEntry Commit()
+    {
+        ObjectDisposedException.ThrowIf(_file is null || _done, this);
+        _file.Dispose();
+        _file = null;
+        _done = true;
+        try
+        {
+            if (Size == 0) throw new PackageError("The file is empty.");
+            var actual = Convert.ToHexStringLower(_hash.GetHashAndReset());
+            if (_expected.Length > 0 && actual != _expected)
+                throw new PackageError($"SHA-256 mismatch for {Name}: the vendor's value is {_expected}, the file's is {actual}. The file was not added.");
+            lock (PackageLibrary.Sync)
+            {
+                var data = _lib.Load();
+                var entry = data.Packages.FirstOrDefault(p => string.Equals(p.Id, _pid, StringComparison.OrdinalIgnoreCase));
+                if (entry is null)
+                {
+                    entry = new PackageEntry { Id = _pid, Name = _pid, Added = PackageLibrary.Now() };
+                    data.Packages.Add(entry);
+                }
+                if (_title.Length > 0) entry.Name = _title;
+                var version = _version.Length > 0 ? _version : entry.Version ?? "";
+                entry.Version = version;
+                var rel = $"{PackageLibrary.Safe(_pid)}/{PackageLibrary.Safe(version.Length > 0 ? version : "manual")}/{Name}";
+                var dest = _lib.File(rel);
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                System.IO.File.Move(_tmp, dest, overwrite: true);
+                entry.Files = entry.Files.Where(f => f.Path != rel).ToList();
+                entry.Files.Add(new PackageFile
+                {
+                    Path = rel, Version = version, Added = PackageLibrary.Now(), Size = Size, Sha256 = actual, Kind = "installer",
+                    VendorChecked = _expected.Length > 0,
+                });
+                entry.SourceHashChecked = entry.Files.All(f => f.VendorChecked);
+                entry.Downloaded = entry.Verified = PackageLibrary.Now();
+                entry.VerifyOk = true;
+                _lib.Save(data);
+                return entry;
+            }
+        }
+        finally
+        {
+            Cleanup();
+        }
+    }
+
+    private void Cleanup()
+    {
+        try
+        {
+            if (System.IO.File.Exists(_tmp)) System.IO.File.Delete(_tmp);
+            var dir = Path.GetDirectoryName(_tmp)!;
+            if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir);
+        }
+        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException) { }
+    }
+
+    public void Dispose()
+    {
+        _file?.Dispose();
+        _file = null;
+        _hash.Dispose();
+        if (!_done)
+        {
+            _done = true;
+            Cleanup();
+        }
+    }
+}

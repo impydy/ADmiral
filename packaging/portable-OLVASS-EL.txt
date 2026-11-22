@@ -1,0 +1,12 @@
+ADmiral – hordozható változat
+
+1. Csomagolja ki ezt a mappát bárhová (pl. C:\Eszközök\ADmiral vagy egy pendrive).
+2. Indítsa el az ADmiral.exe fájlt.
+
+A mellette lévő admiral.toml miatt minden adat (beállítások, adatbázis, napló)
+ebben a mappában marad, a gépen máshova nem ír. A mappának írhatónak kell lennie.
+A jelszavak titkosítva tárolódnak, és csak azzal a Windows-fiókkal fejthetők vissza,
+amellyel elmentette őket.
+
+Követelmény: 64 bites Windows 10/11 vagy Server 2016+, Microsoft Edge WebView2 Runtime.
+Felhasználói kézikönyv: a programban Súgó -> Felhasználói kézikönyv (F1).

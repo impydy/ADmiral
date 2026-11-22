@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- ADmiral Ko-fi avatar: full-bleed square (Ko-fi crops it to a circle). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e4fa3"/>
+      <stop offset="1" stop-color="#0a2350"/>
+    </linearGradient>
+    <linearGradient id="gold" gradientUnits="userSpaceOnUse" x1="0" y1="40" x2="0" y2="215">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset=".55" stop-color="#e3a929"/>
+      <stop offset="1" stop-color="#b9801a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" fill="url(#bg)"/>
+  <path d="M0 206c22-10 40-10 64 0s42 10 64 0 42-10 64 0 40 10 64 0v50H0z" fill="#0f3a7d" opacity=".9"/>
+  <g transform="translate(128 128) scale(.88) translate(-128 -128)">
+    <g stroke="url(#gold)" stroke-width="13" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="128" cy="62" r="16"/>
+      <path d="M128 78v118"/>
+      <path d="M98 104h60"/>
+      <path d="M58 150c6 34 32 52 70 52s64-18 70-52"/>
+    </g>
+    <path d="M42 158l16-26 20 22z M214 158l-16-26-20 22z" fill="url(#gold)" stroke="url(#gold)" stroke-width="5" stroke-linejoin="round"/>
+  </g>
+</svg>

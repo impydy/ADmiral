@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="hu" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ADmiral</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="shell">
+  <nav class="rail" id="rail" aria-label="Navigation"></nav>
+  <div class="app">
+    <!-- toolbar -->
+    <div class="toolbar" id="toolbar" role="toolbar"></div>
+
+    <!-- tree + page -->
+    <div class="workspace">
+      <aside class="tree-pane">
+        <input class="tree-filter" id="tree-filter" type="search" autocomplete="off">
+        <div class="tree" id="tree" role="tree" tabindex="0"></div>
+      </aside>
+      <div class="splitter" id="splitter" aria-hidden="true"></div>
+      <section class="page" id="page"></section>
+    </div>
+
+    <!-- status bar -->
+    <footer class="statusbar">
+      <span id="sb-left"></span>
+      <span class="sb-mid" id="sb-mid"></span>
+      <a href="#" id="sb-right"></a>
+    </footer>
+  </div>
+  </div>
+
+  <!-- computer window (opens over the main window, like a separate window) -->
+  <div class="cwin-layer" id="cwin" hidden>
+    <div class="cwin" role="dialog" aria-modal="true">
+      <div class="cwin-title"><span id="cwin-title"></span><button class="cwin-x" data-cw="close" aria-label="Close">✕</button></div>
+      <div class="toolbar cwin-toolbar" id="cwin-toolbar"></div>
+      <div class="cwin-body">
+        <nav class="cwin-cats" id="cwin-cats"></nav>
+        <div class="cwin-main">
+          <div class="cwin-head" id="cwin-head"></div>
+          <div class="cwin-content" id="cwin-content"></div>
+          <div class="cwin-msg" id="cwin-msg" hidden></div>
+        </div>
+      </div>
+      <div class="statusbar cwin-status"><span id="cwin-status"></span></div>
+    </div>
+  </div>
+
+
+  <!-- user window (Users page: double-click a user) -->
+  <div class="cwin-layer" id="uwin" hidden>
+    <div class="cwin" role="dialog" aria-modal="true">
+      <div class="cwin-title"><span id="uwin-title"></span><button class="cwin-x" data-uw="close" aria-label="Close">✕</button></div>
+      <div class="toolbar cwin-toolbar" id="uwin-toolbar"></div>
+      <div class="cwin-body">
+        <nav class="cwin-cats" id="uwin-cats"></nav>
+        <div class="cwin-main">
+          <div class="cwin-head" id="uwin-head"></div>
+          <div class="cwin-content" id="uwin-content"></div>
+          <div class="cwin-msg" id="uwin-msg" hidden></div>
+        </div>
+      </div>
+      <div class="statusbar cwin-status"><span id="uwin-status"></span></div>
+    </div>
+  </div>
+
+  <!-- software and vulnerability windows -->
+  <div class="cwin-layer" id="swin" hidden>
+    <div class="cwin" role="dialog" aria-modal="true">
+      <div class="cwin-title"><span id="swin-title"></span><button class="cwin-x" data-sw="close" aria-label="Close">✕</button></div>
+      <div class="toolbar cwin-toolbar" id="swin-toolbar"></div>
+      <div class="cwin-body">
+        <nav class="cwin-cats" id="swin-cats"></nav>
+        <div class="cwin-main">
+          <div class="cwin-head" id="swin-head"></div>
+          <div class="cwin-content" id="swin-content"></div>
+        </div>
+      </div>
+      <div class="statusbar cwin-status"><span id="swin-status"></span></div>
+    </div>
+  </div>
+
+  <div class="cwin-layer" id="vwin" hidden>
+    <div class="cwin" role="dialog" aria-modal="true">
+      <div class="cwin-title"><span id="vwin-title"></span><button class="cwin-x" data-vw="close" aria-label="Close">✕</button></div>
+      <div class="toolbar cwin-toolbar" id="vwin-toolbar"></div>
+      <div class="cwin-body">
+        <nav class="cwin-cats" id="vwin-cats"></nav>
+        <div class="cwin-main">
+          <div class="cwin-head" id="vwin-head"></div>
+          <div class="cwin-content" id="vwin-content"></div>
+        </div>
+      </div>
+      <div class="statusbar cwin-status"><span id="vwin-status"></span></div>
+    </div>
+  </div>
+
+  <div class="menu-pop" id="pop" hidden></div>
+  <div class="dlg-layer" id="dlg" hidden><div class="dlg" role="dialog" aria-modal="true"></div></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script src="/static/tt.js"></script>
+  <script src="/static/icons.js"></script>
+  <script src="/static/i18n.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/users.js"></script>
+  <script src="/static/printers.js"></script>
+  <script src="/static/software.js"></script>
+  <script src="/static/packages.js"></script>
+  <script src="/static/deployments.js"></script>
+  <script src="/static/remote.js"></script>
+  <script src="/static/winupdates.js"></script>
+</body>
+</html>

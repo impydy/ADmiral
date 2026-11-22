@@ -1,0 +1,37 @@
+bin/
+obj/
+*.user
+.vs/
+*.db
+*.db-journal
+admiral.toml
+TestResults/
+artifacts/
+publish/
+dist/
+packaging/MicrosoftEdgeWebview2Setup.exe
+
+# local data and secrets - never in the repo
+secrets.json
+*.db-wal
+*.db-shm
+logs/
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.snk
+release-key*
+latest.json
+sign.pfx
+
+# editor / tool leftovers
+.idea/
+.vscode/
+node_modules/
+*.swp
+.DS_Store
+Thumbs.db

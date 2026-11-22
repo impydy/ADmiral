@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ADmiral.Cli/ADmiral.Cli.csproj" />
+    <Project Path="src/ADmiral.Core/ADmiral.Core.csproj" />
+    <Project Path="src/ADmiral.Desktop/ADmiral.Desktop.csproj" />
+    <Project Path="src/ADmiral.Web/ADmiral.Web.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ADmiral.Tests/ADmiral.Tests.csproj" />
+  </Folder>
+</Solution>
