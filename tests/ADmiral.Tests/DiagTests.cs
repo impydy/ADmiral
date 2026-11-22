@@ -212,7 +212,9 @@ public class DiagTests
         L.LogDebug("detail three");
         Assert.DoesNotContain("detail three", Diag.ReadLog(Diag.DebugFile).Text);
         Assert.Throws<ArgumentException>(() => Diag.ReadLog("../../etc/passwd"));
-        File.WriteAllText(f.File(Diag.LogFile), string.Concat(Enumerable.Repeat("x\n", 400_000)));
+        // the logger still has admiral.log open: share it as the logger does (Windows refuses anything else)
+        using (var fs = new FileStream(f.File(Diag.LogFile), FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            fs.Write(System.Text.Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat("x\n", 400_000))));
         var big = Diag.ReadLog(Diag.LogFile, maxBytes: 1000);
         Assert.True(big.Truncated);
         Assert.True(big.Text.Length <= 1000);

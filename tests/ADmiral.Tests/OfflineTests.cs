@@ -33,7 +33,8 @@ public sealed class OfflineTests : IDisposable
         // Regenerate with Offline.WriteScript("scripts/ADmiral-Collect.ps1")
         var shipped = File.ReadAllText(Path.Combine(RepoRoot.Path, "scripts", Offline.ScriptName), Encoding.UTF8).Replace("\r\n", "\n");
         Assert.Equal(shipped, Offline.RenderScript());
-        Assert.Contains(Collector.CombinedScript().Trim(), Offline.RenderScript());    // same queries as the exe
+        // same queries as the exe (a Windows checkout may give the C# sources CRLF line ends; the rendered script is LF)
+        Assert.Contains(Collector.CombinedScript().Trim().Replace("\r\n", "\n"), Offline.RenderScript());
     }
 
     [Fact]
