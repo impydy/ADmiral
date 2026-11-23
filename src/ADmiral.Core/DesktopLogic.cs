@@ -541,7 +541,7 @@ public static partial class DesktopLogic
     // ------------------------------------------------------------------ the JS bridge (window.pywebview.api)
     /// <summary>Methods the page may call (the same names the Python shell exposed).</summary>
     public static readonly IReadOnlyList<string> BridgeMethods =
-        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "remote_assist", "open_url", "set_theme"];
+        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "save_log_package", "remote_assist", "open_url", "set_theme"];
 
     // ------------------------------------------------------------------ the window frame (title bar)
     /// <summary>Dark title bar? The ADmiral theme setting; "system" (or anything else) follows Windows' app mode.</summary>
@@ -670,6 +670,8 @@ public sealed class DesktopBridge(IDesktopShell shell, string home, Action<strin
             case "open_logs_folder":
                 OpenLogsFolder(arg(0));
                 return null;
+            case "save_log_package":
+                return SaveLogPackage(arg(0));
             case "remote_assist":
                 if (remoteAssist is null) throw new InvalidOperationException("Remote Assistance is not available");
                 remoteAssist(arg(0));
@@ -712,6 +714,34 @@ public sealed class DesktopBridge(IDesktopShell shell, string home, Action<strin
     {
         if (!DesktopLogic.IsAllowedExternalUrl(url, out var uri)) throw new ArgumentException("this link is not allowed");
         shell.OpenUrl(uri!);
+    }
+
+    /// <summary>Save one anonymized log package (<c>ADM-XXXX-XXXX</c>) as a .zip where the user picks. ADmiral runs as
+    /// administrator and its data folder is closed to the signed-in user, so Explorer cannot open the package folder
+    /// itself; the package holds no names, so a copy outside is fine. Returns the saved path (null = cancelled).</summary>
+    public string? SaveLogPackage(string packageId)
+    {
+        if (string.IsNullOrEmpty(packageId)) throw new ArgumentException("not a log package id");
+        var folder = DesktopLogic.LogsFolder(logFolder?.Invoke() ?? Diag.InstalledFolder, home, packageId);
+        if (!Directory.Exists(folder)) throw new InvalidOperationException("the log package no longer exists");
+        using var buf = new MemoryStream();
+        using (var zip = new System.IO.Compression.ZipArchive(buf, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach (var f in new DirectoryInfo(folder).EnumerateFiles("*", new EnumerationOptions
+                     { RecurseSubdirectories = false, AttributesToSkip = FileAttributes.ReparsePoint }).OrderBy(f => f.Name, StringComparer.Ordinal))
+            {
+                if (f.Length > DesktopLogic.MaxSaveBytes) continue;
+                var entry = zip.CreateEntry(f.Name, System.IO.Compression.CompressionLevel.Optimal);
+                using var to = entry.Open();
+                using var from = f.OpenRead();
+                from.CopyTo(to);
+            }
+        }
+        if (buf.Length > DesktopLogic.MaxSaveBytes) throw new ArgumentException("the file is too large");
+        var path = shell.PickSaveFile(packageId + ".zip");
+        if (string.IsNullOrEmpty(path)) return null;
+        File.WriteAllBytes(path, buf.ToArray());
+        return path;
     }
 
     /// <summary>Open the log folder, or one anonymized package in it (<c>ADM-XXXX-XXXX</c>; nothing else is accepted).</summary>

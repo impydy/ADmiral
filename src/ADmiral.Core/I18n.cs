@@ -19,6 +19,7 @@ public static partial class I18n
         ["sync.err_no_key"] = ("Nincs beállítva szinkronkulcs.", "No sync key is set."),
         ["sync.err_resolve"] = ("A(z) {peer} cím nem oldható fel: {err}", "Cannot resolve {peer}: {err}"),
         ["sync.err_network"] = ("A(z) {peer} nincs az engedélyezett hálózatban ({net}).", "{peer} is not inside the allowed network ({net})."),
+        ["sync.err_timeout"] = ("nem válaszolt {s} másodpercen belül", "no answer within {s} seconds"),
         ["sync.err_connect"] = ("Nem érhető el a másik ADmiral ({peer}): {err}. Fut, be van kapcsolva a szinkron, és a tűzfal engedi a portot?", "Cannot reach the other ADmiral ({peer}): {err}. Is it running with sync enabled, and does the firewall allow the port?"),
         ["sync.err_key"] = ("A másik oldal elutasította az üzenetet: a szinkronkulcs nem egyezik (vagy az órák eltérnek 5 percnél jobban).", "The other side rejected the message: the sync key differs (or the clocks differ by more than 5 minutes)."),
         ["sync.err_forbidden"] = ("A másik oldal nem fogad kapcsolatot erről a címről (más hálózat).", "The other side does not accept connections from this address (different network)."),

@@ -827,7 +827,8 @@ public sealed partial class SyncManager : IDisposable
             }
             catch (Exception exc) when (exc is HttpRequestException or OperationCanceledException or IOException)
             {
-                throw new SyncError(I18n.T("sync.err_connect", ("peer", $"{host}:{port}"), ("err", exc.GetType().Name)), exc);
+                var why = exc is OperationCanceledException ? I18n.T("sync.err_timeout", ("s", timeoutSeconds + 5)) : exc.GetType().Name;
+                throw new SyncError(I18n.T("sync.err_connect", ("peer", $"{host}:{port}"), ("err", why)), exc);
             }
             if (!busy || attempt >= BusyRetries) break;
             Thread.Sleep(BusyDelay * (attempt + 1));

@@ -205,6 +205,39 @@ public class SyncDataTests
     }
 
     [Fact]
+    public void APeerWithoutInventoryNeverWipesOurs()
+    {
+        // b knows the computer (its AD sync is newer, its collection failed); a has an older but real inventory
+        using var a = StoreWith("PC-1");
+        using var b = StoreWith("PC-1");
+        a.RecordInventory("g-pc-1", new JsonObject { ["model"] = "Latitude", ["apps"] = new JsonArray(new JsonObject { ["name"] = "7-Zip", ["version"] = "24.09" }) });
+        a.AddLogons("g-pc-1", [new JsonObject { ["time"] = "2026-11-01T08:00:00+00:00", ["user"] = "anna", ["domain"] = "CORP", ["type"] = 2 }]);
+        b.AddLogons("g-pc-1", [new JsonObject { ["time"] = "2026-11-02T08:00:00+00:00", ["user"] = "bela", ["domain"] = "CORP", ["type"] = 2 }]);
+        var later = Db.FormatUtc(DateTimeOffset.UtcNow.AddMinutes(2));
+        b.Execute("UPDATE computers SET ad_synced_at = ?, last_scan_attempt = ?, collect_error = 'RPC unavailable', scan_status = 'failed' WHERE guid = 'g-pc-1'", later, later);
+        var da = new SyncData(a);
+        var db = new SyncData(b);
+
+        var (pull, push) = SyncData.Plan(da.Manifest("computers"), db.Manifest("computers"));
+        Assert.Contains("g-pc-1", pull);                   // b's record is newer as a whole...
+        Assert.Contains("g-pc-1", push);                   // ...but a's inventory is newer: it goes to b as well
+        da.Apply("computers", [.. db.Export("computers", ["g-pc-1"])]);
+        var row = a.Query("SELECT * FROM computers WHERE guid = 'g-pc-1'")[0];
+        Assert.Contains("Latitude", (string)row["inventory"]!);            // kept
+        Assert.NotNull(row["collected_at"]);
+        Assert.Equal("RPC unavailable", row["collect_error"]);              // the newer failed attempt is shown
+        Assert.True((long)a.Scalar("SELECT COUNT(*) FROM computer_items WHERE guid = 'g-pc-1' AND kind = 'apps'")! > 0);
+        Assert.Equal(["anna", "bela"], a.Items("g-pc-1")["logons"].Select(l => (string)l!["user"]!).Order());   // merged
+
+        db.Apply("computers", [.. da.Export("computers", ["g-pc-1"])]);   // b gets the inventory it never collected
+        Assert.Contains("Latitude", (string)b.Scalar("SELECT inventory FROM computers WHERE guid = 'g-pc-1'")!);
+        Assert.True((long)b.Scalar("SELECT COUNT(*) FROM computer_items WHERE guid = 'g-pc-1' AND kind = 'apps'")! > 0);
+        var (p2, s2) = SyncData.Plan(da.Manifest("computers"), db.Manifest("computers"));
+        Assert.Equal(da.Manifest("computers")["g-pc-1"].Split('|')[2], db.Manifest("computers")["g-pc-1"].Split('|')[2]);
+        Assert.DoesNotContain("g-pc-1", s2);                // nothing left to send back
+    }
+
+    [Fact]
     public void BadlyTypedRecordsAreSkipped()
     {
         using var s = StoreWith("PC-1");

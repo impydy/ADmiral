@@ -82,6 +82,51 @@ public sealed class LoginsTests : IDisposable
     private static Settings Cfg(string folder, bool enabled = true) => new() { Logins = { Enabled = enabled, Path = folder } };
 
     [Fact]
+    public void ScriptWritesTheLogFileInPlace()
+    {
+        var text = Logins.RenderScript(@"\\srv\logins$");
+        Assert.DoesNotContain("Move-Item", text);                  // no rename: the computers need no delete right
+        Assert.Contains("[IO.FileMode]::CreateNew", text);         // never overwrites a planted file
+        Assert.Contains("[IO.FileShare]::None", text);             // locked while it is written
+        Assert.Contains("NewGuid", text);
+    }
+
+    [Fact]
+    public void LeftOverTmpFilesOfTheOldScriptAreImported()
+    {
+        using var store = InboxFixture.NewStore();
+        var folder = _tmp.File("legacy");
+        Directory.CreateDirectory(folder);
+        var old = Path.Combine(folder, "PC1_20300102080000_123456.tmp");
+        var young = Path.Combine(folder, "PC2_20300102080000_99.tmp");
+        var other = Path.Combine(folder, "PC1.admiral.json.abc.tmp");          // not a login file: never touched
+        File.WriteAllBytes(old, Entry("PC1", user: "regi", when: "2030-01-02T08:00:00.0000000Z"));
+        File.WriteAllBytes(young, Entry("PC2"));
+        File.WriteAllBytes(other, Entry("PC1"));
+        File.SetLastWriteTimeUtc(old, DateTime.UtcNow.AddHours(-3));
+        File.SetLastWriteTimeUtc(other, DateTime.UtcNow.AddHours(-3));
+        var r = Logins.ImportFolder(store, Cfg(folder));
+        Assert.Equal((1, 1, 0), (r.Found, r.Imported, r.Failed));
+        Assert.False(File.Exists(old));
+        Assert.True(File.Exists(young));                                       // may still be written: next time
+        Assert.True(File.Exists(other));
+        Assert.Equal("regi", (string?)store.Items("g-pc1")["logons"][0]["user"]);
+        File.WriteAllText(old, "{half");                                       // a broken one is set aside, not read again
+        File.SetLastWriteTimeUtc(old, DateTime.UtcNow.AddHours(-3));
+        Assert.Equal(1, Logins.ImportFolder(store, Cfg(folder)).Failed);
+        Assert.True(File.Exists(Path.ChangeExtension(old, ".bad")));
+    }
+
+    [Fact]
+    public void ComputerNamesInAnyScriptAreAccepted()
+    {
+        var (c, _) = Logins.ParseEntry(Entry("KÖNYVELÉS-PC"));
+        Assert.Equal("KÖNYVELÉS-PC", c);
+        Assert.Throws<FormatException>(() => Logins.ParseEntry(Entry("-PC")));
+        Assert.Throws<FormatException>(() => Logins.ParseEntry(Entry("PC\\..")));
+    }
+
+    [Fact]
     public void ImportFolder()
     {
         using var store = InboxFixture.NewStore();

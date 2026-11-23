@@ -131,6 +131,27 @@ public class LogReportTests
     }
 
     [Fact]
+    public void JsonLinesAreAnonymizedPerString()
+    {
+        // the error ledger is JSON: "Task`1" is written as Task\u00601 and "Kovács" as Kov\u00E1cs. Neither may be taken
+        // for (or hide) a DOMAIN\user
+        var line = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            message = "Logon of CORP\\kovács on pc-77.corp.local failed: \"x\"",
+            traceback = "at System.Threading.Tasks.Task`1.InnerInvoke()\r\n   at Func`2.Invoke(Action`1 a)",
+        });
+        Assert.Contains("\\u0060", line);
+        var anon = new Anonymizer();
+        LogReport.MapJsonLines(line + "\nnot json CORP\\bela", s => { anon.Discover(s); return s; });
+        Assert.DoesNotContain("task", anon.Domains);
+        var outp = LogReport.MapJsonLines(line + "\nnot json CORP\\bela", anon.Apply);
+        Assert.Contains("Task`1.InnerInvoke", outp);
+        Assert.Contains("Func`2.Invoke(Action`1 a)", outp);
+        Assert.Empty(LogReport.NamesIn(outp, ["kovács", "bela", "corp"]));
+        Assert.NotNull(System.Text.Json.Nodes.JsonNode.Parse(outp.Split('\n')[0]));      // still one JSON object per line
+    }
+
+    [Fact]
     public void NewIdShape()
     {
         var ids = Enumerable.Range(0, 50).Select(_ => LogReport.NewId()).ToList();

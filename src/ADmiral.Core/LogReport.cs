@@ -411,15 +411,25 @@ public static partial class LogReport
         folder ??= Diag.InstalledFolder ?? ".";
         var reportId = NewId();
         var texts = new Dictionary<string, string>();
-        foreach (var p in LogFilePaths(folder)) texts[OutName(Path.GetFileName(p))] = Diag.Redact(TailText(p));
+        var jsonl = new HashSet<string>(StringComparer.Ordinal);         // JSON lines: names are found / hidden per string
+        foreach (var p in LogFilePaths(folder))
+        {
+            var outName = OutName(Path.GetFileName(p));
+            texts[outName] = Diag.Redact(TailText(p));
+            if (Path.GetFileName(p).Contains(".jsonl", StringComparison.OrdinalIgnoreCase)) jsonl.Add(outName);
+        }
         texts["error-report.txt"] = Diag.Redact(Diag.Report(folder));
 
         var anon = new Anonymizer();
         SettingsNames(settings, anon);
         DbNames(store, anon);
         SessionNames(anon);
-        foreach (var t in texts.Values) anon.Discover(t);
-        var outFiles = texts.ToDictionary(kv => kv.Key, kv => anon.Apply(kv.Value));
+        foreach (var (name, t) in texts)
+        {
+            if (jsonl.Contains(name)) MapJsonLines(t, s => { anon.Discover(s); return s; });
+            else anon.Discover(t);
+        }
+        var outFiles = texts.ToDictionary(kv => kv.Key, kv => jsonl.Contains(kv.Key) ? MapJsonLines(kv.Value, anon.Apply) : anon.Apply(kv.Value));
         var counts = anon.Found.Where(kv => kv.Value.Count > 0).ToDictionary(kv => kv.Key.ToLowerInvariant(), kv => kv.Value.Count);
 
         var info = new[]
@@ -441,6 +451,46 @@ public static partial class LogReport
         if (Log.Logger.IsEnabled(LogLevel.Information))
             Log.Logger.LogInformation("Anonymized log package {Id} written ({Count} files)", reportId, outFiles.Count);
         return new LogPackage(reportId, target, [.. outFiles.Keys.Order(StringComparer.Ordinal)], counts, RepoIssues);
+    }
+
+    private static readonly JsonSerializerOptions Readable = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,      // plain text file: keep "é" readable
+    };
+
+    /// <summary>Run <paramref name="map"/> over every string of every JSON line (names and values), so JSON escapes
+    /// (<c>\u0060</c>, <c>\"</c>, <c>\r\n</c>) are never mistaken for a <c>DOMAIN\user</c> and an escaped name
+    /// (<c>Kov\u00E1cs</c>) is still found. A line that is not JSON is mapped as a whole.</summary>
+    internal static string MapJsonLines(string text, Func<string, string> map)
+    {
+        var lines = text.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].TrimEnd('\r');
+            if (line.Length == 0) continue;
+            JsonNode? node;
+            try { node = JsonNode.Parse(line); }
+            catch (JsonException) { node = null; }
+            lines[i] = node is null ? map(line) : (MapNode(node, map)?.ToJsonString(Readable) ?? "null");
+        }
+        return string.Join('\n', lines);
+    }
+
+    private static JsonNode? MapNode(JsonNode? node, Func<string, string> map)
+    {
+        switch (node)
+        {
+            case JsonObject o:
+                var copy = new JsonObject();
+                foreach (var (k, v) in o.ToList()) copy[k] = MapNode(v, map);      // the keys are ADmiral's own
+                return copy;
+            case JsonArray a:
+                return new JsonArray([.. a.Select(v => MapNode(v, map))]);
+            case JsonValue v when v.GetValueKind() == JsonValueKind.String:
+                return JsonValue.Create(map(v.GetValue<string>()));
+            default:
+                return node?.DeepClone();
+        }
     }
 
     /// <summary>The given names that still occur in <paramref name="text"/> (case-insensitive, whole words).</summary>

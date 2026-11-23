@@ -73,6 +73,22 @@ public sealed class SyncData
         """,
     ];
 
+    /// <summary>The collected inventory: taken from a peer only when its collection is newer (<c>collected_at</c>).</summary>
+    private static readonly HashSet<string> InventoryCols = ["inventory", "collected_at"];
+    /// <summary>The last collection attempt: newer collection or newer attempt (<c>last_scan_attempt</c>).</summary>
+    private static readonly HashSet<string> AttemptCols = ["collect_error", "scan_status", "last_scan_attempt"];
+    /// <summary>The reachability scan: newer <c>scanned_at</c>.</summary>
+    private static readonly HashSet<string> ScanCols = ["ip", "online", "open_ports", "scanned_at"];
+
+    private static JsonNode? Parse(string data)
+    {
+        try { return JsonNode.Parse(data); }
+        catch (JsonException) { return null; }
+    }
+
+    private string LogonsOf(string guid) =>
+        string.Join("\n", _store.Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'logons' ORDER BY pos", guid).Select(r => S(r["data"])));
+
     private static readonly string[] FleetCols = ["description", "kind", "rules", "ad_group_dn", "created", "updated"];
 
     private readonly Store _store;
@@ -107,6 +123,14 @@ public sealed class SyncData
         return i < 0 ? (value ?? "", "") : (value![..i], value[(i + 1)..]);
     }
 
+    /// <summary>The collected_at part of a computer's manifest extra ("tags|collected_at"); null when there is none
+    /// (other categories, or a peer before 0.6.2).</summary>
+    private static string? Inventory(string extra)
+    {
+        var i = extra.IndexOf('|', StringComparison.Ordinal);
+        return i < 0 ? null : extra[(i + 1)..];
+    }
+
     /// <summary>(keys to pull from the peer, keys to push to it) for two manifests {key: "timestamp[|tag hash]"}.</summary>
     public static (List<string> Pull, List<string> Push) Plan(IReadOnlyDictionary<string, string> local, IReadOnlyDictionary<string, string> remote)
     {
@@ -123,9 +147,14 @@ public sealed class SyncData
             var (lt, lh) = Split(lv);
             var (rt, rh) = Split(rv);
             var c = string.CompareOrdinal(rt, lt);
-            if (c > 0) pull.Add(key);
-            else if (c < 0) push.Add(key);
-            else if (lh != rh)                        // same data, different tags: exchange both ways (union)
+            // computers: "ts|tags|collected_at". The side with the newer inventory sends it even when the other side's
+            // record is newer as a whole (it saw the computer later but could not collect it)
+            var li = Inventory(lh);
+            var ri = Inventory(rh);
+            var inv = li is not null && ri is not null ? string.CompareOrdinal(ri, li) : 0;
+            if (c > 0 || inv > 0) pull.Add(key);
+            if (c < 0 || inv < 0) push.Add(key);
+            if (c == 0 && inv == 0 && lh != rh)       // same data, different tags: exchange both ways (union)
             {
                 pull.Add(key);
                 push.Add(key);
@@ -171,7 +200,7 @@ public sealed class SyncData
                     var g = S(r["guid"]);
                     var list = tags.TryGetValue(g, out var l) ? l.Order(StringComparer.Ordinal) : Enumerable.Empty<string>();
                     var h = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", list))))[..16];
-                    outp[g] = $"{MaxTs(r)}|{h}";
+                    outp[g] = $"{MaxTs(r)}|{h}|{S(r["collected_at"])}";      // + when its inventory was collected
                 }
                 break;
             case "fleets":
@@ -363,47 +392,71 @@ public sealed class SyncData
                     foreach (var k in AdOwnedCols) row.Remove(k);
             }
             foreach (var k in NeverFromPeer) row.Remove(k);
-            var changed = false;
-            if (cur is null || string.CompareOrdinal(rts, MaxTs(cur)) > 0)
+            // validate the items before anything is written
+            var items = new List<(string Kind, long Pos, string Data)>();
+            foreach (var it in rec["items"] as JsonArray ?? [])
             {
-                // validate the items before anything is written
-                var items = new List<(string Kind, long Pos, string Data)>();
-                foreach (var it in rec["items"] as JsonArray ?? [])
+                if (it is not JsonArray { Count: 3 } a || Str(a[0]) is not { } kind || Long(a[1]) is not { } pos || Str(a[2]) is not { } data)
                 {
-                    if (it is not JsonArray { Count: 3 } a || Str(a[0]) is not { } kind || Long(a[1]) is not { } pos || Str(a[2]) is not { } data)
-                    {
-                        bad = true;
-                        break;
-                    }
-                    items.Add((kind, pos, data));
+                    bad = true;
+                    break;
                 }
-                if (bad) continue;
+                items.Add((kind, pos, data));
+            }
+            if (bad) continue;
+            var changed = false;
+            if (cur is null)
+            {
+                // only a peer knows it: its host name is the peer's word - no scan / collection / retry until our AD has it
                 var names = row.Keys.ToList();             // column names: only ones PRAGMA table_info listed
-                if (cur is null)
+                if (cols.Contains("allow_scan"))
                 {
-                    // only a peer knows it: its host name is the peer's word - no scan / collection / retry until our AD has it
-                    if (cols.Contains("allow_scan"))
-                    {
-                        row["allow_scan"] = 0L;
-                        names.Add("allow_scan");
-                    }
-                    s.Execute($"INSERT INTO computers ({string.Join(", ", names)}) VALUES ({string.Join(", ", names.Select(_ => "?"))})",
-                              [.. names.Select(k => row[k])]);
-                    s.Execute("INSERT OR IGNORE INTO sync_unconfirmed (guid, added) VALUES (?, ?)", guid, Db.UtcNow());
-                    if (Log.Logger.IsEnabled(LogLevel.Information))
-                        Log.Logger.LogInformation("Sync: new computer {Name} from a peer; not scanned until this instance's AD sync lists it", name);
+                    row["allow_scan"] = 0L;
+                    names.Add("allow_scan");
                 }
-                else
-                {
-                    var sets = names.Where(k => k != "guid").ToList();
-                    if (sets.Count > 0)
-                        s.Execute($"UPDATE computers SET {string.Join(", ", sets.Select(k => k + " = ?"))} WHERE guid = ?",
-                                  [.. sets.Select(k => row[k]), guid]);
-                }
-                s.Execute("DELETE FROM computer_items WHERE guid = ?", guid);
+                s.Execute($"INSERT INTO computers ({string.Join(", ", names)}) VALUES ({string.Join(", ", names.Select(_ => "?"))})",
+                          [.. names.Select(k => row[k])]);
+                s.Execute("INSERT OR IGNORE INTO sync_unconfirmed (guid, added) VALUES (?, ?)", guid, Db.UtcNow());
                 foreach (var (kind, pos, data) in items)
                     s.Execute("INSERT OR REPLACE INTO computer_items (guid, kind, pos, data) VALUES (?, ?, ?, ?)", guid, kind, pos, data);
+                if (Log.Logger.IsEnabled(LogLevel.Information))
+                    Log.Logger.LogInformation("Sync: new computer {Name} from a peer; not scanned until this instance's AD sync lists it", name);
                 changed = true;
+            }
+            else
+            {
+                // every part of the record goes by its own time: a peer that saw the computer later (AD sync, a failed
+                // attempt) but never collected it must not replace an older inventory with nothing
+                bool Newer(string col) => row.ContainsKey(col) && string.CompareOrdinal(S(row[col]), cur.TryGetValue(col, out var v) ? S(v) : "") > 0;
+                var takeInventory = Newer("collected_at");
+                var takeAttempt = takeInventory || Newer("last_scan_attempt");
+                var takeScan = Newer("scanned_at");
+                var takeRest = string.CompareOrdinal(rts, MaxTs(cur)) > 0;
+                var sets = row.Keys.Where(k => k != "guid" && (
+                    InventoryCols.Contains(k) ? takeInventory
+                    : AttemptCols.Contains(k) ? takeAttempt
+                    : ScanCols.Contains(k) ? takeScan
+                    : takeRest)).ToList();
+                if (sets.Count > 0)
+                {
+                    s.Execute($"UPDATE computers SET {string.Join(", ", sets.Select(k => k + " = ?"))} WHERE guid = ?",
+                              [.. sets.Select(k => row[k]), guid]);
+                    changed = true;
+                }
+                if (takeInventory)
+                {
+                    s.Execute("DELETE FROM computer_items WHERE guid = ? AND kind <> 'logons'", guid);
+                    foreach (var (kind, pos, data) in items.Where(i => i.Kind != "logons"))
+                        s.Execute("INSERT OR REPLACE INTO computer_items (guid, kind, pos, data) VALUES (?, ?, ?, ?)", guid, kind, pos, data);
+                }
+                // the logon history is merged (never replaced): both sides may have seen other logons
+                var logons = items.Where(i => i.Kind == "logons").Select(i => Parse(i.Data)).Where(n => n is not null).ToList();
+                if (logons.Count > 0)
+                {
+                    var before = LogonsOf(guid);
+                    s.AddLogons(guid, logons);
+                    changed |= LogonsOf(guid) != before;
+                }
             }
             foreach (var t in rec["tags"] as JsonArray ?? [])
                 if (Str(t) is { Length: > 0 } tag)

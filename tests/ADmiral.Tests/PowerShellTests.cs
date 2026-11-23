@@ -40,6 +40,9 @@ function Get-CimInstance {
     'Win32_QuickFixEngineering' {
       [pscustomobject]@{ HotFixID = 'KB5044285'; Description = 'Security Update'; InstalledOn = '10/15/2026'; InstalledBy = 'NT AUTHORITY\SYSTEM' }
       [pscustomobject]@{ HotFixID = 'KB5043080'; Description = 'Update'; InstalledOn = '01d9a5b2c3d4e5f6'; InstalledBy = '' }
+      [pscustomobject]@{ HotFixID = 'KB5043081'; Description = 'Update'; InstalledOn = ''; InstalledBy = '' }
+      [pscustomobject]@{ HotFixID = 'KB5043082'; Description = 'Update'; InstalledOn = 'tegnap'; InstalledBy = '' }
+      [pscustomobject]@{ HotFixID = 'KB5043083'; Description = 'Update'; InstalledOn = '20261102'; InstalledBy = '' }
     }
     'Win32_Service' {
       [pscustomobject]@{ Name = 'WinRM'; DisplayName = 'Windows Remote Management (WS-Management)'; State = 'Running'; StartMode = 'Auto'; StartName = 'NT AUTHORITY\NetworkService' }
@@ -227,7 +230,10 @@ function net { @('Alias name     Administrators', 'Comment        Administrators
         Assert.Equal("KB5044285", (string?)hf[0]!["id"]);
         Assert.Equal("2026-10-15", (string?)hf[0]!["installed_on"]);
         Assert.Equal("NT AUTHORITY\\SYSTEM", (string?)hf[0]!["installed_by"]);
-        Assert.Null(hf[1]!["installed_on"]);                         // unparseable WMI date -> null, not a crash
+        Assert.Equal("2023-06-23", (string?)hf[1]!["installed_on"]);   // hex FILETIME
+        Assert.Null(hf[2]!["installed_on"]);                         // empty / unparseable WMI date -> null, not a crash
+        Assert.Null(hf[3]!["installed_on"]);
+        Assert.Equal("2026-11-02", (string?)hf[4]!["installed_on"]);
     }
 
     [PwshFact]

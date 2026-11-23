@@ -25,7 +25,7 @@ internal static partial class Inbox
 {
     /// <summary>The regular files directly in <paramref name="folder"/> whose name ends with <paramref name="suffix"/>
     /// (case-insensitive), sorted. Links / junctions (reparse points) and sub-folders are never followed; names with
-    /// anything but letters, digits, '_', '-', '.' are skipped (logged), so no name can address another folder.</summary>
+    /// anything but letters (any script), digits, '_', '-', '.' are skipped (logged), so no name can address another folder.</summary>
     public static List<string> List(string folder, string suffix)
     {
         var outList = new List<string>();
@@ -52,7 +52,7 @@ internal static partial class Inbox
         return outList;
     }
 
-    [GeneratedRegex(@"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$")]
+    [GeneratedRegex(@"\A[\p{L}\p{N}_][\p{L}\p{N}_.-]{0,199}\z")]
     private static partial Regex SafeName();
 
     /// <summary>Read at most <paramref name="maxBytes"/> (a larger file is refused without reading it all).</summary>

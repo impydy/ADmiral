@@ -1673,7 +1673,10 @@ function renderSettings(el) {
           <div class="faint">${esc(t("s.lp_steps"))}</div>
           <div class="chk" style="gap:10px">${isDesktop() ? `<button class="btn" id="lp-open" type="button">${esc(t("s.lp_open"))}</button>` : ""}<button class="btn primary" id="lp-issue" type="button">${esc(t("s.lp_issue"))}</button></div>`;
         $("#lp-copy").onclick = async () => { await copyText(r.id); toast(t("s.diag_copied")); };
-        if ($("#lp-open")) $("#lp-open").onclick = () => guard(() => window.pywebview.api.open_logs_folder(r.id));
+        if ($("#lp-open")) $("#lp-open").onclick = () => guard(async () => {
+          const path = await window.pywebview.api.save_log_package(r.id);
+          if (path) toast(tText("s.lp_saved", { path }));
+        });
         $("#lp-issue").onclick = () => guard(() => openUrl(url));
       } finally { btn.disabled = false; }
     });
@@ -1817,7 +1820,14 @@ function renderSettings(el) {
       const f = $("#sy-key"); f.type = "text"; f.value = key; f.select();
       toast(t("s.sy_gen_done"));
     };
+    const noPeer = () => {
+      if ($("#sy-peer").value.trim()) return false;
+      toast(t("s.sy_no_peer"), true);
+      $("#sy-peer").focus();
+      return true;
+    };
     $("#sy-test").onclick = () => guard(async () => {
+      if (noPeer()) return;
       await api("PUT", "/api/settings", collect());
       const r = await api("POST", "/api/sync/test");
       const bad = (r.peers || []).filter((p) => !p.ok);
@@ -1825,6 +1835,7 @@ function renderSettings(el) {
         + (bad.length ? " · " + bad.map((p) => `${p.peer}: ${p.error}`).join(" · ") : ""), bad.length > 0);
     });
     $("#sy-run").onclick = () => guard(async () => {
+      if (noPeer()) return;
       await api("PUT", "/api/settings", collect());
       startJob("sync");
       setTimeout(() => guard(drawSync), 4000);

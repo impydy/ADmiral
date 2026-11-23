@@ -2222,7 +2222,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     }
 
     // ------------------------------------------------------------------ remote assistance
-    [GeneratedRegex(@"^[A-Za-z0-9]([A-Za-z0-9._-]{0,253}[A-Za-z0-9])?$")]
+    [GeneratedRegex(@"\A[\p{L}\p{N}]([\p{L}\p{N}._-]{0,253}[\p{L}\p{N}])?\z")]
     private static partial Regex HostnameRe();
 
     /// <summary>The validated host name for <c>msra /offerra</c> (a stray trailing "-" / "." is dropped). Throws

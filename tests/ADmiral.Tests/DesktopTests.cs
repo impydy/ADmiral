@@ -458,7 +458,7 @@ public sealed class DesktopBridgeTests
     [Fact]
     public void ExposesExactlyThePythonBridgeMethods()
     {
-        Assert.Equal(["open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file", "set_theme"],
+        Assert.Equal(["open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file", "save_log_package", "set_theme"],
                      DesktopLogic.BridgeMethods.Order(StringComparer.Ordinal));
         using var tmp = new CoreTemp();
         var b = new DesktopBridge(new FakeShell(null), tmp.Path, remoteAssist: _ => { }, logFolder: () => tmp.Path);
@@ -466,6 +466,7 @@ public sealed class DesktopBridgeTests
         {
             try { b.Call(m, _ => ""); }
             catch (ArgumentException exc) { Assert.DoesNotContain("unknown bridge method", exc.Message); }
+            catch (InvalidOperationException) { }
         }
     }
 
@@ -498,6 +499,25 @@ public sealed class DesktopBridgeTests
         foreach (var bad in new[] { "..", "../../Windows", "ADM-AB12-CD34\\..\\..", "C:\\Windows", "adm-ab12-cd34x", "ADM-AB12-CD34\n" })
             Assert.Throws<ArgumentException>(() => b.OpenLogsFolder(bad));
         Assert.Equal(Path.Combine(tmp.Path, "logs"), DesktopLogic.LogsFolder(null, tmp.Path, ""));
+    }
+
+    [Fact]
+    public void SaveLogPackageWritesAZipOfThePackageOnly()
+    {
+        using var tmp = new CoreTemp();
+        var pkg = Path.Combine(tmp.Path, LogReport.OutDir, "ADM-AB12-CD34");
+        Directory.CreateDirectory(pkg);
+        File.WriteAllText(Path.Combine(pkg, "README.txt"), "hello");
+        File.WriteAllText(Path.Combine(pkg, "admiral.log"), "log");
+        var target = tmp.File("out.zip");
+        var b = new DesktopBridge(new FakeShell(target), tmp.Path, logFolder: () => tmp.Path);
+        Assert.Equal(target, b.SaveLogPackage("ADM-AB12-CD34"));
+        using (var zip = System.IO.Compression.ZipFile.OpenRead(target))
+            Assert.Equal(["README.txt", "admiral.log"], zip.Entries.Select(e => e.FullName).Order(StringComparer.Ordinal));
+        Assert.Throws<InvalidOperationException>(() => b.SaveLogPackage("ADM-ZZ12-CD34"));            // no such package
+        foreach (var bad in new[] { "", "..", "ADM-AB12-CD34\\..", "C:\\Windows" })
+            Assert.Throws<ArgumentException>(() => b.SaveLogPackage(bad));
+        Assert.Null(new DesktopBridge(new FakeShell(null), tmp.Path, logFolder: () => tmp.Path).SaveLogPackage("ADM-AB12-CD34"));   // cancelled
     }
 
     [Fact]

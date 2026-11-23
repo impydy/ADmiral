@@ -172,7 +172,14 @@ public partial class PdqTests
     [InlineData("10.0.0.5", true)]
     [InlineData("fe80::1", true)]
     [InlineData("pc1..corp", false)]
-    [InlineData("pc-.corp", false)]
+    [InlineData("pc-.corp", true)]                // Windows accepts a name ending in '-'
+    [InlineData("KÖNYVELÉS-PC.corp.local", true)]
+    [InlineData("pc-", true)]
+    [InlineData("-pc", false)]
+    [InlineData("pc.-x", false)]
+    [InlineData("pc1\n", false)]
+    [InlineData("pc\u2013x", false)]           // an en dash is not a hyphen
+    [InlineData("pc$", false)]
     [InlineData("pc 1", false)]
     public void HostValidation(string host, bool ok) => Assert.Equal(ok, Remote.IsValidHost(host));
 

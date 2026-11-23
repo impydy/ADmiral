@@ -290,7 +290,12 @@ $r.nics = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled
   [ordered]@{ name = $_.Description; mac = $_.MACAddress; ip = ($_.IPAddress -join ', ');
     gateway = ($_.DefaultIPGateway -join ', '); dns = ($_.DNSServerSearchOrder -join ', '); dhcp = [bool]$_.DHCPEnabled } })
 $r.hotfixes = @(Get-CimInstance Win32_QuickFixEngineering | ForEach-Object {
-  $d = $null; try { $d = ([datetime]$_.InstalledOn).ToString('yyyy-MM-dd') } catch {}
+  # the raw WMI value: PowerShell's own InstalledOn property throws for empty / some values (into $Error)
+  $raw = if ($_.PSObject.Properties['CimInstanceProperties']) { [string]$_.CimInstanceProperties['InstalledOn'].Value } else { [string]$_.InstalledOn }
+  $d = $null; $p = [datetime]::MinValue
+  if ($raw -match '^[0-9A-Fa-f]{16}$') { $t = [Convert]::ToInt64($raw, 16); if ($t -gt 0 -and $t -lt 2650467743999999999) { $d = [datetime]::FromFileTimeUtc($t).ToString('yyyy-MM-dd') } }
+  elseif ($raw -and [datetime]::TryParseExact($raw, [string[]]@('M/d/yyyy', 'MM/dd/yyyy', 'yyyyMMdd', 'yyyy-MM-dd', 'yyyy.MM.dd', 'yyyy. MM. dd.'),
+      [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$p)) { $d = $p.ToString('yyyy-MM-dd') }
   [ordered]@{ id = $_.HotFixID; description = $_.Description; installed_on = $d; installed_by = $_.InstalledBy } })
 """";
     private const string PsApps = """"

@@ -131,10 +131,12 @@ public sealed class CleanupReport(string host)
 /// <summary>Validation of the values that end up in remote paths and service command lines.</summary>
 public static partial class Remote
 {
-    [GeneratedRegex(@"^(?=.{1,253}\.?$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?$")]
+    // labels of letters (any script: AD allows "KÖNYVELÉS-PC"), digits, '_' and '-'; a label never starts with '-' (so a
+    // name can never look like a command-line switch), but may end with one (Windows accepts "PC-")
+    [GeneratedRegex(@"\A(?=.{1,253}\z)[\p{L}\p{N}_][\p{L}\p{N}_-]{0,62}(?:\.[\p{L}\p{N}_][\p{L}\p{N}_-]{0,62})*\.?\z")]
     private static partial Regex HostName();
 
-    /// <summary>A DNS / NetBIOS host name or an IP address; anything else (spaces, quotes, slashes, '%', '&amp;'...)
+    /// <summary>A DNS / NetBIOS host name (letters of any script) or an IP address; anything else (spaces, quotes, slashes, '%', '&amp;', '$'...)
     /// is refused before it reaches a UNC path, an SCM call or a remoting request.</summary>
     public static bool IsValidHost(string? host)
     {
@@ -689,7 +691,14 @@ public sealed class NativeRemoteFiles : IRemoteFiles
         {
             if (!task.Wait(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds))))
             {
-                task.ContinueWith(t => t.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
+                // the attempt goes on in the background: close the connection if it still succeeds, and observe its
+                // failure (otherwise the finalizer reports it as an "unobserved task exception" error)
+                task.ContinueWith(t =>
+                {
+                    if (t.IsFaulted && Log.Logger.IsEnabled(LogLevel.Debug)) Log.Logger.LogDebug("SMB {Host}: the abandoned connection attempt failed: {Error}", host, t.Exception?.InnerException?.Message);
+                    else if (t.IsCompletedSuccessfully) t.Result.Dispose();
+                    _ = t.Exception;                       // observed, whatever the log level
+                }, TaskScheduler.Default);
                 throw new TimeoutException($"SMB connection to {host} timed out after {timeoutSeconds}s");
             }
         }
