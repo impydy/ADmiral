@@ -28,6 +28,11 @@
 #ifndef AppVersion
   #define AppVersion "0.6.2"
 #endif
+; The version shown and used in the file name; a beta build passes e.g. /DVersionLabel=0.6.2-beta.7 with a numeric
+; /DAppVersion=0.6.2.7 (Windows' file version must be numbers only). Normal builds: the same as AppVersion.
+#ifndef VersionLabel
+  #define VersionLabel AppVersion
+#endif
 #ifndef SourceDir
   #define SourceDir "..\dist\ADmiral"
 #endif
@@ -36,8 +41,8 @@
 [Setup]
 AppId={{C6865C1C-D795-424A-AA11-A858F9475B4D}
 AppName={#AppName}
-AppVersion={#AppVersion}
-AppVerName={#AppName} {#AppVersion}
+AppVersion={#VersionLabel}
+AppVerName={#AppName} {#VersionLabel}
 AppPublisher=TidecrestLabs
 AppPublisherURL=https://tidecrestlabs.com/
 AppSupportURL=https://tidecrestlabs.com/
@@ -54,7 +59,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir=..\dist
-OutputBaseFilename=ADmiral-Setup-{#AppVersion}
+OutputBaseFilename=ADmiral-Setup-{#VersionLabel}
 SetupIconFile=..\src\ADmiral.Web\wwwroot\admiral.ico
 UninstallDisplayIcon={app}\ADmiral.exe
 UninstallDisplayName={#AppName}
