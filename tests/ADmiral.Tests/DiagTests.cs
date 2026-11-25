@@ -168,7 +168,7 @@ public class DiagTests
         {
             Diag.MainMaxBytes = 4000;
             for (var i = 0; i < 2000; i++)
-                L.LogInformation("line {N} with some padding to grow the file quickly", i);
+                if (L.IsEnabled(LogLevel.Information)) L.LogInformation("line {N} with some padding to grow the file quickly", i);
             Assert.True(new FileInfo(f.File(Diag.LogFile)).Length <= 4200);
             Assert.True(System.IO.File.Exists(f.File(Diag.LogFile + ".1")));
             Assert.False(System.IO.File.Exists(f.File(Diag.LogFile + "." + (Diag.MainBackups + 1))));   // bounded on disk

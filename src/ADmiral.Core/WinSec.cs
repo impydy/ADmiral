@@ -320,7 +320,8 @@ public static class WinSec
             }
             catch (Exception exc) when (exc is UnauthorizedAccessException or InvalidOperationException or SystemException)
             {
-                Log.Logger.LogDebug("Could not make {Sid} the owner of {Path}: {Error}", sid, dir.FullName, exc.Message);
+                if (Log.Logger.IsEnabled(LogLevel.Debug))
+                    Log.Logger.LogDebug("Could not make {Sid} the owner of {Path}: {Error}", sid, dir.FullName, exc.Message);
             }
         }
     }

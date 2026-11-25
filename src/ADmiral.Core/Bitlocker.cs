@@ -52,7 +52,8 @@ public sealed partial class BitlockerVault(SecretStore secrets, Func<bool> ephem
             if (secrets.IsForeign(SecretName) || (!secrets.Persistent && !ephemeralAllowed())) return null;
             var fresh = RSA.Create(KeyBits);
             secrets.Set(SecretName, Convert.ToBase64String(fresh.ExportPkcs8PrivateKey()));
-            Log.Logger.LogInformation("New BitLocker key pair made ({Bits} bit RSA) and saved in the secret store", KeyBits);
+            if (Log.Logger.IsEnabled(LogLevel.Information))
+                Log.Logger.LogInformation("New BitLocker key pair made ({Bits} bit RSA) and saved in the secret store", KeyBits);
             return _rsa = fresh;
         }
     }

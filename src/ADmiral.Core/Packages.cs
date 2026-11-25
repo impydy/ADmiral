@@ -187,7 +187,7 @@ public sealed partial class PackageLibrary(string folder)
                 throw new PackageError($"'{rel}' is outside the package library");
         }
         var baseDir = RealPath(Folder);
-        var full = System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDir, System.IO.Path.Combine(segments)));
+        var full = System.IO.Path.GetFullPath(System.IO.Path.Combine([baseDir, .. segments]));
         if (!IsInside(baseDir, full)) throw new PackageError($"'{rel}' is outside the package library");
         // a link (symlink / junction) inside the library must not lead outside of it either
         var cur = baseDir;
