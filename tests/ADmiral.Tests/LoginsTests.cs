@@ -118,6 +118,27 @@ public sealed class LoginsTests : IDisposable
     }
 
     [Fact]
+    public void LocalAccountsAreNeitherWrittenNorStored()
+    {
+        // the script skips them on the computer...
+        Assert.Contains("$domain -eq $env:COMPUTERNAME", Logins.RenderScript(@"\\srv\logins$"));
+        // ...and a file that still names one (an older script) is deleted without storing anything
+        using var store = InboxFixture.NewStore();
+        var folder = _tmp.File("local");
+        Directory.CreateDirectory(folder);
+        var before = store.Items("g-pc1")["logons"].Count;
+        File.WriteAllBytes(Path.Combine(folder, "1.log"), Entry("PC1", user: "Administrator", domain: "pc1", when: "2030-01-05T08:00:00.0000000Z"));
+        File.WriteAllBytes(Path.Combine(folder, "2.log"), Entry("PC1", user: "helyi", domain: ".", when: "2030-01-06T08:00:00.0000000Z"));
+        File.WriteAllBytes(Path.Combine(folder, "3.log"), Entry("PC1", user: "anna", when: "2030-01-07T08:00:00.0000000Z"));
+        var r = Logins.ImportFolder(store, Cfg(folder));
+        Assert.Equal((3, 1, 2, 0), (r.Found, r.Imported, r.Local, r.Failed));
+        Assert.Empty(Directory.GetFiles(folder));
+        var logons = store.Items("g-pc1")["logons"];
+        Assert.Equal(before + 1, logons.Count);
+        Assert.DoesNotContain(logons, l => (string?)l["user"] is "Administrator" or "helyi");
+    }
+
+    [Fact]
     public void ComputerNamesInAnyScriptAreAccepted()
     {
         var (c, _) = Logins.ParseEntry(Entry("KÖNYVELÉS-PC"));

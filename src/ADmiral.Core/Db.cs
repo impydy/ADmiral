@@ -193,6 +193,15 @@ public static class Db
         ALTER TABLE fleets ADD COLUMN peer_changed TEXT;
         ALTER TABLE tags ADD COLUMN peer_added TEXT;
         """,
+        // 12: BitLocker recovery passwords, only as RSA-OAEP ciphertext made on the computer with ADmiral's public key
+        // (the private key is in the DPAPI-protected secret store); never part of the inventory, never synced
+        """
+        CREATE TABLE bitlocker_key (
+            guid TEXT NOT NULL REFERENCES computers(guid) ON DELETE CASCADE,
+            drive TEXT NOT NULL, protector_id TEXT NOT NULL, cipher TEXT NOT NULL, collected_at TEXT NOT NULL,
+            PRIMARY KEY (guid, drive, protector_id)
+        );
+        """,
     ];
 
     /// <summary>The computer fields that come from Active Directory (replaced by every AD sync).</summary>
@@ -200,7 +209,7 @@ public static class Db
         ["name", "dns_hostname", "dn", "ou", "os", "os_version", "enabled", "last_logon", "created", "description", "location", "member_of", "sid"];
 
     /// <summary>The list sections of an inventory, stored as rows of computer_items.</summary>
-    public static readonly IReadOnlyList<string> ListKinds = ["disks", "nics", "hotfixes", "apps", "services", "local_admins", "logons"];
+    public static readonly IReadOnlyList<string> ListKinds = ["disks", "nics", "hotfixes", "apps", "services", "local_admins", "logons", "user_accounts", "local_groups", "monitors", "bitlocker"];
 
     /// <summary>Now, UTC, to the second, ISO-8601: "2026-11-21T10:00:00+00:00" (the format of every DB timestamp).</summary>
     public static string UtcNow() => FormatUtc(DateTimeOffset.UtcNow);
@@ -584,7 +593,9 @@ public sealed class Store : IDisposable
     {
         var old = Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'logons' ORDER BY pos", guid)
             .Select(r => ParseJson(r["data"]));
-        var merged = CollectorModel.CleanLogons(rows.Concat(old));
+        // local accounts of the computer are not kept (also cleans what an older version stored)
+        var name = Query("SELECT name FROM computers WHERE guid = ?", guid).Select(r => r["name"] as string).FirstOrDefault();
+        var merged = CollectorModel.CleanLogons(rows.Concat(old), name);
         Execute("DELETE FROM computer_items WHERE guid = ? AND kind = 'logons'", guid);
         for (var i = 0; i < merged.Count; i++)
             Execute("INSERT INTO computer_items (guid, kind, pos, data) VALUES (?, 'logons', ?, ?)", guid, i, merged[i].ToJsonString());
@@ -614,7 +625,15 @@ public sealed class Store : IDisposable
             }
             var scalars = new JsonObject();
             foreach (var (k, v) in inventory)
-                if (!Db.ListKinds.Contains(k)) scalars[k] = v?.DeepClone();
+                if (!Db.ListKinds.Contains(k) && k != "bitlocker_keys") scalars[k] = v?.DeepClone();   // keys: see SetBitlockerKeys
+            // a local account of the computer is not recorded as its logged-on user (older scripts still send it)
+            var compName = Query("SELECT name FROM computers WHERE guid = ?", guid).Select(r => r["name"] as string).FirstOrDefault();
+            if (scalars["logged_on_user"] is JsonValue lu && lu.GetValueKind() == JsonValueKind.String
+                && CollectorModel.IsLocalAccountName(lu.GetValue<string>(), compName))
+            {
+                scalars["logged_on_user"] = null;
+                scalars["user_display_name"] = null;
+            }
             var sectionErrors = inventory["section_errors"];
             var partial = Db.Truthy(sectionErrors);
             var errText = partial && sectionErrors is JsonObject se
@@ -644,6 +663,23 @@ public sealed class Store : IDisposable
             }
         });
     }
+
+    /// <summary>Replace the stored BitLocker recovery keys of a computer (ciphertext only).</summary>
+    public void SetBitlockerKeys(string guid, IEnumerable<(string Drive, string Id, string Cipher)> keys) => InTx(() =>
+    {
+        Execute("DELETE FROM bitlocker_key WHERE guid = ?", guid);
+        var now = Db.UtcNow();
+        foreach (var (d, id, c) in keys)
+            Execute("INSERT OR REPLACE INTO bitlocker_key (guid, drive, protector_id, cipher, collected_at) VALUES (?,?,?,?,?)", guid, d, id, c, now);
+    });
+
+    /// <summary>[{drive, id, collected_at}] of the stored recovery keys - never the key itself.</summary>
+    public List<Row> BitlockerKeyList(string guid) =>
+        Query("SELECT drive, protector_id AS id, collected_at FROM bitlocker_key WHERE guid = ? ORDER BY drive, protector_id", guid);
+
+    /// <summary>The ciphertext of one stored recovery key (null when there is none).</summary>
+    public string? BitlockerCipher(string guid, string id) =>
+        Query("SELECT cipher FROM bitlocker_key WHERE guid = ? AND protector_id = ?", guid, id).Select(r => r["cipher"] as string).FirstOrDefault();
 
     /// <summary>The list sections of one computer: kind -> rows (every <see cref="Db.ListKinds"/> key present).</summary>
     public Dictionary<string, List<JsonObject>> Items(string guid)

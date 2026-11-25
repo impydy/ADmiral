@@ -144,6 +144,13 @@ public static partial class WebApp
         // ----------------------------------------------------------------- computers
         app.MapGet("/api/computers", () => J(a.Computers()));
         app.MapGet("/api/computers/{guid}", (string guid) => J(a.Computer(guid)));
+        // a BitLocker recovery key in clear text: only with the administrator password entered again (never cached)
+        app.MapPost("/api/computers/{guid}/bitlocker-key", async (HttpContext ctx, string guid) =>
+        {
+            var b = await JsonBody.ReadAsync(ctx);
+            ctx.Response.Headers.CacheControl = "no-store";
+            return J(a.RevealBitlockerKey(guid, b.Str("id"), b.Str("password", "")));
+        });
         app.MapPost("/api/tags", async (HttpContext ctx) =>
         {
             var b = await JsonBody.ReadAsync(ctx);
@@ -274,6 +281,28 @@ public static partial class WebApp
             var file = b.Str("file");
             return J(a.PackageVendorCheck(id, file, b.Str("sha256")));
         });
+        app.MapPost("/api/packages-new", async (HttpContext ctx) =>
+        {
+            var b = await JsonBody.ReadAsync(ctx);
+            return J(a.PackageCreate(b.Str("id"), b.Str("name", ""), b.Str("version", ""), b.Str("publisher", "")), 201);
+        });
+        app.MapPost("/api/packages-steps", async (HttpContext ctx) =>
+        {
+            // the chain of a package: [{type, file?, args?, path?, script?, seconds?, wait?, continue_on_error?}]
+            var b = await JsonBody.ReadAsync(ctx);
+            var arr = b.Array("steps");
+            if (arr.Count > Chain.MaxSteps) throw new ArgumentException(I18n.T("err.chain_many", ("n", Chain.MaxSteps)));
+            List<PackageStep> steps;
+            try
+            {
+                steps = arr.Select(n => n is JsonObject o ? o.Deserialize<PackageStep>() ?? new PackageStep() : throw new ArgumentException("a step must be an object")).ToList();
+            }
+            catch (JsonException exc)
+            {
+                throw new ArgumentException($"invalid step: {exc.Message}", exc);
+            }
+            return J(a.PackageSetSteps(b.Str("id"), steps));
+        });
         app.MapPost("/api/packages-verify", async (HttpContext ctx) =>
         {
             var b = await JsonBody.ReadOptionalAsync(ctx);
@@ -285,14 +314,15 @@ public static partial class WebApp
         {
             var b = await JsonBody.ReadAsync(ctx);
             var pkg = b.Str("package_id");
-            var file = b.Str("file");
+            var chain = b.Bool("chain", false);
+            var file = chain ? "" : b.Str("file");
             var args = b.Str("args", "");
             var ids = b.StrList("ids");
             var timeout = b.OptLong("timeout");
             if (timeout is < 60 or > 86400)
                 throw new RequestValidationException(timeout < 60 ? "greater_than_equal" : "less_than_equal", ["body", "timeout"],
                     timeout < 60 ? "Input should be greater than or equal to 60" : "Input should be less than or equal to 86400");
-            var r = a.StartDeployment(pkg, file, args, ids, (int?)timeout);
+            var r = chain ? a.StartChainDeployment(pkg, ids, (int?)timeout) : a.StartDeployment(pkg, file, args, ids, (int?)timeout);
             return J(Obj(("id", r["id"]), ("job", r["job"])), 202);
         });
         app.MapPost("/api/deployments/preview", async (HttpContext ctx) =>

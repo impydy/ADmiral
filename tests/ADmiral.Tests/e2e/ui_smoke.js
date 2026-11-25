@@ -138,9 +138,20 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.click("#grid tbody tr:nth-child(2) td:nth-child(2)", { modifiers: ["Control"] });
   });
   await step("static collection from selection + add/remove members", async () => {
-    await p.click("[data-tb='new-stat']");
+    await p.click("[data-tb='new-coll']");
+    check((await p.getAttribute("#fe-kind [data-kind='static']", "class") || "").includes("on"), "a selection starts a static collection");
     await p.fill("#fe-name", "E2E statikus");
-    check((await p.inputValue("#fe-members")).split("\n").length === 2, "members prefilled from selection");
+    check((await p.locator("#fe-dual .dual-r option").count()) === 2, "members prefilled from selection");
+    // add-all then remove-all then back to the two: the middle buttons move between the lists
+    const left = await p.locator("#fe-dual .dual-l option").count();
+    await p.click("#fe-dual [data-dl='add-all']");
+    check((await p.locator("#fe-dual .dual-r option").count()) === left + 2, "add all");
+    await p.click("#fe-dual [data-dl='rem-all']");
+    check((await p.locator("#fe-dual .dual-r option").count()) === 0, "remove all");
+    const names = await p.locator("#fe-dual .dual-l option").evaluateAll((os) => os.slice(0, 2).map((o) => o.value));
+    await p.selectOption("#fe-dual .dual-l", names);
+    await p.click("#fe-dual [data-dl='add']");
+    check((await p.locator("#fe-dual .dual-r option").count()) === 2, "add selected");
     await p.click("#fe-save");
     await p.waitForSelector(".page-head h1:has-text('E2E statikus')");
     await waitRows(2);
@@ -150,7 +161,8 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await waitRows(1);
   });
   await step("dynamic collection with app rule", async () => {
-    await p.click("[data-tb='new-dyn']");
+    await p.click("[data-tb='new-coll']");
+    await p.click("#fe-kind [data-kind='dynamic']");
     await p.fill("#fe-name", "E2E Chrome");
     await p.selectOption("select[data-k='field']", "app");
     await p.selectOption("select[data-k='op']", "any_contains");
@@ -171,6 +183,14 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
   });
   await step("export dialog (copy)", async () => {
     await p.click("[data-tb='export']");
+    await p.click("#rp-tabs [data-tab='filter']");
+    await p.click("#rp-add");
+    await p.selectOption("#rp-filter select[data-fk='op']", "ends_with");
+    await p.fill("#rp-filter input[data-fk='value']", "zzz-no-such-name");
+    await p.waitForFunction(() => document.querySelector("#rp-coll").disabled, null, { timeout: 5000 });
+    await p.click("#rp-filter [data-rm-f='0']");
+    check(!(await p.isDisabled("#rp-coll")), "new collection from report enabled");
+    await p.click("#rp-tabs [data-tab='layout']");
     await p.selectOption("#ex-fmt", "txt");
     await p.click(".dlg [data-copy]");
     await p.waitForFunction(async () => (await navigator.clipboard.readText()).includes(".contoso.local"), null, { timeout: 10000, polling: 200 });
@@ -194,8 +214,12 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
   });
   await step("scan selected computers (job + status bar)", async () => {
     await p.click("#grid tbody tr:nth-child(3) td:nth-child(2)");
+    // the toolbar's Scan menu says it covers every computer; the selection is scanned from the right-click menu
     await p.click("[data-tb='scan']");
-    await p.click("#pop .mi:nth-child(1)");
+    check((await p.textContent("#pop .mi:nth-child(1)")).includes("Összes gép"), "toolbar scan menu names all computers");
+    await p.keyboard.press("Escape");
+    await p.click("#grid tbody tr:nth-child(3) td:nth-child(2)", { button: "right" });
+    await p.click("#pop .mi:has-text('Szkennelés (elérhetőség + leltár)')");
     await p.waitForFunction(() => document.querySelector("#sb-right").textContent.includes("0 számítógép"), null, { timeout: 15000 });
     await p.waitForSelector(".toast");
   });

@@ -15,6 +15,8 @@ public sealed class LoginImportResult
     [JsonPropertyName("imported")] public int Imported { get; set; }
     [JsonPropertyName("unknown")] public int Unknown { get; set; }
     [JsonPropertyName("failed")] public int Failed { get; set; }
+    /// <summary>Logons of local (non-domain) accounts: their files are deleted, nothing is stored.</summary>
+    [JsonPropertyName("local")] public int Local { get; set; }
     [JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Error { get; set; }
 }
 
@@ -90,6 +92,8 @@ foreach ($s in (Get-CimInstance Win32_LogonSession | Where-Object { $_.LogonType
   $user = [string]$a.Antecedent.Name; $domain = [string]$a.Antecedent.Domain
   $new += $id
   if (-not $user -or $user -match '\$$' -or $user -match '^(DWM|UMFD)-\d+$' -or $domain -in 'NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host') { continue }
+  # local accounts of this computer (domain = computer name) are not tracked: nothing about them is written
+  if ($domain -eq $env:COMPUTERNAME -or $domain -eq '.') { continue }
   $when = ([datetime]$s.StartTime).ToUniversalTime()
   $rec = [ordered]@{ computer = $env:COMPUTERNAME; time = $when.ToString('o'); user = $user; domain = $domain; type = [int]$s.LogonType; ip = '' }
   # written in place, no rename: the computers only need 'Create files / write data' on the folder. The file is
@@ -141,6 +145,13 @@ if ($new.Count) {
         return (computer, events[0]);
     }
 
+    /// <summary>A logon of a local account of that computer (its domain is the computer name, or "."), not a domain user.</summary>
+    public static bool IsLocalAccount(string computer, JsonObject ev)
+    {
+        var domain = ((string?)ev["domain"] ?? "").Trim();
+        return domain == "." || string.Equals(domain, computer.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>The files of the script before 0.6.2 (<c>&lt;computer&gt;_&lt;time&gt;_&lt;session&gt;.tmp</c>), left
     /// behind when renaming them to .log failed. Written in full before that rename, so they are read like the .log files
     /// (same checks) once they are older than <see cref="LegacyTempAge"/>.</summary>
@@ -190,6 +201,7 @@ if ($new.Count) {
         var sids = Inbox.SidIndex(store);
         var per = new Dictionary<string, List<JsonNode?>>();
         var done = new List<string>();
+        var local = new List<string>();
         foreach (var path in files)
         {
             var name = Path.GetFileName(path);
@@ -222,6 +234,11 @@ if ($new.Count) {
                 Log.Logger.LogWarning("Login file {Name} could not be read: {Error}", name, exc.Message);
                 continue;
             }
+            if (IsLocalAccount(computer, ev))                  // e.g. written by an older script: dropped, not stored
+            {
+                local.Add(path);
+                continue;
+            }
             if (!index.TryGetValue(computer.ToLowerInvariant(), out var guid))
             {
                 outp.Unknown++;
@@ -232,6 +249,14 @@ if ($new.Count) {
             done.Add(path);
         }
         foreach (var (guid, events) in per) store.AddLogons(guid, events);
+        foreach (var path in local)
+        {
+            try { File.Delete(path); outp.Local++; }
+            catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
+            {
+                Log.Logger.LogWarning("Login file {Name} (local account) could not be deleted: {Error}", Path.GetFileName(path), exc.Message);
+            }
+        }
         foreach (var path in done)
         {
             try

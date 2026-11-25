@@ -39,6 +39,17 @@ public class ExportersTests
         Assert.Contains(",16,", lines[1].Replace(",16.0,", ",16,"));
     }
 
+    [Theory]
+    [InlineData("=HYPERLINK(\"http://x\")", "\"'=HYPERLINK(\"\"http://x\"\")\"")]
+    [InlineData("+cmd|' /C calc'!A0", "'+cmd|' /C calc'!A0")]
+    [InlineData("@SUM(1)", "'@SUM(1)")]
+    [InlineData("-2+3", "'-2+3")]
+    [InlineData("\tx", "'\tx")]
+    [InlineData("-12.5", "-12.5")]                                    // a plain number stays a number
+    [InlineData("Latitude 7440", "Latitude 7440")]
+    [InlineData("", "")]
+    public void CsvCellsNeverStartAFormula(string value, string expected) => Assert.Equal(expected, Exporters.CsvField(value));
+
     [Fact]
     public void JsonAndAnsible()
     {

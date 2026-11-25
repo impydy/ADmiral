@@ -4,6 +4,8 @@
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+// a CSV cell that a spreadsheet would run as a formula (=, +, -, @, tab, CR at the start) is kept as text with a leading '
+const csvSafe = (v) => { const s = String(v ?? ""); return /^[=+\-@\t\r]/.test(s) ? "'" + s : s; };
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const store = {
   get(k, d) { try { const v = localStorage.getItem("admiral." + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
@@ -12,10 +14,12 @@ const store = {
 
 const S = {
   status: null, computers: [], byGuid: new Map(), fleets: [], tags: [],
-  node: store.get("node", "welcome"), expanded: new Set(store.get("expanded", ["lib", "ad", "my"])),
+  node: store.get("node", "welcome"), expanded: new Set(store.get("expanded", ["ad", "my"])),
   sel: new Set(), anchor: null, filter: "", treeFilter: "", sort: store.get("sort", { key: "name", dir: 1 }),
   list: [], cols: store.get("cols", null), job: null, cw: null, theme: "system", section: store.get("section", "devices"),
 };
+// the Collection Library starts collapsed; close it once also for trees saved while it was open by default
+if (!store.get("lib_closed_v1", false)) { S.expanded.delete("lib"); store.set("expanded", [...S.expanded]); store.set("lib_closed_v1", true); }
 
 /* ================================================================== api */
 const TOKEN = new URLSearchParams(location.search).get("token") || (() => { try { return sessionStorage.getItem("admiral-token") || ""; } catch (_) { return ""; } })();
@@ -441,6 +445,59 @@ function moveSelection(delta) {
   $(`#grid tr[data-guid="${CSS.escape(g)}"]`)?.scrollIntoView({ block: "nearest" });
 }
 
+/* ================================================================== sorting of every other table */
+// Tables that sort themselves (their headers carry a data-…sort attribute: computers, users, printers, ...) keep
+// doing so. Every other table.grid becomes sortable by any column: a click on the header sorts the rows by that
+// column's text (numbers and versions in number order, empty cells last), a second click reverses. The choice
+// is remembered per table and applied again when the table is redrawn (filtering, refresh).
+const TSORT = new Map();                                     // table key -> { col: header text, dir }
+const ownSort = (th) => [...th.attributes].some((a) => /^data-\w*sort$/.test(a.name));
+const tsHead = (tb) => tb.tHead?.rows[0];
+const thText = (th) => th.textContent.replace(/[▲▼]/g, "").trim();
+const tsKey = (tb) => (tb.closest("[id]")?.id || "") + "|" + [...tsHead(tb).cells].map(thText).join("|");
+const tsSortable = (tb) => tb.classList.contains("grid") && tsHead(tb) && tb.tBodies[0] && ![...tsHead(tb).cells].some(ownSort)
+  && !tb.tBodies[0].querySelector("td[colspan]");
+const tsCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+function tsApply(tb) {
+  if (!tsSortable(tb)) return;
+  const st = TSORT.get(tsKey(tb));
+  const cells = [...tsHead(tb).cells];
+  cells.forEach((th) => { th.querySelector(".arr.ts")?.remove(); if (thText(th) && !th.classList.contains("rn")) th.classList.add("ts-th"); });
+  if (!st) return;
+  const i = cells.findIndex((th) => thText(th) === st.col);
+  if (i < 0) return;
+  cells[i].insertAdjacentHTML("beforeend", `<span class="arr ts">${st.dir > 0 ? "▲" : "▼"}</span>`);
+  const body = tb.tBodies[0];
+  const val = (tr) => { const td = tr.cells[i]; return td ? (td.dataset.sv ?? td.textContent.trim()) : ""; };
+  const rows = [...body.rows];
+  rows.sort((a, b) => {
+    const x = val(a), y = val(b);
+    if (!x || !y) return x ? -1 : y ? 1 : 0;                  // empty cells always last
+    const nx = Number(x.replace(/\s/g, "").replace(",", ".")), ny = Number(y.replace(/\s/g, "").replace(",", "."));
+    return (Number.isFinite(nx) && Number.isFinite(ny) ? nx - ny : tsCollator.compare(x, y)) * st.dir;
+  });
+  body.append(...rows);
+}
+document.addEventListener("click", (e) => {
+  const th = e.target.closest("table.grid > thead th");
+  if (!th) return;
+  const tb = th.closest("table");
+  if (ownSort(th)) { for (const k of [...TSORT.keys()]) if (k.startsWith((tb.closest("[id]")?.id || "") + "|")) TSORT.delete(k); return; }
+  if (th.classList.contains("rn") || !thText(th) || !tsSortable(tb)) return;
+  const key = tsKey(tb), col = thText(th), cur = TSORT.get(key);
+  TSORT.set(key, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
+  tsApply(tb);
+});
+// re-apply a remembered order whenever a table is (re)drawn
+new MutationObserver((muts) => {
+  const seen = new Set();
+  for (const m of muts) for (const n of m.addedNodes) {
+    if (n.nodeType !== 1) continue;
+    const tables = n.matches("table.grid") ? [n] : n.querySelectorAll ? n.querySelectorAll("table.grid") : [];
+    for (const tb of tables) if (!seen.has(tb)) { seen.add(tb); tsApply(tb); }
+  }
+}).observe(document.documentElement, { childList: true, subtree: true });
+
 /* ================================================================== page */
 function pageHead(iconName, title, sub, buttons) {
   return `<div class="page-head"><h1>${icon(iconName, 30)}<span>${esc(title)}</span></h1>${sub ? `<span class="sub">${esc(sub)}</span>` : ""}
@@ -530,7 +587,7 @@ function renderCollectionList(el, id) {
   const node = findNode(S.treeNodes, id);
   const kids = node?.children || [];
   el.innerHTML = pageHead(node.icon, node.label, "", id === "my" || id === "lib"
-    ? `<button class="btn" data-act="new-dyn">${icon("coll_dyn", 16)}${esc(t("m.new_dyn").replace("…", ""))}</button><button class="btn" data-act="new-stat">${icon("coll_stat", 16)}${esc(t("m.new_stat").replace("…", ""))}</button>` : "")
+    ? `<button class="btn" data-act="new-coll">${icon("coll_dyn", 16)}${esc(t("m.new_coll").replace("…", ""))}</button>` : "")
     + `<div class="grid-wrap" tabindex="0"><table class="grid"><thead><tr><th class="rn"></th><th>${t("col.name")}</th><th>${t("coll.type")}</th><th>${t("sb.count", { n: "" }).trim() || "#"}</th><th>${t("col.description")}</th></tr></thead><tbody>
       ${kids.map((k) => {
         const f = k.id.startsWith("f:") ? S.fleets.find((x) => "f:" + x.id === k.id) : null;
@@ -700,7 +757,7 @@ function renderToolbar() {
   const b = (id, ic, label, drop) => `<button class="tb" data-tb="${id}">${icon(ic, 30)}<span>${esc(t(label))}</span>${drop ? `<span class="drop">▼</span>` : ""}</button>`;
   const sep = `<span class="tb-sep"></span>`;
   $("#toolbar").innerHTML = b("scan", "scan", "tb.scan", true) + b("adsync", "sync", "tb.ad_sync") + sep
-    + b("library", "library", "tb.library") + b("new-dyn", "dyn", "tb.new_dyn") + b("new-stat", "stat", "tb.new_stat") + sep
+    + b("library", "library", "tb.library") + b("new-coll", "dyn", "tb.new_coll") + sep
     + b("export", "export", "tb.export") + b("group", "group", "tb.group") + sep
     + b("details", "details", "tb.details") + b("columns", "columns", "m.columns") + b("copy", "copy", "tb.copy") + b("delete", "delete", "tb.delete") + sep
     + b("settings", "settings", "tb.settings");
@@ -710,9 +767,11 @@ function renderToolbar() {
       e.stopPropagation();
       const r = btn.getBoundingClientRect();
       return showMenu([
-        { label: t("m.scan_full"), icon: "scan", action: () => scanSelection("full") },
-        { label: t("m.scan_ping"), icon: "ping", action: () => scanSelection("scan") },
-        { label: t("m.scan_inv"), icon: "details", action: () => scanSelection("collect") },
+        // the toolbar's Scan menu always covers every computer, even when rows are selected (the selection has
+        // its own scan entries in the right-click menu)
+        { label: t("m.scan_all_full"), icon: "scan", action: () => startJob("full", {}) },
+        { label: t("m.scan_all_ping"), icon: "ping", action: () => startJob("scan", {}) },
+        { label: t("m.scan_all_inv"), icon: "details", action: () => startJob("collect", {}) },
         "-",
         { label: t("m.ad_sync"), icon: "sync", action: () => adBrowserDialog() },
       ], r.left, r.bottom, btn);
@@ -746,8 +805,10 @@ const ACTIONS = {
     await loadAll();
     selectNode("my");
   }),
+  // one "New collection" entry: the dialog switches between dynamic and static; a selection starts it as static
+  "new-coll": () => { const g = selectedComputers().map((c) => c.guid); fleetEditor(null, { kind: g.length ? "static" : "dynamic", guids: g }); },
   "new-dyn": () => fleetEditor(null, { kind: "dynamic" }),
-  "new-stat": () => fleetEditor(null, { kind: "static", members: selectedComputers().map((c) => c.name) }),
+  "new-stat": () => fleetEditor(null, { kind: "static", guids: selectedComputers().map((c) => c.guid) }),
   "edit-coll": () => { const f = currentFleet(); if (f) fleetEditor(f, {}); else toast(t("need_collection"), true); },
   "remove-from-coll": () => guard(async () => {
     const f = currentFleet();
@@ -927,9 +988,21 @@ function resultText(kind, r) {
 }
 
 /* ================================================================== computer window */
+// monitors report their maker as a 3-letter PnP id (EDID); the well-known ones by name
+const PNP_VENDORS = { ACR: "Acer", AOC: "AOC", AUO: "AU Optronics", AUS: "ASUS", BNQ: "BenQ", BOE: "BOE", CMN: "Innolux", DEL: "Dell", EIZ: "EIZO",
+  ENC: "EIZO", FUS: "Fujitsu", GSM: "LG", HPN: "HP", HWP: "HP", IVM: "iiyama", LEN: "Lenovo", LGD: "LG Display", MSI: "MSI", NEC: "NEC",
+  PHL: "Philips", SAM: "Samsung", SDC: "Samsung Display", SHP: "Sharp", SNY: "Sony", VSC: "ViewSonic", MEI: "Panasonic", APP: "Apple", HKC: "HKC" };
+const pnpVendor = (code) => (code ? (PNP_VENDORS[code.toUpperCase()] ? `${PNP_VENDORS[code.toUpperCase()]} (${code})` : code) : "");
+// WmiMonitorConnectionParams.VideoOutputTechnology
+const monConn = (v) => {
+  if (v == null || v === "") return "";
+  const n = Number(v) >>> 0;
+  const names = { 0: "VGA", 1: "S-Video", 2: "Composite", 3: "Component", 4: "DVI", 5: "HDMI", 6: "LVDS", 8: "D-Jpn", 9: "SDI", 10: "DisplayPort", 11: "DisplayPort (embedded)", 12: "UDI", 13: "UDI (embedded)", 14: "SDTV", 15: "Miracast", 16: "Indirect (wired)", 17: "Indirect (virtual)", 2147483648: tText("t.internal") };
+  return names[n] || String(v);
+};
 const CATS = [
-  ["computer", "computer"], ["ad_groups", "group"], ["apps", "apps"], ["disks", "disk"], ["nics", "nic"],
-  ["hotfixes", "patch"], ["services", "services"], ["local_admins", "admin"], ["logons", "user"], ["ports", "ping"], ["collections", "coll_stat"], ["tags", "tag"],
+  ["computer", "computer"], ["ad_groups", "group"], ["apps", "apps"], ["disks", "disk"], ["monitors", "monitor"], ["nics", "nic"],
+  ["hotfixes", "patch"], ["services", "services"], ["local_admins", "admin"], ["local_users", "user"], ["local_groups", "group"], ["ad_users", "users"], ["logons", "log"], ["ports", "ping"], ["collections", "coll_stat"], ["tags", "tag"],
 ];
 
 function openComputer(guid, back) {
@@ -965,9 +1038,9 @@ async function loadComputer() {
 
 function renderCwToolbar() {
   const b = (id, ic, label) => `<button class="tb" data-cw="${id}">${icon(ic, 30)}<span>${esc(t(label))}</span></button>`;
-  $("#cwin-toolbar").innerHTML = b("scan", "scan", "cw.scan") + b("ping", "ping", "m.scan_ping") + (isDesktop() ? b("ra", "ra", "cw.ra") : "") + `<span class="tb-sep"></span>`
+  $("#cwin-toolbar").innerHTML = b("scan", "scan", "cw.scan") + b("ping", "ping", "m.scan_ping") + (isDesktop() ? b("ra", "ra", "cw.ra") + b("events", "log", "cw.events") + b("mmc", "admin", "cw.mmc") : "") + `<span class="tb-sep"></span>`
     + b("prev", "prev", "cw.prev") + b("next", "next", "cw.next") + `<span class="tb-sep"></span>`
-    + b("allow", "block", "cw.toggle_disallow") + b("copy", "copy", "tb.copy") + `<span class="tb-sep"></span>` + b("close", "back", "cw.close");
+    + b("allow", "block", "cw.toggle_disallow") + b("copy", "copy", "tb.copy") + b("print", "printer", "cw.print") + `<span class="tb-sep"></span>` + b("close", "back", "cw.close");
 }
 
 function renderComputer() {
@@ -981,11 +1054,17 @@ function renderComputer() {
   const running = S.job && S.job.status === "running";
   $('#cwin-toolbar [data-cw="scan"]').disabled = running || !c.allow_scan;
   $('#cwin-toolbar [data-cw="ping"]').disabled = running || !c.allow_scan;
+  const ev = $('#cwin-toolbar [data-cw="events"]');
+  if (ev) { ev.disabled = c.online !== true; ev.title = t(c.online === true ? "cw.events_tip" : "cw.events_offline"); }
+  const mm = $('#cwin-toolbar [data-cw="mmc"]');
+  if (mm) { mm.disabled = c.online !== true; mm.title = t(c.online === true ? "cw.mmc_tip" : "cw.mmc_offline"); }
 
   const counts = {
     computer: null, ad_groups: c.member_of.length, ports: c.open_ports.length, collections: c.fleets.length, tags: c.tags.length,
   };
-  for (const k of ["apps", "disks", "nics", "hotfixes", "services", "local_admins", "logons"]) counts[k] = (c.items[k] || []).length;
+  for (const k of ["apps", "disks", "monitors", "nics", "hotfixes", "services", "local_admins", "local_groups", "logons"]) counts[k] = (c.items[k] || []).length;
+  counts.local_users = (c.items.user_accounts || []).filter((a) => a.type === "local").length;
+  counts.ad_users = (c.items.user_accounts || []).filter((a) => a.type !== "local").length;
   $("#cwin-cats").innerHTML = CATS.map(([id, ic]) => `<div class="cat${cw.cat === id ? " sel" : ""}${counts[id] === 0 && id !== "tags" ? " empty-cat" : ""}" data-cat="${id}">${icon(ic, 18)}<span>${esc(t("cw.cat." + id))}</span>${counts[id] ? `<span class="cnt">${counts[id]}</span>` : ""}</div>`).join("");
 
   const [stCls, stLabel] = scanStatus(c);
@@ -1004,9 +1083,93 @@ function renderComputer() {
   renderCwContent();
 }
 
+/* Print the computer window's current page (the selected category, as filtered) as a tidy document: a header with
+   the computer, the page and the print time, then the content without the interactive parts (filter box, buttons,
+   links become text, the full table instead of the scrolling box). Uses the system print dialog (PDF works too). */
+function printComputer() {
+  const cw = S.cw, c = cw?.data;
+  if (!c) return;
+  const body = $("#cwin-content").cloneNode(true);
+  body.querySelectorAll(".subtable-tools, button, input, select, textarea, [data-untag]").forEach((x) => x.remove());
+  body.querySelectorAll("a").forEach((a) => a.replaceWith(document.createTextNode(a.textContent)));
+  body.querySelectorAll("[id]").forEach((x) => x.removeAttribute("id"));
+  body.querySelectorAll("[title]").forEach((x) => x.removeAttribute("title"));
+  const [, stLabel] = scanStatus(c);
+  let root = $("#print-root");
+  if (!root) { root = document.createElement("div"); root.id = "print-root"; document.body.appendChild(root); }
+  const sub = [c.dns_hostname, (c.ou || "").split("/").slice(1).join("/"), c.description].filter(Boolean).map(esc).join(" · ");
+  root.innerHTML = `<div class="pr-head">
+      <div><div class="pr-title">${esc(c.name)} <span class="pr-cat">– ${esc(tText("cw.cat." + cw.cat))}</span></div>
+        <div class="pr-sub">${sub}</div>
+        <div class="pr-sub">${esc(t("f.online"))}: ${onlineCell(c)} · ${esc(t("col.scan_status"))}: ${esc(stLabel)}${c.collected_at ? ` · ${esc(t("col.scanned"))}: ${esc(fmtDate(c.collected_at))}` : ""}</div></div>
+      <div class="pr-meta">ADmiral ${esc(S.status?.version || "")}<br>${esc(tText("pr.printed", { when: fmtDate(new Date().toISOString()) }))}${cw.filter.trim() ? `<br>${esc(tText("pr.filtered", { q: cw.filter.trim() }))}` : ""}</div>
+    </div><div class="pr-body"></div>`;
+  $(".pr-body", root).append(...body.childNodes);
+  document.body.classList.add("printing");
+  const done = () => { document.body.classList.remove("printing"); root.innerHTML = ""; window.removeEventListener("afterprint", done); };
+  window.addEventListener("afterprint", done);
+  window.print();
+}
+
 function fieldRow(label, value, opts = {}) {
   const v = value == null || value === "" ? "" : value;
   return `<div class="frow"><label class="${opts.sub ? "sub" : ""}" title="${esc(label)}">${opts.sub ? "↳ " : ""}${esc(label)}</label><div class="fval${opts.wrap ? " wrap" : ""}${opts.mono ? " mono" : ""}" title="${esc(typeof v === "string" ? v : "")}">${opts.html ? v : esc(v)}</div></div>`;
+}
+
+/* BitLocker: the volume states under the disks, and a stored recovery key shown only after the administrator's
+   password was entered again (checked by the server; wrong passwords are counted and logged). The key is shown in
+   this dialog only, never kept by the page, and hidden again after two minutes. */
+const blStatus = (s) => { const k = "bl.st." + s; return s ? (t(k) === k ? esc(s) : t(k)) : ""; };
+function blSection(c, items) {
+  const vols = items.bitlocker || [];
+  const keys = c.bitlocker_keys || [];
+  if (!vols.length && !keys.length) return "";
+  const prot = (v) => (v.protection === "On" ? `<span class="st-ok">${t("bl.on")}</span>` : v.protection === "Off" ? `<span class="st-warn">${t("bl.off")}</span>` : `<span class="faint">${t("v.unknown")}</span>`);
+  const keyBtns = (drive) => keys.filter((k) => k.drive === drive).map((k) => `<button type="button" class="btn" data-blkey="${esc(k.id)}" data-bldrive="${esc(k.drive)}" title="${esc(tText("bl.key_tip", { id: k.id, when: fmtDate(k.collected_at) }))}">${icon("shield", 14)}${esc(t("bl.show_key"))}</button>`).join(" ");
+  const rows = vols.map((v) => `<tr><td class="rn"></td><td>${esc(v.drive)}</td><td>${prot(v)}</td><td>${blStatus(v.status)}${v.percent != null && v.percent < 100 && v.status !== "FullyDecrypted" ? ` (${esc(v.percent)}%)` : ""}</td>
+    <td>${esc(v.method === "None" ? "" : v.method)}</td><td>${esc(v.protectors)}</td><td class="nowrap">${keyBtns(v.drive) || `<span class="faint">${v.protection === "On" ? esc(t("bl.no_key")) : ""}</span>`}</td></tr>`).join("");
+  return `<div class="fsec" style="margin-top:16px">${icon("shield", 16)} BitLocker</div><div class="grid-wrap"><table class="grid"><thead><tr><th class="rn"></th>
+    ${["t.drive", "bl.protection", "bl.status", "bl.method", "bl.protectors", "bl.recovery"].map((k) => `<th>${esc(t(k))}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function blRevealDialog(c, id, drive) {
+  const box = dialog(tText("bl.title", { name: c.name, drive }), `
+    <div class="callout">${icon("shield", 16)} ${esc(t("bl.reauth"))}</div>
+    <label class="fld"><span>${esc(t("bl.password"))}</span><input id="bl-pw" type="password" autocomplete="off" spellcheck="false"></label>
+    ${S.status?.mode === "demo" ? `<div class="faint">${esc(t("bl.demo_hint"))}</div>` : ""}
+    <div id="bl-out"></div>`,
+    `<button class="btn" data-dclose>${t("d.close")}</button><button class="btn primary" id="bl-go">${esc(t("bl.show"))}</button>`);
+  let timer = null;
+  const pw = $("#bl-pw", box);
+  const go = () => guard(async () => {
+    const password = pw.value;
+    pw.value = "";
+    if (!password) return pw.focus();
+    try {
+      const r = await api("POST", `/api/computers/${encodeURIComponent(c.guid)}/bitlocker-key`, { id, password });
+      $("#bl-go", box).hidden = true;
+      pw.closest(".fld").hidden = true;
+      $("#bl-out", box).innerHTML = `<div class="bl-key mono" id="bl-key">${esc(r.key)}</div>
+        <div class="faint">${esc(tText("bl.key_meta", { id: r.id, when: fmtDate(r.collected_at) }))}</div>
+        <div class="subtable-tools"><button type="button" class="btn" id="bl-copy">${icon("copy", 14)}${esc(t("d.copy"))}</button><span class="faint">${esc(t("bl.logged"))}</span></div>`;
+      $("#bl-copy", box).onclick = async () => { await copyText(r.key); toast(tText("copied", { n: 1 })); };
+      // hide the key again after two minutes, or as soon as the dialog closes
+      const wipe = () => {
+        const k = $("#bl-key", box);
+        if (k) { k.textContent = t("bl.hidden"); k.classList.add("faint"); }
+        const cp = $("#bl-copy", box);
+        if (cp) cp.hidden = true;
+      };
+      timer = setTimeout(wipe, 120000);
+      new MutationObserver((_, o) => { if ($("#dlg").hidden) { clearTimeout(timer); wipe(); o.disconnect(); } })
+        .observe($("#dlg"), { attributes: true, attributeFilter: ["hidden"] });
+    } catch (e) {
+      $("#bl-out", box).innerHTML = `<div class="callout bad">${esc(e.message)}</div>`;
+      pw.focus();
+    }
+  });
+  $("#bl-go", box).onclick = go;
+  pw.onkeydown = (e) => { if (e.key === "Enter") go(); };
 }
 
 function renderCwContent() {
@@ -1074,11 +1237,24 @@ function renderCwContent() {
   if (cat === "ad_groups") html = table([["t.group", (g) => g.split(",")[0].replace(/^CN=/i, "")], ["t.dn", (g) => g]], c.member_of, false);
   else if (cat === "apps") html = table([["t.app", (a) => a.name], ["t.version", (a) => a.version], ["t.publisher", (a) => a.publisher], ["t.installed_on", (a) => (a.installed && /^\d{8}$/.test(a.installed) ? `${a.installed.slice(0, 4)}-${a.installed.slice(4, 6)}-${a.installed.slice(6)}` : a.installed)], ["t.arch", (a) => a.arch]], items.apps || [], true);
   else if (cat === "disks") html = table([["t.drive", (d) => d.drive], ["t.label", (d) => d.label], ["t.fs", (d) => d.file_system], ["t.size", (d) => gb(d.size_gb), "num"], ["t.free", (d) => gb(d.free_gb), "num"],
-    ["t.used", (d) => { const p = d.size_gb ? Math.round(100 - (d.free_gb / d.size_gb) * 100) : 0; return `<span class="usage${p > 90 ? " hi" : ""}"><span style="width:${p}%"></span></span>${p}%`; }, "html"]], items.disks || [], false);
+    ["t.used", (d) => { const p = d.size_gb ? Math.round(100 - (d.free_gb / d.size_gb) * 100) : 0; return `<span class="usage${p > 90 ? " hi" : ""}"><span style="width:${p}%"></span></span>${p}%`; }, "html"]], items.disks || [], false) + blSection(c, items);
   else if (cat === "nics") html = table([["t.adapter", (n) => n.name], ["t.ip", (n) => n.ip], ["t.mac", (n) => n.mac], ["t.gateway", (n) => n.gateway], ["t.dns", (n) => n.dns], ["t.dhcp", (n) => yesNo(n.dhcp)]], items.nics || [], false);
   else if (cat === "hotfixes") html = table([["t.kb", (h) => h.id], ["t.desc", (h) => h.description], ["t.installed_on", (h) => h.installed_on], ["t.installed_by", (h) => h.installed_by]], items.hotfixes || [], true);
   else if (cat === "services") html = table([["t.service", (s) => s.name], ["t.display", (s) => s.display_name], ["t.state", (s) => s.state], ["t.start", (s) => s.start_mode], ["t.account", (s) => s.account]], items.services || [], true);
   else if (cat === "local_admins") html = table([["t.member", (m) => m.name], ["t.type", (m) => m.type], ["t.source", (m) => m.source]], items.local_admins || [], false);
+  // the computer's user accounts, split: its own (local) accounts, and the AD users that have a profile on it
+  else if (cat === "local_users") html = table([["t.account", (a) => a.name], ["t.full_name", (a) => a.full_name],
+    ["t.enabled", (a) => (a.enabled == null ? "" : yesNo(a.enabled)), "html"], ["t.last_use", (a) => fmtDate(a.last_use)], ["t.profile", (a) => a.profile], ["t.sid", (a) => a.sid]],
+    (items.user_accounts || []).filter((a) => a.type === "local"), true);
+  else if (cat === "ad_users") html = table([["t.account", (a) => (a.domain ? `${a.domain}\\${a.name}` : a.name)],
+    ["t.last_use", (a) => fmtDate(a.last_use)], ["t.profile", (a) => a.profile], ["t.sid", (a) => a.sid]],
+    (items.user_accounts || []).filter((a) => a.type !== "local"), true);
+  else if (cat === "local_groups") html = table([["t.group", (g) => g.name], ["t.desc", (g) => g.description],
+    ["t.member_count", (g) => (g.member_count == null ? "" : g.member_count), "num"], ["t.members", (g) => g.members]], items.local_groups || [], true);
+  else if (cat === "monitors") html = table([["t.monitor", (m) => m.name || ((Number(m.connection) >>> 0) === 2147483648 ? tText("t.internal") : m.product_code)], ["t.manufacturer", (m) => pnpVendor(m.manufacturer)],
+    ["t.serial", (m) => m.serial], ["t.size_in", (m) => (m.size_in ? `${m.size_in}" (${m.width_cm} × ${m.height_cm} cm)` : "")],
+    ["t.connection", (m) => monConn(m.connection)], ["t.made", (m) => (m.year ? `${m.year}${m.week ? ` / ${m.week}. ${t("t.week")}` : ""}` : "")],
+    ["t.product_code", (m) => m.product_code]], items.monitors || [], false);
   else if (cat === "logons") html = table([["t.time", (l) => fmtDate(l.time)], ["t.account", (l) => (l.domain ? `${l.domain}\\${l.user}` : l.user)], ["t.logon_type", (l) => t("lt." + l.type)], ["t.source_ip", (l) => l.ip]], items.logons || [], true);
   else if (cat === "ports") html = table([["t.port", (p) => p], ["t.service_name", (p) => PORTS[p] || ""]], c.open_ports, false);
   else if (cat === "collections") html = c.fleets.length ? `<div style="padding:10px 0;display:flex;flex-direction:column;gap:6px">${c.fleets.map((f) => `<a href="#" data-goto="f:${f.id}">${icon("coll_dyn", 16)} ${esc(f.name)}</a>`).join("")}</div>` : `<div class="empty">${esc(t("tree.none"))}</div>`;
@@ -1092,6 +1268,7 @@ function renderCwContent() {
     f.oninput = (e) => { cw.filter = e.target.value; const pos = e.target.selectionStart; renderCwContent(); const nf = $("#cw-filter"); nf.focus(); nf.setSelectionRange(pos, pos); };
   }
   $$("[data-goto]", el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); if (S.cw) S.cw.back = null; closeComputer(); selectNode(a.dataset.goto); }));
+  $$("[data-blkey]", el).forEach((b) => (b.onclick = () => blRevealDialog(c, b.dataset.blkey, b.dataset.bldrive)));
   const retag = (body) => guard(async () => { await api("POST", "/api/tags", { ids: [c.guid], ...body }); await reload(); loadComputer(); });
   $$("[data-untag]", el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); retag({ remove: [a.dataset.untag] }); }));
   const tf = $("#cw-tagform");
@@ -1109,7 +1286,12 @@ function bindComputerWindow() {
         scan: () => startJob("full", { ids: [c.guid] }), ping: () => startJob("scan", { ids: [c.guid] }),
         allow: () => setAllowScan([c.guid], !c.allow_scan),
         ra: () => guard(() => window.pywebview.api.remote_assist(c.name)),
+        // the target's event logs in the Windows Event Viewer (as the signed-in user)
+        events: () => guard(() => window.pywebview.api.event_viewer(c.dns_hostname || c.name)),
+        // Computer Management (MMC) connected to the target
+        mmc: () => guard(() => window.pywebview.api.computer_management(c.dns_hostname || c.name)),
         copy: async () => { await copyText(c.dns_hostname || c.name); toast(tText("copied", { n: 1 })); },
+        print: printComputer,
       })[b.dataset.cw]?.();
       return;
     }
@@ -1138,7 +1320,8 @@ function dialog(title, body, buttons) {
   const box = $(".dlg", layer);
   box.innerHTML = `<div class="dlg-title"><span>${esc(title)}</span><button class="cwin-x" data-dclose aria-label="Close">✕</button></div>
     <div class="dlg-body">${body}</div><div class="dlg-foot">${buttons || `<button class="btn" data-dclose>${t("d.close")}</button>`}</div>`;
-  box.style.width = "";                                    // a dialog may widen itself; the next one starts normal
+  box.style.width = box.style.height = "";                 // a dialog may resize itself; the next one starts normal
+  box.classList.remove("dlg-big");
   layer.hidden = false;
   $$("[data-dclose]", box).forEach((b) => (b.onclick = closeDialog));
   setTimeout(() => box.querySelector("input:not([type=checkbox]),select,textarea")?.focus(), 30);
@@ -1228,7 +1411,7 @@ function addToCollectionDialog() {
   const statics = S.fleets.filter((f) => f.kind === "static");
   if (!statics.length) {
     return dialog(t("m.add_to_coll").replace("…", ""), `<div class="callout">${esc(t("coll.no_static"))}</div>`,
-      `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" data-new>${esc(t("m.new_stat").replace("…", ""))}</button>`)
+      `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" data-new>${esc(t("m.new_coll").replace("…", ""))}</button>`)
       .querySelector("[data-new]").onclick = () => { closeDialog(); ACTIONS["new-stat"](); };
   }
   const box = dialog(t("m.add_to_coll").replace("…", ""), `<label class="fld"><span>${t("coll.pick")} · ${t("sb.selected", { n: ids.length })}</span>
@@ -1242,33 +1425,190 @@ function addToCollectionDialog() {
   });
 }
 
+/* ================================================================== report (export) editor */
+// Every column a report can have, by category (the computer window's sections). val(c) is the plain text that goes
+// into the file and that the filter compares.
+const rpTxt = (v) => (v == null ? "" : String(v));
+const rpYn = (v) => (v == null ? "" : v ? tText("v.yes") : tText("v.no"));
+const REPORT_COLUMNS = [
+  ["cw.general", [
+    ["name", "col.name", (c) => c.name], ["dns_hostname", "f.host", (c) => c.dns_hostname], ["description", "col.description", (c) => c.description],
+    ["online", "col.online", (c) => rpYn(c.online)], ["uptime", "col.uptime", (c) => fmtUptime(c.uptime_s)], ["last_boot", "f.boot", (c) => fmtDate(inv(c, "last_boot"))],
+    ["user", "col.user", (c) => inv(c, "logged_on_user")], ["user_display_name", "f.display_name", (c) => inv(c, "user_display_name")],
+    ["ip", "col.ip", (c) => inv(c, "ip_address") || c.ip], ["mac", "f.mac", (c) => inv(c, "mac_address")], ["time_zone", "f.tz", (c) => inv(c, "time_zone")],
+    ["added", "f.added", (c) => fmtDate(c.added)], ["tags", "col.tags", (c) => (c.tags || []).join(", ")],
+    ["collections", "cw.cat.collections", (c) => S.fleets.filter((f) => (f.guids || []).includes(c.guid)).map((f) => f.name).join(", ")],
+  ]],
+  ["cw.os", [
+    ["os", "col.os", (c) => osShort(c)], ["os_name", "rp.os_name", (c) => inv(c, "os_caption") || c.os], ["os_version", "col.os_version", (c) => inv(c, "os_version") || (c.os_version || "").replace(/ \((\d+)\)/, ".$1")],
+    ["release", "col.release", (c) => inv(c, "os_display_version")], ["os_build", "rp.os_build", (c) => inv(c, "os_build")],
+    ["os_installed", "rp.os_installed", (c) => fmtDate(inv(c, "os_installed"))], ["os_architecture", "f.arch", (c) => inv(c, "os_architecture")],
+    ["powershell_version", "f.ps", (c) => inv(c, "powershell_version")], ["ie_version", "f.ie", (c) => inv(c, "ie_version")],
+    ["smb1_server", "f.smb1s", (c) => rpYn(inv(c, "smb1_server"))], ["smb1_client", "f.smb1c", (c) => rpYn(inv(c, "smb1_client"))],
+    ["reboot", "col.reboot", (c) => rpYn(inv(c, "pending_reboot"))],
+  ]],
+  ["cw.ad", [
+    ["ou", "col.ou", (c) => (c.ou || "").split("/").slice(1).join("/")], ["domain", "f.domain", (c) => inv(c, "domain") || (c.ou || "").split("/")[0]],
+    ["location", "col.location", (c) => c.location], ["last_logon", "col.last_logon", (c) => fmtDate(c.last_logon)], ["created", "f.created", (c) => fmtDate(c.created)],
+    ["enabled", "f.account", (c) => (c.enabled ? tText("v.enabled") : tText("v.disabled"))], ["dn", "f.dn", (c) => c.dn],
+  ]],
+  ["cw.system", [
+    ["manufacturer", "col.manufacturer", (c) => inv(c, "manufacturer")], ["model", "col.model", (c) => inv(c, "model")], ["serial", "col.serial", (c) => inv(c, "serial")],
+    ["chassis", "col.chassis", (c) => inv(c, "chassis")], ["memory", "col.memory", (c) => gb(inv(c, "memory_gb"))], ["cfree", "col.cfree", (c) => gb(inv(c, "c_free_gb"))],
+    ["cpu", "f.cpu", (c) => inv(c, "cpu")], ["cpu_cores", "rp.cpu_cores", (c) => inv(c, "cpu_cores")], ["bios_version", "f.bios_version", (c) => inv(c, "bios_version")],
+    ["bios_manufacturer", "f.bios_manufacturer", (c) => inv(c, "bios_manufacturer")], ["asset", "f.asset", (c) => inv(c, "bios_asset_tag")], ["sku", "f.sku", (c) => inv(c, "sku")],
+  ]],
+  ["cw.updates", [
+    ["security", "col.security", (c) => secState(c)[1]], ["sec_installed", "sec.installed", (c) => c.security?.installed], ["sec_latest", "sec.latest", (c) => c.security?.latest],
+  ]],
+  ["cw.scanning", [
+    ["scan_status", "col.scan_status", (c) => scanStatus(c)[1]], ["scanned", "col.scanned", (c) => fmtDate(c.scan_status === "failed" ? "" : c.collected_at)],
+    ["collect_error", "f.error", (c) => c.collect_error], ["allow_scan", "f.allow_scan", (c) => rpYn(c.allow_scan !== false)],
+  ]],
+].flatMap(([cat, cols]) => cols.map(([id, label, val]) => ({ id, cat, label, val: (c) => rpTxt(val(c)) })));
+const RP_DEFAULT = ["name", "online", "os", "os_version", "release", "ip", "user", "manufacturer", "model", "serial", "ou", "last_logon"];
+const RP_OPS = ["contains", "not_contains", "equals", "starts_with", "ends_with", "ver_between", "ver_gt", "ver_lt", "ver_ge"];
+const rpCol = (id) => REPORT_COLUMNS.find((x) => x.id === id);
+const rpLabel = (col) => `${tText(col.label)}`;
+
+// "10.0.19045.3803" / "v1.2-beta" -> [10, 0, 19045, 3803] / [1, 2]; null when the value has no number at all
+function verParts(v) { const m = String(v ?? "").match(/\d+/g); return m ? m.map(Number) : null; }
+function verCmp(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) { const x = a[i] || 0, y = b[i] || 0; if (x !== y) return x < y ? -1 : 1; }
+  return 0;
+}
+/** Does one computer satisfy one report filter condition {col, op, value, value2}? Text matching ignores case. */
+function rpMatch(c, f) {
+  const col = rpCol(f.col);
+  if (!col) return true;
+  const v = col.val(c).toLowerCase(), q = String(f.value ?? "").trim().toLowerCase();
+  switch (f.op) {
+    case "contains": return v.includes(q);
+    case "not_contains": return !v.includes(q);
+    case "equals": return v === q;
+    case "starts_with": return v.startsWith(q);
+    case "ends_with": return v.endsWith(q);
+  }
+  const have = verParts(v), a = verParts(q);
+  if (!have || !a) return false;
+  if (f.op === "ver_gt") return verCmp(have, a) > 0;
+  if (f.op === "ver_lt") return verCmp(have, a) < 0;
+  if (f.op === "ver_ge") return verCmp(have, a) >= 0;
+  if (f.op === "ver_between") { const b = verParts(f.value2); return !!b && verCmp(have, a) >= 0 && verCmp(have, b) <= 0; }
+  return true;
+}
+const rpFiltered = (rows, filter) => {
+  const conds = filter.conds.filter((f) => String(f.value ?? "").trim() !== "");
+  if (!conds.length) return rows;
+  return rows.filter((c) => (filter.match === "any" ? conds.some((f) => rpMatch(c, f)) : conds.every((f) => rpMatch(c, f))));
+};
+
+/* The Export (report) dialog: the "Layout" tab puts together which columns the report has and in what order, the
+   "Filter" tab narrows the computers (column + comparison + value). Both are remembered for the next report.
+   A static collection can be made from the computers the report lists. */
 function exportDialog() {
   const fleet = currentFleet();
-  const rows = S.sel.size ? selectedComputers() : S.list;
-  const formats = fleet ? Object.keys(S.status.export_formats) : ["txt", "csv"];
-  const title = fleet && !S.sel.size ? fleet.name : (S.sel.size ? t("exp.selection") : (findNode(S.treeNodes, S.node)?.label || ""));
+  const base = S.sel.size ? selectedComputers() : S.list;
+  const serverFmts = fleet ? Object.keys(S.status.export_formats).filter((f) => f !== "txt" && f !== "csv") : [];
+  const title = fleet && !S.sel.size ? fleet.name : (S.sel.size ? tText("exp.selection") : (findNode(S.treeNodes, S.node)?.label || ""));
+  let cols = (store.get("report.cols", null) || RP_DEFAULT).filter((id) => rpCol(id));
+  if (!cols.length) cols = [...RP_DEFAULT];
+  const saved = store.get("report.filter", null);
+  const filter = { match: saved?.match === "any" ? "any" : "all", conds: (saved?.conds || []).filter((f) => rpCol(f.col) && RP_OPS.includes(f.op)) };
+  let tab = "layout";
   const box = dialog(tText("exp.title", { name: title }), `
-    <label class="fld"><span>${t("exp.format")}</span><select id="ex-fmt">${formats.map((f) => `<option value="${f}">${esc(t("fmt." + f))}</option>`).join("")}</select></label>
-    <label class="chk"><input type="checkbox" id="ex-online"> ${t("exp.online")}</label>`,
-    `<button class="btn" data-copy>${t("d.copy")}</button><button class="btn primary" data-save>${t("d.download")}</button>`);
+    <div class="grid2"><label class="fld"><span>${t("exp.format")}</span><select id="ex-fmt">
+      <option value="csv">${esc(t("fmt.csv_report"))}</option><option value="txt">${esc(t("fmt.txt"))}</option>
+      ${serverFmts.map((f) => `<option value="${f}">${esc(t("fmt." + f))} · ${esc(t("rp.full"))}</option>`).join("")}</select></label>
+      <label class="chk" style="align-self:end;padding-bottom:4px"><input type="checkbox" id="ex-online"> ${t("exp.online")}</label></div>
+    <div class="tabs" id="rp-tabs"><button type="button" data-tab="layout">${icon("columns", 14)} ${t("rp.layout")}</button><button type="button" data-tab="filter">${icon("details", 14)} ${t("rp.filter")} <span id="rp-fn"></span></button></div>
+    <div id="rp-layout"></div><div id="rp-filter" hidden></div>
+    <div class="preview" id="rp-count"></div>`,
+    `<button class="btn" id="rp-coll">${icon("coll_stat", 16)}${t("rp.new_coll")}</button><span style="flex:1"></span>
+     <button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn" data-copy>${t("d.copy")}</button><button class="btn primary" data-save>${t("d.download")}</button>`);
+  box.classList.add("dlg-big");                          // tall, and the user can drag its corner to resize it
+  const persist = () => { store.set("report.cols", cols); store.set("report.filter", filter); };
+  const rows = () => { const o = $("#ex-online", box).checked; return rpFiltered(o ? base.filter((c) => c.online) : base, filter); };
+  const srvFmt = () => serverFmts.includes($("#ex-fmt", box).value);
+  const count = () => {
+    const n = rows().length, act = filter.conds.filter((f) => String(f.value ?? "").trim() !== "").length;
+    $("#rp-fn", box).textContent = act ? `(${act})` : "";
+    $("#rp-count", box).innerHTML = srvFmt() ? `<span class="faint">${esc(t("rp.server_note"))}</span>`
+      : `${t("rp.count", { n, c: cols.length })}${act ? ` <span class="faint">· ${esc(tText("rp.of", { n: base.length }))}</span>` : ""}`;
+    $("#rp-coll", box).disabled = !n;
+  };
+  const items = REPORT_COLUMNS.map((c) => ({ id: c.id, label: rpLabel(c), group: tText(c.cat) }));
+  dualList($("#rp-layout", box), { items, chosen: cols, ordered: true, left: t("rp.available"), right: t("rp.chosen"),
+    onChange: (ids) => { cols = ids; persist(); count(); } });
+
+  const opLabel = (o) => tText("rp.op." + o);
+  const colSelect = (f, i) => `<select data-fi="${i}" data-fk="col">${REPORT_COLUMNS.map((c, j) => (j === 0 || REPORT_COLUMNS[j - 1].cat !== c.cat ? `${j ? "</optgroup>" : ""}<optgroup label="${esc(tText(c.cat))}">` : "")
+    + `<option value="${c.id}" ${c.id === f.col ? "selected" : ""}>${esc(rpLabel(c))}</option>`).join("")}</optgroup></select>`;
+  const drawFilter = () => {
+    const el = $("#rp-filter", box);
+    el.innerHTML = `<div class="chk"><span class="muted">${t("coll.match")}</span><div class="seg" id="rp-match"><button type="button" data-rm-match="all" class="${filter.match === "all" ? "on" : ""}">${t("coll.match_all")}</button><button type="button" data-rm-match="any" class="${filter.match === "any" ? "on" : ""}">${t("coll.match_any")}</button></div></div>
+      ${filter.conds.map((f, i) => `<div class="rule rp-rule">${colSelect(f, i)}
+        <select data-fi="${i}" data-fk="op">${RP_OPS.map((o) => `<option value="${o}" ${o === f.op ? "selected" : ""}>${esc(opLabel(o))}</option>`).join("")}</select>
+        <span class="rp-vals"><input data-fi="${i}" data-fk="value" value="${esc(f.value ?? "")}" placeholder="${esc(f.op.startsWith("ver_") ? t("rp.version") : t("r.value"))}" list="rp-vals-${i}">
+        ${f.op === "ver_between" ? `<span class="faint">–</span><input data-fi="${i}" data-fk="value2" value="${esc(f.value2 ?? "")}" placeholder="${esc(t("rp.version"))}" list="rp-vals-${i}">` : ""}</span>
+        <datalist id="rp-vals-${i}">${[...new Set(base.map((c) => rpCol(f.col).val(c)).filter(Boolean))].sort().slice(0, 300).map((v) => `<option value="${esc(v)}">`).join("")}</datalist>
+        <button type="button" class="btn" data-rm-f="${i}" aria-label="${esc(t("d.remove"))}">✕</button></div>`).join("")
+        || `<div class="faint">${esc(t("rp.no_filter"))}</div>`}
+      <div><button type="button" class="btn" id="rp-add">${t("coll.add_cond")}</button></div>
+      <div class="faint">${esc(t("rp.filter_hint"))}</div>`;
+    count();
+  };
+  drawFilter();
+  const showTab = () => {
+    $$("#rp-tabs button", box).forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+    $("#rp-layout", box).hidden = tab !== "layout";
+    $("#rp-filter", box).hidden = tab !== "filter";
+  };
+  showTab();
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.tab) { tab = b.dataset.tab; showTab(); }
+    else if (b.dataset.rmMatch) { filter.match = b.dataset.rmMatch; persist(); drawFilter(); }
+    else if (b.id === "rp-add") { filter.conds.push({ col: "name", op: "contains", value: "" }); persist(); drawFilter(); $(`#rp-filter input[data-fi="${filter.conds.length - 1}"]`, box)?.focus(); }
+    else if (b.dataset.rmF !== undefined) { filter.conds.splice(Number(b.dataset.rmF), 1); persist(); drawFilter(); }
+  });
+  const onEdit = (e) => {
+    const { fi, fk } = e.target.dataset;
+    if (fi === undefined) return;
+    const f = filter.conds[Number(fi)];
+    f[fk] = e.target.value;
+    persist();
+    if (e.type === "change" && (fk === "col" || fk === "op")) drawFilter(); else count();
+  };
+  $("#rp-filter", box).addEventListener("change", onEdit);
+  $("#rp-filter", box).addEventListener("input", onEdit);
+  $("#ex-online", box).onchange = count;
+  $("#ex-fmt", box).onchange = () => { const srv = srvFmt(); $("#rp-tabs", box).hidden = srv; $("#rp-layout", box).hidden = srv || tab !== "layout"; $("#rp-filter", box).hidden = srv || tab !== "filter"; count(); };
+
   const build = async () => {
     const fmt = $("#ex-fmt", box).value, online = $("#ex-online", box).checked;
-    if (fleet && !S.sel.size) {
+    if (srvFmt()) {
       const data = await api("GET", `/api/fleets/${fleet.id}/export?format=${fmt}&online_only=${online}`);
       return [typeof data === "string" ? data : JSON.stringify(data, null, 2), `${fleet.name.replace(/[^\w-]/g, "_")}.${fmt === "ansible" ? "ini" : fmt}`];
     }
-    const list = online ? rows.filter((c) => c.online) : rows;
-    const host = (c) => c.dns_hostname || c.name;
-    if (fmt === "txt") return [list.map(host).join("\r\n") + "\r\n", "computers.txt"];
-    const cols = visibleCols();
-    const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-    const csv = [cols.map((c) => q(t("col." + c.id))).join(";")].concat(list.map((c) => cols.map((col) => {
-      const tmp = document.createElement("div"); tmp.innerHTML = col.html ? col.html(c) : esc(col.get(c)); return q(tmp.textContent);
-    }).join(";"))).join("\r\n");
-    return ["\ufeff" + csv + "\r\n", "computers.csv"];
+    const list = rows();
+    const stem = (fleet && !S.sel.size ? fleet.name : "computers").replace(/[^\p{L}\p{N}_-]/gu, "_");
+    if (fmt === "txt") return [list.map((c) => c.dns_hostname || c.name).join("\r\n") + "\r\n", stem + ".txt"];
+    const q = (v) => `"${csvSafe(v).replace(/"/g, '""')}"`;
+    const use = cols.map(rpCol).filter(Boolean);
+    const csv = [use.map((c) => q(rpLabel(c))).join(";")].concat(list.map((c) => use.map((col) => q(col.val(c))).join(";"))).join("\r\n");
+    return ["﻿" + csv + "\r\n", stem + ".csv"];
   };
   box.querySelector("[data-save]").onclick = () => guard(async () => { const [text, name] = await build(); await saveText(name, text); closeDialog(); });
   box.querySelector("[data-copy]").onclick = () => guard(async () => { const [text] = await build(); await copyText(text); toast(t("exp.copied")); });
+  // a new static collection with exactly the computers this report lists (the type can still be switched in the editor)
+  $("#rp-coll", box).onclick = () => {
+    const guids = rows().map((c) => c.guid);
+    if (!guids.length) return;
+    closeDialog();
+    fleetEditor(null, { kind: "static", guids, name: tText("rp.coll_name", { name: title }) });
+  };
 }
 
 // READ-ONLY: compares the collection with the AD group's current members. ADmiral never
@@ -1301,14 +1641,79 @@ function groupCompareDialog(fleet) {
   load();
 }
 
+/* Two lists side by side - the available items on the left, the chosen ones on the right - with move buttons
+   in the middle (add selected / add all / remove selected / remove all). Double-click moves one item.
+   opts: items [{id, label, group?, hint?}], chosen [ids], left / right titles, ordered (up/down buttons, keeps
+   the chosen order), onChange(ids). Returns { get(), set(ids) }. */
+function dualList(host, opts) {
+  let chosen = opts.chosen.filter((id) => opts.items.some((x) => x.id === id));
+  const byId = new Map(opts.items.map((x) => [x.id, x]));
+  host.innerHTML = `<div class="dual">
+    <div class="dual-col"><div class="dual-h"><span data-dl-lt></span></div>
+      <input type="search" class="dual-filter" placeholder="${esc(t("page.filter"))}"><select multiple class="dual-l" aria-label="${esc(opts.left)}"></select></div>
+    <div class="dual-btns">
+      <button type="button" class="btn" data-dl="add" title="${esc(t("dl.add"))}">${esc(t("dl.add"))} ›</button>
+      <button type="button" class="btn" data-dl="add-all" title="${esc(t("dl.add_all"))}">${esc(t("dl.add_all"))} »</button>
+      <button type="button" class="btn" data-dl="rem" title="${esc(t("dl.remove"))}">‹ ${esc(t("dl.remove"))}</button>
+      <button type="button" class="btn" data-dl="rem-all" title="${esc(t("dl.remove_all"))}">« ${esc(t("dl.remove_all"))}</button>
+    </div>
+    <div class="dual-col"><div class="dual-h"><span data-dl-rt></span></div>
+      <select multiple class="dual-r" aria-label="${esc(opts.right)}"></select>
+      ${opts.ordered ? `<div class="dual-order"><button type="button" class="btn" data-dl="up">▲ ${esc(t("dl.up"))}</button><button type="button" class="btn" data-dl="down">▼ ${esc(t("dl.down"))}</button></div>` : ""}</div>
+  </div>`;
+  const L = $(".dual-l", host), R = $(".dual-r", host), F = $(".dual-filter", host);
+  const opt = (x) => `<option value="${esc(x.id)}" title="${esc(x.hint || x.label)}">${esc(x.label)}${x.hint ? ` <span>– ${esc(x.hint)}</span>` : ""}</option>`;
+  const visibleLeft = () => {
+    const q = F.value.trim().toLowerCase(), cs = new Set(chosen);
+    return opts.items.filter((x) => !cs.has(x.id) && (!q || `${x.label} ${x.hint || ""} ${x.group || ""}`.toLowerCase().includes(q)));
+  };
+  const draw = (keepR) => {
+    const left = visibleLeft();
+    const groups = [...new Set(left.map((x) => x.group || ""))];
+    L.innerHTML = groups.map((g) => { const its = left.filter((x) => (x.group || "") === g).map(opt).join(""); return g ? `<optgroup label="${esc(g)}">${its}</optgroup>` : its; }).join("");
+    const right = (opts.ordered ? chosen.map((id) => byId.get(id)) : chosen.map((id) => byId.get(id)).sort((a, b) => a.label.localeCompare(b.label))).filter(Boolean);
+    R.innerHTML = right.map((x) => opt(opts.ordered && x.group ? { ...x, label: x.label, hint: x.group } : x)).join("");
+    if (keepR) [...R.options].forEach((o) => (o.selected = keepR.has(o.value)));
+    $("[data-dl-lt]", host).textContent = `${opts.left} (${opts.items.length - chosen.length})`;
+    $("[data-dl-rt]", host).textContent = `${opts.right} (${chosen.length})`;
+  };
+  const changed = (keepR) => { draw(keepR); opts.onChange && opts.onChange([...chosen]); };
+  const selOf = (sel) => [...sel.selectedOptions].map((o) => o.value);
+  const add = (ids) => { const cs = new Set(chosen); ids.forEach((id) => { if (!cs.has(id)) { chosen.push(id); cs.add(id); } }); changed(new Set(ids)); };
+  const rem = (ids) => { const r = new Set(ids); chosen = chosen.filter((id) => !r.has(id)); changed(); };
+  const move = (d) => {
+    const s = new Set(selOf(R));
+    if (!s.size) return;
+    const idx = chosen.map((id, i) => (s.has(id) ? i : -1)).filter((i) => i >= 0);
+    if (d < 0 ? idx[0] === 0 : idx[idx.length - 1] === chosen.length - 1) return;
+    for (const i of d < 0 ? idx : idx.reverse()) [chosen[i], chosen[i + d]] = [chosen[i + d], chosen[i]];
+    changed(s);
+  };
+  host.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-dl]");
+    if (!b) return;
+    e.stopPropagation();
+    ({ add: () => add(selOf(L)), "add-all": () => add(visibleLeft().map((x) => x.id)), rem: () => rem(selOf(R)),
+       "rem-all": () => rem([...chosen]), up: () => move(-1), down: () => move(1) })[b.dataset.dl]();
+  });
+  L.addEventListener("dblclick", (e) => { const o = e.target.closest("option"); if (o) add([o.value]); });
+  R.addEventListener("dblclick", (e) => { const o = e.target.closest("option"); if (o) rem([o.value]); });
+  F.addEventListener("input", (e) => { e.stopPropagation(); draw(new Set(selOf(R))); });
+  draw();
+  return { get: () => [...chosen], set: (ids) => { chosen = ids.filter((id) => byId.has(id)); changed(); } };
+}
+
 function fleetEditor(fleet, preset) {
   const isNew = !fleet;
   const schema = S.status.rules;
   let kind = fleet?.kind || preset.kind || "dynamic";
   let match = fleet?.rules?.match || "all";
   const conds = fleet?.rules?.conditions?.map((c) => ({ ...c })) || [{ field: "ou", op: "contains", value: "" }];
+  const origGuids = fleet?.kind === "static" ? [...(fleet.guids || [])] : [];
+  let members = fleet ? [...origGuids] : [...(preset.guids || [])];      // static members (GUIDs), kept across type switches
+  let dual = null;
   const box = dialog(isNew ? t("coll.new") : tText("coll.edit", { name: fleet.name }), `
-    <div class="grid2"><label class="fld"><span>${t("coll.name")}</span><input id="fe-name" value="${esc(fleet?.name || "")}"></label>
+    <div class="grid2"><label class="fld"><span>${t("coll.name")}</span><input id="fe-name" value="${esc(fleet?.name || preset.name || "")}"></label>
       <label class="fld"><span>${t("coll.desc")}</span><input id="fe-desc" value="${esc(fleet?.description || "")}"></label></div>
     <label class="fld"><span>${t("coll.group")}</span><input id="fe-group" class="mono" value="${esc(fleet?.ad_group_dn || "")}" placeholder="CN=Deploy-Office-Pilot,OU=Groups,DC=corp,DC=local"></label>
     ${isNew ? `<div class="chk"><span class="muted">${t("coll.type")}</span><div class="seg" id="fe-kind"><button type="button" data-kind="dynamic">${t("coll.type_dyn")}</button><button type="button" data-kind="static">${t("coll.type_stat")}</button></div></div>` : ""}
@@ -1345,8 +1750,13 @@ function fleetEditor(fleet, preset) {
   const draw = () => {
     $$("#fe-kind button", box).forEach((b) => b.classList.toggle("on", b.dataset.kind === kind));
     const body = $("#fe-body", box);
+    box.style.width = kind === "static" ? "min(980px, calc(100vw - 32px))" : "";
+    dual = null;
     if (kind === "static") {
-      body.innerHTML = isNew ? `<label class="fld"><span>${t("coll.members")}</span><textarea id="fe-members" rows="7" class="mono">${esc((preset.members || []).join("\n"))}</textarea></label>` : `<div class="muted">${t("coll.members_later")}</div>`;
+      body.innerHTML = `<div id="fe-dual"></div>`;
+      const items = [...S.computers].sort((a, b) => a.name.localeCompare(b.name))
+        .map((c) => ({ id: c.guid, label: c.name, hint: [osShort(c), (c.ou || "").split("/").slice(1).join("/")].filter(Boolean).join(" · ") }));
+      dual = dualList($("#fe-dual", body), { items, chosen: members, left: t("coll.available"), right: t("coll.in_coll"), onChange: (ids) => (members = ids) });
       return;
     }
     body.innerHTML = `<div class="chk"><span class="muted">${t("coll.match")}</span><div class="seg" id="fe-match"><button type="button" data-m="all" class="${match === "all" ? "on" : ""}">${t("coll.match_all")}</button><button type="button" data-m="any" class="${match === "any" ? "on" : ""}">${t("coll.match_any")}</button></div></div>
@@ -1387,9 +1797,16 @@ function fleetEditor(fleet, preset) {
     let saved;
     if (isNew) {
       body.kind = kind;
-      if (kind === "static") body.members = ($("#fe-members", box)?.value || "").split(/[\s,;]+/).filter(Boolean);
+      if (kind === "static") body.members = members;
       saved = await api("POST", "/api/fleets", body);
-    } else saved = await api("PUT", `/api/fleets/${fleet.id}`, body);
+    } else {
+      saved = await api("PUT", `/api/fleets/${fleet.id}`, body);
+      if (fleet.kind === "static") {
+        const was = new Set(origGuids), now = new Set(members);
+        const add = members.filter((g) => !was.has(g)), remove = origGuids.filter((g) => !now.has(g));
+        if (add.length || remove.length) await api("POST", `/api/fleets/${fleet.id}/members`, { add, remove });
+      }
+    }
     closeDialog();
     toast(isNew ? tText("coll.created", { name: saved.name }) : t("coll.saved"));
     await guard(loadAll);
@@ -1947,6 +2364,7 @@ function bindGlobal() {
     if (S.cw) {
       if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); cwStep(-1); }
       if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); cwStep(1); }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") { e.preventDefault(); printComputer(); }
       return;
     }
     if (e.key === "F5") { e.preventDefault(); ACTIONS.refresh(); return; }

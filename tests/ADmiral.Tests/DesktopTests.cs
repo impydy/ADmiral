@@ -458,7 +458,7 @@ public sealed class DesktopBridgeTests
     [Fact]
     public void ExposesExactlyThePythonBridgeMethods()
     {
-        Assert.Equal(["open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file", "save_log_package", "set_theme"],
+        Assert.Equal(["computer_management", "event_viewer", "open_data_folder", "open_logs_folder", "open_url", "quit", "remote_assist", "save_binary", "save_file", "save_log_package", "set_theme"],
                      DesktopLogic.BridgeMethods.Order(StringComparer.Ordinal));
         using var tmp = new CoreTemp();
         var b = new DesktopBridge(new FakeShell(null), tmp.Path, remoteAssist: _ => { }, logFolder: () => tmp.Path);
@@ -532,6 +532,33 @@ public sealed class DesktopBridgeTests
         foreach (var bad in new[] { "", "a b", "pc; calc", "pc&calc", "-x", "pc|1", "$(x)", new string('a', 300) })
             Assert.Throws<ArgumentException>(() => b.Call("remote_assist", _ => bad));
         Assert.Throws<InvalidOperationException>(() => new DesktopBridge(new FakeShell(null), tmp.Path).Call("remote_assist", _ => "pc01"));
+    }
+
+    [Fact]
+    public void EventViewerGoesThroughTheValidatedCommand()
+    {
+        using var tmp = new CoreTemp();
+        var started = new List<string>();
+        var b = new DesktopBridge(new FakeShell(null), tmp.Path, eventViewer: h => started.Add(string.Join(" ", AdmiralService.EventViewerStartInfo(h).ArgumentList)));
+        b.Call("event_viewer", _ => " pc01.corp.local ");
+        Assert.Equal(["pc01.corp.local"], started);
+        foreach (var bad in new[] { "", "a b", "pc; calc", "/s", "-x", "pc|1", new string('a', 300) })
+            Assert.Throws<ArgumentException>(() => b.Call("event_viewer", _ => bad));
+        Assert.Throws<InvalidOperationException>(() => new DesktopBridge(new FakeShell(null), tmp.Path).Call("event_viewer", _ => "pc01"));
+    }
+
+    [Fact]
+    public void ComputerManagementGoesThroughTheValidatedCommand()
+    {
+        using var tmp = new CoreTemp();
+        var started = new List<string>();
+        var b = new DesktopBridge(new FakeShell(null), tmp.Path,
+                                  computerManagement: h => started.Add(AdmiralService.ComputerManagementStartInfo(h).ArgumentList[1]));
+        b.Call("computer_management", _ => " pc01.corp.local ");
+        Assert.Equal(["/computer=pc01.corp.local"], started);
+        foreach (var bad in new[] { "", "a b", "pc; calc", "/s", "-x", "pc|1", new string('a', 300) })
+            Assert.Throws<ArgumentException>(() => b.Call("computer_management", _ => bad));
+        Assert.Throws<InvalidOperationException>(() => new DesktopBridge(new FakeShell(null), tmp.Path).Call("computer_management", _ => "pc01"));
     }
 }
 

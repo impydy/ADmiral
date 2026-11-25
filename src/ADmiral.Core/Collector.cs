@@ -259,8 +259,10 @@ $r.smb1_server = $smbS
 $r.smb1_client = if ($m10) { $m10.StartType -ne 'Disabled' } else { $false }
 $r.ie_version = if ($ie.svcVersion) { $ie.svcVersion } else { $ie.Version }
 $r.pending_reboot = [bool]$rb
-$r.logged_on_user = $cs.UserName
-$r.user_display_name = $lui.LastLoggedOnDisplayName
+# local accounts of this computer (COMPUTER\user, .\user) are not recorded as the logged-on user
+$isLocal = { param($n) $n -and (($n -split '\\')[0] -in @($env:COMPUTERNAME, '.')) }
+$r.logged_on_user = if (& $isLocal $cs.UserName) { $null } else { $cs.UserName }
+$r.user_display_name = if (& $isLocal $lui.LastLoggedOnSAMUser) { $null } else { $lui.LastLoggedOnDisplayName }
 $r.domain = $cs.Domain
 $r.domain_controller = ($gp.DCName -replace '^\\\\', '')
 $r.ip_address = @($nic.IPAddress | Where-Object { $_ -match '^\d+\.' })[0]
@@ -297,6 +299,30 @@ $r.hotfixes = @(Get-CimInstance Win32_QuickFixEngineering | ForEach-Object {
   elseif ($raw -and [datetime]::TryParseExact($raw, [string[]]@('M/d/yyyy', 'MM/dd/yyyy', 'yyyyMMdd', 'yyyy-MM-dd', 'yyyy.MM.dd', 'yyyy. MM. dd.'),
       [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$p)) { $d = $p.ToString('yyyy-MM-dd') }
   [ordered]@{ id = $_.HotFixID; description = $_.Description; installed_on = $d; installed_by = $_.InstalledBy } })
+# BitLocker: state of every volume (no secret here; the recovery keys are a separate, encrypted part)
+$blv = @()
+try { $blv = @(Get-BitLockerVolume -ErrorAction Stop) } catch {}
+if ($blv.Count) {
+  $r.bitlocker = @($blv | ForEach-Object { [ordered]@{ drive = [string]$_.MountPoint; volume_type = [string]$_.VolumeType;
+    status = [string]$_.VolumeStatus; protection = [string]$_.ProtectionStatus; percent = $_.EncryptionPercentage;
+    method = [string]$_.EncryptionMethod; lock = [string]$_.LockStatus; auto_unlock = $_.AutoUnlockEnabled;
+    protectors = ((@($_.KeyProtector) | ForEach-Object { [string]$_.KeyProtectorType }) -join ', ') } })
+} else {
+  $r.bitlocker = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' Win32_EncryptableVolume | ForEach-Object {
+    [ordered]@{ drive = [string]$_.DriveLetter; volume_type = ''; status = ''; protection = $(switch ([int]$_.ProtectionStatus) { 0 { 'Off' } 1 { 'On' } default { 'Unknown' } });
+      percent = $null; method = ''; lock = ''; auto_unlock = $null; protectors = '' } })
+}
+# connected displays (EDID through WMI): maker code, model, serial, manufacture date, size, connection
+$txt = { param($a) if ($a) { -join ($a | Where-Object { $_ -ne 0 } | ForEach-Object { [char][int]$_ }) } else { '' } }
+$bp = @{}; Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | ForEach-Object { $bp[[string]$_.InstanceName] = $_ }
+$cn = @{}; Get-CimInstance -Namespace root\wmi WmiMonitorConnectionParams | ForEach-Object { $cn[[string]$_.InstanceName] = $_.VideoOutputTechnology }
+$r.monitors = @(Get-CimInstance -Namespace root\wmi WmiMonitorID | ForEach-Object {
+  $b = $bp[[string]$_.InstanceName]
+  $w = if ($b) { [int]$b.MaxHorizontalImageSize } else { 0 }; $h = if ($b) { [int]$b.MaxVerticalImageSize } else { 0 }
+  [ordered]@{ manufacturer = (& $txt $_.ManufacturerName); name = (& $txt $_.UserFriendlyName); product_code = (& $txt $_.ProductCodeID);
+    serial = (& $txt $_.SerialNumberID); year = $_.YearOfManufacture; week = $_.WeekOfManufacture; width_cm = $w; height_cm = $h;
+    size_in = $(if ($w -and $h) { [math]::Round([math]::Sqrt($w * $w + $h * $h) / 2.54, 1) } else { $null });
+    connection = $cn[[string]$_.InstanceName]; active = [bool]$_.Active; instance = [string]$_.InstanceName } })
 """";
     private const string PsApps = """"
 $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -313,23 +339,70 @@ $adm = @()
 try { $adm = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { [ordered]@{ name = $_.Name; type = "$($_.ObjectClass)"; source = "$($_.PrincipalSource)" } }) }
 catch { $adm = @(net localgroup Administrators | Select-Object -Skip 6 | Where-Object { $_ -and $_ -notmatch 'completed successfully|sikeresen' } | ForEach-Object { [ordered]@{ name = $_.Trim(); type = ''; source = '' } }) }
 $r.local_admins = $adm
+# every local group of the computer with its members
+$lg = @()
+try {
+  $lg = @(Get-LocalGroup -ErrorAction Stop | ForEach-Object {
+    $g = $_; $m = @()
+    try { $m = @(Get-LocalGroupMember -Group $g -ErrorAction Stop | ForEach-Object { [string]$_.Name }) } catch {}
+    [ordered]@{ name = $g.Name; description = $g.Description; sid = [string]$g.SID; members = ($m -join ', '); member_count = $m.Count } })
+} catch {
+  $lg = @(Get-CimInstance Win32_Group -Filter 'LocalAccount=True' | ForEach-Object {
+    [ordered]@{ name = $_.Name; description = $_.Description; sid = [string]$_.SID; members = ''; member_count = $null } })
+}
+$r.local_groups = $lg
 """";
     private const string PsLogons = """"
 $xp = '*[System[(EventID=4624)]] and *[EventData[Data[@Name="LogonType"]="2" or Data[@Name="LogonType"]="7" or Data[@Name="LogonType"]="10" or Data[@Name="LogonType"]="11"]]'
 $r.logons = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 3000 | Where-Object {
     $u = [string]$_.Properties[5].Value; $d = [string]$_.Properties[6].Value
     $u -and $u -notmatch '\$$' -and $u -notmatch '^(DWM|UMFD)-\d+$' -and
-    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host') -and
+    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host', $env:COMPUTERNAME, '.') -and
     $u -notin @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON') } |
   Select-Object -First 300 | ForEach-Object {
   [ordered]@{ time = D $_.TimeCreated; user = [string]$_.Properties[5].Value; domain = [string]$_.Properties[6].Value;
     type = [int]$_.Properties[8].Value; ip = [string]$_.Properties[18].Value } })
+# every user account of the computer: its local accounts, and the (domain) accounts that have a profile on it
+$prof = @{}
+Get-CimInstance Win32_UserProfile -Filter 'Special=False' | ForEach-Object { $prof[[string]$_.SID] = $_ }
+$seenSid = @{}
+$loc = @(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | ForEach-Object {
+  $p = $prof[[string]$_.SID]; $seenSid[[string]$_.SID] = 1
+  [ordered]@{ name = $_.Name; domain = $_.Domain; full_name = $_.FullName; type = 'local'; enabled = -not $_.Disabled;
+    last_use = $(if ($p) { D $p.LastUseTime } else { $null }); profile = $(if ($p) { $p.LocalPath } else { '' }); sid = [string]$_.SID } })
+$oth = @($prof.Values | Where-Object { -not $seenSid.ContainsKey([string]$_.SID) } | ForEach-Object {
+  $n = ''; try { $n = ([Security.Principal.SecurityIdentifier][string]$_.SID).Translate([Security.Principal.NTAccount]).Value } catch {}
+  $parts = if ($n -like '*\*') { $n.Split('\', 2) } else { @('', $n) }
+  [ordered]@{ name = $(if ($parts[1]) { $parts[1] } else { [string]$_.SID }); domain = $parts[0]; full_name = ''; type = 'domain'; enabled = $null;
+    last_use = D $_.LastUseTime; profile = $_.LocalPath; sid = [string]$_.SID } })
+$r.user_accounts = @($loc + $oth)
 """";
 
-    private static string SectionBody(string section) => section switch
+    /// <summary>The recovery passwords, encrypted on the computer with ADmiral's RSA public key (OAEP) before they
+    /// leave it: neither the result file, the network nor the database ever holds one readable. Only when BitLocker
+    /// answered (an empty list then means "no recovery password", and replaces the stored ones).</summary>
+    private const string PsBitlockerKeys = """"
+if ($blv.Count) {
+  $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+  $rsa.FromXmlString(@@BLKEY@@)
+  $r.bitlocker_keys = @(foreach ($v in $blv) { foreach ($p in @($v.KeyProtector)) {
+    if ([string]$p.KeyProtectorType -eq 'RecoveryPassword' -and $p.RecoveryPassword) {
+      [ordered]@{ drive = [string]$v.MountPoint; id = [string]$p.KeyProtectorId;
+        cipher = [Convert]::ToBase64String($rsa.Encrypt([Text.Encoding]::UTF8.GetBytes([string]$p.RecoveryPassword), $true)) } } } })
+}
+"""";
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\A<RSAKeyValue><Modulus>[A-Za-z0-9+/=]{100,2000}</Modulus><Exponent>[A-Za-z0-9+/=]{1,16}</Exponent></RSAKeyValue>\z")]
+    private static partial System.Text.RegularExpressions.Regex RsaPublicXml();
+
+    /// <summary>The section's body; the hardware section also reads the BitLocker recovery keys when
+    /// <paramref name="bitlockerKey"/> (ADmiral's RSA public key, XML) is given.</summary>
+    private static string SectionBody(string section, string? bitlockerKey = null) => section switch
     {
         "general" => PsGeneral,
-        "hardware" => PsHardware,
+        "hardware" => bitlockerKey is null ? PsHardware
+            : PsHardware.TrimEnd() + "\n" + PsBitlockerKeys.Replace("@@BLKEY@@",
+                Deploy.Q(RsaPublicXml().IsMatch(bitlockerKey) ? bitlockerKey : throw new ArgumentException("not an RSA public key"))),
         "apps" => PsApps,
         "services" => PsServices,
         "logons" => PsLogons,
@@ -339,12 +412,12 @@ $r.logons = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 3000 | 
     private static string WrapText => "\n" + Wrap + "\n";
 
     /// <summary>The script of one section: the body inside the common wrapper (errors collected, base64 JSON output).</summary>
-    public static string Script(string section) => WrapText.Replace("{body}", SectionBody(section).Trim());
+    public static string Script(string section, string? bitlockerKey = null) => WrapText.Replace("{body}", SectionBody(section, bitlockerKey).Trim());
 
     /// <summary>Every section as one script producing a single base64 JSON record (the PDQ-style collector and the
     /// offline script run it); exactly the same read-only <c>Get-*</c> inventory as the per-section scripts.</summary>
-    public static string CombinedScript() =>
-        WrapText.Replace("{body}", string.Join("\n", SectionNames.Select(s => SectionBody(s).Trim())));
+    public static string CombinedScript(string? bitlockerKey = null) =>
+        WrapText.Replace("{body}", string.Join("\n", SectionNames.Select(s => SectionBody(s, bitlockerKey).Trim())));
 
     /// <summary>Remove the PowerShell <c>$Error</c> list (<c>ps_errors</c>) from a decoded record and log it.</summary>
     public static void LogScriptErrors(string host, string where, JsonObject record)
@@ -576,7 +649,7 @@ Emit $out
         TimeSpan.FromSeconds(Math.Max(5, cfg.Timeout) + 15 + SectionNames.Count * Math.Max(120, cfg.Timeout * 3));
 
     /// <summary>The stdin request for one session (exposed for tests; contains the password - never log it).</summary>
-    internal static string BuildRequest(string host, WinRMSettings cfg, string transport, string realm)
+    internal static string BuildRequest(string host, WinRMSettings cfg, string transport, string realm, string? bitlockerKey = null)
     {
         string user = cfg.User ?? "", password = cfg.Password ?? "";
         if (transport == "kerberos")
@@ -598,12 +671,12 @@ Emit $out
             ["user"] = user,
             ["password"] = password,
             ["order"] = new JsonArray([.. SectionNames.Select(s => (JsonNode)s)]),
-            ["sections"] = new JsonObject(SectionNames.Select(s => KeyValuePair.Create(s, (JsonNode?)Script(s)))),
+            ["sections"] = new JsonObject(SectionNames.Select(s => KeyValuePair.Create(s, (JsonNode?)Script(s, bitlockerKey)))),
         };
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(req.ToJsonString()));
     }
 
-    private static JsonObject RunSession(string host, WinRMSettings cfg, string transport, string realm, IPowerShellRunner runner)
+    private static JsonObject RunSession(string host, WinRMSettings cfg, string transport, string realm, IPowerShellRunner runner, string? bitlockerKey = null)
     {
         if (transport == "credssp")
             WarnOnce("credssp", "WinRM CredSSP hands the account's password to every target computer: a compromised computer can " +
@@ -612,7 +685,7 @@ Emit $out
             WarnOnce("cert", "WinRM HTTPS without certificate validation: a machine in the middle can read the session");
         if (PsAuthentication(transport) == "Basic" && !cfg.UseHttps)       // settings from elsewhere than Config.Validate
             throw new CollectError($"WinRM transport '{transport}' (Basic) needs HTTPS (use_https): the password would cross the network readable");
-        var res = runner.Run(BuildRequest(host, cfg, transport, realm), TotalTimeout(cfg), MaxOutputBytes);
+        var res = runner.Run(BuildRequest(host, cfg, transport, realm, bitlockerKey), TotalTimeout(cfg), MaxOutputBytes);
         JsonObject resp;
         try
         {
@@ -645,14 +718,14 @@ Emit $out
     /// transport is kerberos, explicit credentials are configured and Kerberos failed with an authentication error
     /// (never after a network error such as a timeout or a refused connection).</para>
     /// <paramref name="runner"/> defaults to Windows PowerShell (Windows only).</summary>
-    public static JsonObject WinrmCollect(string host, WinRMSettings cfg, string realm = "", IPowerShellRunner? runner = null)
+    public static JsonObject WinrmCollect(string host, WinRMSettings cfg, string realm = "", IPowerShellRunner? runner = null, string? bitlockerKey = null)
     {
         Remote.ValidateHost(host);
         runner ??= DefaultRunner();
         JsonObject resp;
         try
         {
-            resp = RunSession(host, cfg, cfg.Transport, realm, runner);
+            resp = RunSession(host, cfg, cfg.Transport, realm, runner, bitlockerKey);
             if (Log.Logger.IsEnabled(LogLevel.Information))
                 Log.Logger.LogInformation("WinRM {Host}: authenticated with {Transport}", host, cfg.Transport);
         }
@@ -668,7 +741,7 @@ Emit $out
             Log.Logger.LogWarning("WinRM {Host}: Kerberos failed ({Error}); falling back to NTLMv2", host, exc.Message);
             try
             {
-                resp = RunSession(host, cfg, "ntlm", realm, runner);
+                resp = RunSession(host, cfg, "ntlm", realm, runner, bitlockerKey);
             }
             catch (CollectError exc2)
             {

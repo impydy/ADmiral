@@ -68,8 +68,15 @@ public static partial class Exporters
         _ => v.ToString() ?? "",
     };
 
-    private static string CsvField(string s) =>
-        s.IndexOfAny([',', '"', '\r', '\n']) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
+    /// <summary>A CSV cell. The values come from the computers' own inventory (untrusted): one a spreadsheet would run
+    /// as a formula (=, +, -, @, tab or CR first; a plain number excepted) gets a leading ' so it stays text.</summary>
+    internal static string CsvField(string s)
+    {
+        if (s.Length > 0 && s[0] is '=' or '+' or '-' or '@' or '\t' or '\r'
+            && !double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+            s = "'" + s;
+        return s.IndexOfAny([',', '"', '\r', '\n']) >= 0 ? "\"" + s.Replace("\"", "\"\"") + "\"" : s;
+    }
 
     /// <summary>Export <paramref name="computers"/> (rows of <see cref="Store.Computers"/>) in a format of
     /// <see cref="Formats"/>; an unknown format raises <see cref="ArgumentException"/>.</summary>

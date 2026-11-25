@@ -37,9 +37,27 @@ public static partial class CollectorModel
         return !VirtualAccount().IsMatch(u);
     }
 
+    /// <summary>Is <paramref name="domain"/> the account database of the computer itself (a local account)? Only known
+    /// with the computer's name; without it nothing counts as local.</summary>
+    public static bool IsLocalDomain(string? domain, string? computerName)
+    {
+        if (string.IsNullOrWhiteSpace(computerName)) return false;
+        var d = (domain ?? "").Trim();
+        return d == "." || string.Equals(d, computerName.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>"COMPUTER\\user" / ".\\user" of that computer's own (local) account?</summary>
+    public static bool IsLocalAccountName(string? account, string? computerName)
+    {
+        var a = (account ?? "").Trim();
+        var i = a.IndexOf('\\', StringComparison.Ordinal);
+        return i > 0 && IsLocalDomain(a[..i], computerName);
+    }
+
     /// <summary>Keep real users' interactive logons, newest first, without duplicates, at most <see cref="MaxLogons"/>.
-    /// Each result is <c>{time, user, domain, type, ip}</c>.</summary>
-    public static List<JsonObject> CleanLogons(IEnumerable<JsonNode?>? rows)
+    /// Each result is <c>{time, user, domain, type, ip}</c>. With <paramref name="computerName"/>, the logons of that
+    /// computer's local accounts (domain = the computer name, or ".") are dropped too.</summary>
+    public static List<JsonObject> CleanLogons(IEnumerable<JsonNode?>? rows, string? computerName = null)
     {
         var seen = new HashSet<(string, string, string, int)>();
         var outList = new List<JsonObject>();
@@ -48,7 +66,7 @@ public static partial class CollectorModel
             if (node is not JsonObject r) continue;
             var user = Str(r["user"]);
             var domain = Str(r["domain"]);
-            if (!RealUser(domain, user)) continue;
+            if (!RealUser(domain, user) || IsLocalDomain(domain, computerName)) continue;
             if (Int(r["type"]) is not { } typ || !LogonTypes.ContainsKey(typ)) continue;
             var time = Str(r["time"]);
             if (string.IsNullOrEmpty(time)) continue;

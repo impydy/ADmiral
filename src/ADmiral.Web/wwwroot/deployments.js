@@ -21,7 +21,20 @@ function dpCode(x) {
   return ` <span class="dp-code mono" title="${esc(tip)}">(${esc(x.exit_code)})</span>`;
 }
 
+// one step of a chain as text (the deploy dialog)
+function chStepText(s) {
+  const f = (s.file || "").split("/").pop();
+  const d = { install: `${f} ${s.args || ""}`, copy: `${f} → ${s.path}`, delete: s.path, reboot: tText(s.wait ? "ch.reboot_wait" : "ch.in_s", { s: s.seconds }),
+    shutdown: tText("ch.in_s", { s: s.seconds }), wol: tText("ch.wol_text", { s: s.seconds }), powershell: (s.script || "").split("\n")[0], cmd: (s.script || "").split("\n")[0] }[s.type] || "";
+  return `${t("ch.type." + s.type)}${d ? ": " + d.trim() : ""}${s.continue_on_error ? " (" + t("ch.continue") + ")" : ""}`;
+}
+
 function dpTargetState(x) {
+  if (x.step && x.step.startsWith("chain:")) {                 // chain:<i>:<n>:<type>
+    const [, i, n, type] = x.step.split(":");
+    const bar = `<span class="meter"><span style="width:${x.percent ?? 0}%"></span></span>`;
+    return `<span class="st-run">${esc(tText("ch.running", { i, n, type: t("ch.type." + type) }))}</span>${bar}`;
+  }
   if (x.step !== "done") {
     const pct = x.step === "copying" && x.percent != null ? ` ${x.percent}%` : "";
     const i = DP_STEPS.indexOf(x.step);
@@ -59,7 +72,7 @@ function dpRows() {
   const from = dpStart(DP.from), to = dpEnd(DP.to), q = DP.q.trim().toLowerCase();
   const rows = DP.list.filter((d) => dpIn(d, from, to) && (!DP.status || d.status === DP.status)
     && (!q || [d.package_name, d.version, d.args, d.package_id, d.status].join(" ").toLowerCase().includes(q)));
-  const key = { created: (d) => d.created, package: (d) => d.package_name.toLowerCase(), total: (d) => d.total, ok: (d) => d.ok, failed: (d) => d.failed, avg: (d) => d.avg_seconds ?? -1 }[DP.sort.key];
+  const key = { created: (d) => d.created, package: (d) => d.package_name.toLowerCase(), total: (d) => d.total, ok: (d) => d.ok, failed: (d) => d.failed, statuses: (d) => d.failed * 1e6 + d.unreachable * 1e3 + d.reboot, avg: (d) => d.avg_seconds ?? -1 }[DP.sort.key];
   return rows.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0) * DP.sort.dir);
 }
 
@@ -119,7 +132,7 @@ function drawDpCards() {
     <div class="dcard"><h4>${esc(t("dp.card.worst"))}</h4>${cur.worst.length ? cur.worst.map((p) => `<div class="worst"><span class="trunc">${esc(p.name)}</span><span class="st-bad">${p.rate.toFixed(0)}%</span><span class="faint">${p.bad}/${p.all}</span></div>`).join("") : `<div class="faint" style="padding:10px 0">${esc(t("dp.card.none"))}</div>`}</div>`;
 }
 
-const DP_COLS = [["created", "dp.col.last"], ["package", "dp.col.deployment"], ["total", "dp.col.to"], [null, "dp.col.statuses"], ["avg", "dp.col.avg"]];
+const DP_COLS = [["created", "dp.col.last"], ["package", "dp.col.deployment"], ["total", "dp.col.to"], ["statuses", "dp.col.statuses"], ["avg", "dp.col.avg"]];
 function dpStatusCells(d) {
   const c = (n, ic, cls, tip) => `<span class="dst ${n ? cls : "faint"}" title="${esc(t(tip))}">${icon(ic, 14)} ${n}</span>`;
   return c(d.queued, "dst_queued", "", "dp.step.queued") + c(d.running, "dst_run", "st-run", "dp.step.installing")
@@ -173,7 +186,7 @@ function drawDeployDetail() {
   const el = $("#dpdetail"), d = DP.detail;
   if (!el) return;
   if (!d) { dpSetHtml(el, ""); return; }
-  dpSetHtml(el, `<div class="faint" style="padding:6px 10px">${esc(tText("dp.detail", { id: d.id, file: d.file, args: d.args || "–" }))}
+  dpSetHtml(el, `<div class="faint" style="padding:6px 10px">${esc(tText("dp.detail", { id: d.id, file: d.kind === "chain" ? t("ch.chain") : d.file, args: d.args || "–" }))}
     <button class="btn" data-dplog="${d.id}" style="margin-left:8px">${esc(t("dp.log.btn"))}</button></div>
     <div class="grid-wrap"><table class="grid"><thead><tr><th class="rn"></th>${["computer", "state", "started", "finished", "message"].map((c) => `<th>${esc(t("dp.col." + c))}</th>`).join("")}</tr></thead><tbody>
     ${d.targets.map((x) => `<tr><td class="rn"></td><td>${icon("computer", 16)}${esc(x.name)}</td><td>${dpTargetState(x)}</td><td>${esc(fmtDate(x.started))}</td><td>${esc(fmtDate(x.finished))}</td>
@@ -222,7 +235,11 @@ async function dpNewDialog() {
   const pk = await guard(() => api("GET", "/api/packages"));
   if (!pk) return;
   const options = [];
-  for (const p of pk.packages) for (const f of p.files) if (f.kind === "installer" && dpExt(f.path)) options.push({ pid: p.id, path: f.path, label: `${p.name} ${f.version || p.version} — ${f.path.split("/").pop()}` });
+  // a package with a chain is offered as a whole first; its single installers can still be deployed alone
+  for (const p of pk.packages) {
+    if ((p.steps || []).length) options.push({ pid: p.id, chain: true, label: `${p.name} ${p.version || ""} — ${tText("ch.option", { n: p.steps.length })}`, steps: p.steps });
+    for (const f of p.files) if (f.kind === "installer" && dpExt(f.path)) options.push({ pid: p.id, path: f.path, label: `${p.name} ${f.version || p.version} — ${f.path.split("/").pop()}` });
+  }
   if (!options.length) return toast(t("dp.no_installers"), true);
   const comps = [...S.computers].sort((a, b) => a.name.localeCompare(b.name));
   const sel = new Set(S.sel);
@@ -231,9 +248,10 @@ async function dpNewDialog() {
   const effective = () => new Set([...sel, ...covered()]);
   const box = dialog(t("dp.new"), `
     <label class="fld"><span>${esc(t("dp.installer"))}</span><select id="dp-file">${options.map((o, i) => `<option value="${i}">${esc(o.label)}</option>`).join("")}</select></label>
-    <label class="fld"><span>${esc(t("dp.args"))}</span><input id="dp-args" class="field-in mono" type="text"></label>
+    <div id="dp-argbox"><label class="fld"><span>${esc(t("dp.args"))}</span><input id="dp-args" class="field-in mono" type="text"></label>
     <div id="dp-presets" class="faint"></div>
-    <div class="faint">${esc(t("dp.args_hint"))}</div>
+    <div class="faint">${esc(t("dp.args_hint"))}</div></div>
+    <div id="dp-chain" class="preview" hidden></div>
     ${S.fleets.length ? `<div class="faint">${esc(t("dp.collections"))}</div><div id="dp-cols" style="flex:none;max-height:120px;overflow:auto;border:1px solid var(--border-soft)">${S.fleets.map((f) => `<label class="chk" style="padding:2px 8px;display:flex"><input type="checkbox" data-f="${f.id}"> ${icon(f.kind === "dynamic" ? "coll_dyn" : "coll_stat", 16)} ${esc(f.name)} <span class="faint">${f.count}</span></label>`).join("")}</div>` : ""}
     <div class="subtable-tools"><input class="page-filter" id="dp-filter" type="search" placeholder="${esc(t("dp.filter"))}"><span class="faint" id="dp-count"></span>
       <button class="btn" id="dp-all" type="button">${esc(t("dp.all"))}</button><button class="btn" id="dp-none" type="button">${esc(t("dp.none"))}</button></div>
@@ -242,7 +260,14 @@ async function dpNewDialog() {
     `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" id="dp-go">${esc(t("dp.start"))}</button>`);
   const cur = () => options[Number($("#dp-file", box).value)];
   const presets = () => {
-    const ext = dpExt(cur().path);
+    const o = cur();
+    $("#dp-argbox", box).hidden = !!o.chain;
+    $("#dp-chain", box).hidden = !o.chain;
+    if (o.chain) {
+      $("#dp-chain", box).innerHTML = `<b>${esc(t("ch.steps"))}</b><ol style="margin:4px 0 0;padding-left:22px">${o.steps.map((s) => `<li>${esc(chStepText(s))}</li>`).join("")}</ol>`;
+      return;
+    }
+    const ext = dpExt(o.path);
     $("#dp-presets", box).innerHTML = DP_PRESETS[ext].map((a) => `<button class="btn" type="button" data-preset="${esc(a)}">${esc(a || t("dp.no_switches"))}</button>`).join(" ");
     $("#dp-args", box).value = DP_PRESETS[ext][0];
   };
@@ -274,7 +299,7 @@ async function dpNewDialog() {
     const all = new Set(pv.ids);
     const args = $("#dp-args", box).value, inv = $("#dp-inv", box).checked;
     if (inv) { closeDialog(); await dpRefreshInventory([...all]); }
-    const r = await api("POST", "/api/deployments", { package_id: o.pid, file: o.path, args, ids: [...all] });
+    const r = await api("POST", "/api/deployments", o.chain ? { package_id: o.pid, chain: true, ids: [...all] } : { package_id: o.pid, file: o.path, args, ids: [...all] });
     if (!inv) closeDialog();
     DP.sel = r.id;
     await dpRefresh();

@@ -157,7 +157,7 @@ public static partial class Remote
     /// <summary>A new unpredictable run tag (48 random bits, lower-case hex).</summary>
     public static string NewTag() => RandomNumberGenerator.GetHexString(12, lowercase: true);
 
-    [GeneratedRegex(@"^ADmiral\\(?<t>[0-9a-f]{12})\\admiral-\k<t>(?:-inst)?\.[a-z0-9]{1,8}$")]
+    [GeneratedRegex(@"^ADmiral\\(?<t>[0-9a-f]{12})\\admiral-\k<t>(?:-inst|-user|-f\d{1,3})?\.[a-z0-9]{1,8}$")]
     private static partial Regex SharePathPattern();
 
     [GeneratedRegex(@"^ADmiral\\[0-9a-f]{12}$")]
@@ -258,7 +258,7 @@ public static class Pdq
     /// The self-check runs (and reports through <paramref name="onCleanup"/>) only if the service was actually started,
     /// whether the collection succeeded or not; its own failure never breaks the result.</summary>
     public static JsonObject Collect(string host, SmbCreds creds, CollectSettings? cfg = null, PdqBackend? backend = null,
-                                     Action<CleanupReport>? onCleanup = null)
+                                     Action<CleanupReport>? onCleanup = null, string? bitlockerKey = null)
     {
         cfg ??= new CollectSettings();
         Remote.ValidateHost(host);
@@ -286,7 +286,7 @@ public static class Pdq
             try
             {
                 MakeRunDir(sess, tag);
-                sess.PutFile(psShare, ScriptBytes(Collector.CombinedScript()));
+                sess.PutFile(psShare, ScriptBytes(Collector.CombinedScript(bitlockerKey)));
                 backend.Services.RunCommand(host, creds, CollectCommand(tag), svc);
                 started = true;                     // the self-check applies from here on
             }

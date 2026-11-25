@@ -37,6 +37,29 @@ public class CollectorModelTests
         Assert.Equal("", (string?)clean[1]["ip"]);
     }
 
+    [Theory]
+    [InlineData(@"PC1\admin", "PC1", true)]
+    [InlineData(@"pc1\admin", "PC1", true)]
+    [InlineData(@".\admin", "PC1", true)]
+    [InlineData(@"CORP\anna", "PC1", false)]
+    [InlineData("anna", "PC1", false)]
+    [InlineData(@"PC1\admin", null, false)]
+    public void LocalAccountName(string account, string? computer, bool expected) =>
+        Assert.Equal(expected, CollectorModel.IsLocalAccountName(account, computer));
+
+    [Fact]
+    public void CleanLogonsDropsLocalAccountsOfTheComputer()
+    {
+        var rows = new JsonNode?[]
+        {
+            new JsonObject { ["time"] = "2026-01-01T08:00:00", ["user"] = "anna", ["domain"] = "CORP", ["type"] = 2 },
+            new JsonObject { ["time"] = "2026-01-02T08:00:00", ["user"] = "admin", ["domain"] = "pc1", ["type"] = 2 },
+            new JsonObject { ["time"] = "2026-01-03T08:00:00", ["user"] = "helyi", ["domain"] = ".", ["type"] = 2 },
+        };
+        Assert.Equal(["anna"], CollectorModel.CleanLogons(rows, "PC1").Select(l => (string?)l["user"]));
+        Assert.Equal(3, CollectorModel.CleanLogons(rows).Count);      // without the computer's name nothing is known to be local
+    }
+
     [Fact]
     public void CleanLogonsIsCapped()
     {

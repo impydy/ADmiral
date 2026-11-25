@@ -86,8 +86,10 @@ $r.smb1_server = $smbS
 $r.smb1_client = if ($m10) { $m10.StartType -ne 'Disabled' } else { $false }
 $r.ie_version = if ($ie.svcVersion) { $ie.svcVersion } else { $ie.Version }
 $r.pending_reboot = [bool]$rb
-$r.logged_on_user = $cs.UserName
-$r.user_display_name = $lui.LastLoggedOnDisplayName
+# local accounts of this computer (COMPUTER\user, .\user) are not recorded as the logged-on user
+$isLocal = { param($n) $n -and (($n -split '\\')[0] -in @($env:COMPUTERNAME, '.')) }
+$r.logged_on_user = if (& $isLocal $cs.UserName) { $null } else { $cs.UserName }
+$r.user_display_name = if (& $isLocal $lui.LastLoggedOnSAMUser) { $null } else { $lui.LastLoggedOnDisplayName }
 $r.domain = $cs.Domain
 $r.domain_controller = ($gp.DCName -replace '^\\\\', '')
 $r.ip_address = @($nic.IPAddress | Where-Object { $_ -match '^\d+\.' })[0]
@@ -122,6 +124,30 @@ $r.hotfixes = @(Get-CimInstance Win32_QuickFixEngineering | ForEach-Object {
   elseif ($raw -and [datetime]::TryParseExact($raw, [string[]]@('M/d/yyyy', 'MM/dd/yyyy', 'yyyyMMdd', 'yyyy-MM-dd', 'yyyy.MM.dd', 'yyyy. MM. dd.'),
       [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$p)) { $d = $p.ToString('yyyy-MM-dd') }
   [ordered]@{ id = $_.HotFixID; description = $_.Description; installed_on = $d; installed_by = $_.InstalledBy } })
+# BitLocker: state of every volume (no secret here; the recovery keys are a separate, encrypted part)
+$blv = @()
+try { $blv = @(Get-BitLockerVolume -ErrorAction Stop) } catch {}
+if ($blv.Count) {
+  $r.bitlocker = @($blv | ForEach-Object { [ordered]@{ drive = [string]$_.MountPoint; volume_type = [string]$_.VolumeType;
+    status = [string]$_.VolumeStatus; protection = [string]$_.ProtectionStatus; percent = $_.EncryptionPercentage;
+    method = [string]$_.EncryptionMethod; lock = [string]$_.LockStatus; auto_unlock = $_.AutoUnlockEnabled;
+    protectors = ((@($_.KeyProtector) | ForEach-Object { [string]$_.KeyProtectorType }) -join ', ') } })
+} else {
+  $r.bitlocker = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' Win32_EncryptableVolume | ForEach-Object {
+    [ordered]@{ drive = [string]$_.DriveLetter; volume_type = ''; status = ''; protection = $(switch ([int]$_.ProtectionStatus) { 0 { 'Off' } 1 { 'On' } default { 'Unknown' } });
+      percent = $null; method = ''; lock = ''; auto_unlock = $null; protectors = '' } })
+}
+# connected displays (EDID through WMI): maker code, model, serial, manufacture date, size, connection
+$txt = { param($a) if ($a) { -join ($a | Where-Object { $_ -ne 0 } | ForEach-Object { [char][int]$_ }) } else { '' } }
+$bp = @{}; Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | ForEach-Object { $bp[[string]$_.InstanceName] = $_ }
+$cn = @{}; Get-CimInstance -Namespace root\wmi WmiMonitorConnectionParams | ForEach-Object { $cn[[string]$_.InstanceName] = $_.VideoOutputTechnology }
+$r.monitors = @(Get-CimInstance -Namespace root\wmi WmiMonitorID | ForEach-Object {
+  $b = $bp[[string]$_.InstanceName]
+  $w = if ($b) { [int]$b.MaxHorizontalImageSize } else { 0 }; $h = if ($b) { [int]$b.MaxVerticalImageSize } else { 0 }
+  [ordered]@{ manufacturer = (& $txt $_.ManufacturerName); name = (& $txt $_.UserFriendlyName); product_code = (& $txt $_.ProductCodeID);
+    serial = (& $txt $_.SerialNumberID); year = $_.YearOfManufacture; week = $_.WeekOfManufacture; width_cm = $w; height_cm = $h;
+    size_in = $(if ($w -and $h) { [math]::Round([math]::Sqrt($w * $w + $h * $h) / 2.54, 1) } else { $null });
+    connection = $cn[[string]$_.InstanceName]; active = [bool]$_.Active; instance = [string]$_.InstanceName } })
 $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 $r.apps = @(Get-ItemProperty $keys | Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName } |
@@ -134,15 +160,41 @@ $adm = @()
 try { $adm = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { [ordered]@{ name = $_.Name; type = "$($_.ObjectClass)"; source = "$($_.PrincipalSource)" } }) }
 catch { $adm = @(net localgroup Administrators | Select-Object -Skip 6 | Where-Object { $_ -and $_ -notmatch 'completed successfully|sikeresen' } | ForEach-Object { [ordered]@{ name = $_.Trim(); type = ''; source = '' } }) }
 $r.local_admins = $adm
+# every local group of the computer with its members
+$lg = @()
+try {
+  $lg = @(Get-LocalGroup -ErrorAction Stop | ForEach-Object {
+    $g = $_; $m = @()
+    try { $m = @(Get-LocalGroupMember -Group $g -ErrorAction Stop | ForEach-Object { [string]$_.Name }) } catch {}
+    [ordered]@{ name = $g.Name; description = $g.Description; sid = [string]$g.SID; members = ($m -join ', '); member_count = $m.Count } })
+} catch {
+  $lg = @(Get-CimInstance Win32_Group -Filter 'LocalAccount=True' | ForEach-Object {
+    [ordered]@{ name = $_.Name; description = $_.Description; sid = [string]$_.SID; members = ''; member_count = $null } })
+}
+$r.local_groups = $lg
 $xp = '*[System[(EventID=4624)]] and *[EventData[Data[@Name="LogonType"]="2" or Data[@Name="LogonType"]="7" or Data[@Name="LogonType"]="10" or Data[@Name="LogonType"]="11"]]'
 $r.logons = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 3000 | Where-Object {
     $u = [string]$_.Properties[5].Value; $d = [string]$_.Properties[6].Value
     $u -and $u -notmatch '\$$' -and $u -notmatch '^(DWM|UMFD)-\d+$' -and
-    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host') -and
+    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host', $env:COMPUTERNAME, '.') -and
     $u -notin @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON') } |
   Select-Object -First 300 | ForEach-Object {
   [ordered]@{ time = D $_.TimeCreated; user = [string]$_.Properties[5].Value; domain = [string]$_.Properties[6].Value;
     type = [int]$_.Properties[8].Value; ip = [string]$_.Properties[18].Value } })
+# every user account of the computer: its local accounts, and the (domain) accounts that have a profile on it
+$prof = @{}
+Get-CimInstance Win32_UserProfile -Filter 'Special=False' | ForEach-Object { $prof[[string]$_.SID] = $_ }
+$seenSid = @{}
+$loc = @(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | ForEach-Object {
+  $p = $prof[[string]$_.SID]; $seenSid[[string]$_.SID] = 1
+  [ordered]@{ name = $_.Name; domain = $_.Domain; full_name = $_.FullName; type = 'local'; enabled = -not $_.Disabled;
+    last_use = $(if ($p) { D $p.LastUseTime } else { $null }); profile = $(if ($p) { $p.LocalPath } else { '' }); sid = [string]$_.SID } })
+$oth = @($prof.Values | Where-Object { -not $seenSid.ContainsKey([string]$_.SID) } | ForEach-Object {
+  $n = ''; try { $n = ([Security.Principal.SecurityIdentifier][string]$_.SID).Translate([Security.Principal.NTAccount]).Value } catch {}
+  $parts = if ($n -like '*\*') { $n.Split('\', 2) } else { @('', $n) }
+  [ordered]@{ name = $(if ($parts[1]) { $parts[1] } else { [string]$_.SID }); domain = $parts[0]; full_name = ''; type = 'domain'; enabled = $null;
+    last_use = D $_.LastUseTime; profile = $_.LocalPath; sid = [string]$_.SID } })
+$r.user_accounts = @($loc + $oth)
 $r.ps_errors = @($Error | Select-Object -First 15 | ForEach-Object { "$($_.CategoryInfo.Activity): $($_.Exception.Message)" })
 $j = ConvertTo-Json -InputObject $r -Depth 4 -Compress
 [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))

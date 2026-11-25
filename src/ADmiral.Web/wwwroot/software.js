@@ -3,13 +3,19 @@
 "use strict";
 
 const SW = { list: null, sort: store.get("swsort", { key: "name", dir: 1 }), filter: "", sel: null };
-const VU = { data: null, sort: store.get("vusort", { key: "score", dir: -1 }), filter: "", sev: "", sel: null };
+const VU = { data: null, sort: store.get("vusort", { key: "score", dir: -1 }), filter: "", sev: "", sel: null, showHidden: store.get("vuhidden", false) };
+// a CVE id as a link to its NVD page (opened in the system browser)
+const cveUrl = (cve) => `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(cve)}`;
+const cveLink = (cve) => `<a href="#" class="cve-link" data-url="${esc(cveUrl(cve))}" title="${esc(tText("vu.open_nvd", { cve }))}">${esc(cve)}</a>`;
+// CVEs without an affected version or older than 10 years are hidden (and not counted) unless asked for
+const vuVisible = (rows) => (VU.showHidden ? rows : rows.filter((v) => !v.hidden));
+const hiddenTip = (v) => (v.hidden ? tText("vu.hidden_" + v.hidden_reason) : "");
 
 const SEV_ORDER = { critical: 4, high: 3, medium: 2, low: 1, unknown: 0 };
 const sevChip = (s) => `<span class="sev sev-${esc(s)}">${esc(t("sev." + s))}</span>`;
 
 function csvText(header, rows) {
-  const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const q = (v) => `"${csvSafe(v).replace(/"/g, '""')}"`;
   return "﻿" + [header, ...rows].map((r) => r.map(q).join(";")).join("\r\n") + "\r\n";
 }
 
@@ -112,7 +118,7 @@ function renderSoftware() {
   $("#swin-title").textContent = tText("sw.title", { name: d.name, i: i + 1, n: sw.list.length });
   $('#swin-toolbar [data-sw="prev"]').disabled = i <= 0;
   $('#swin-toolbar [data-sw="next"]').disabled = i >= sw.list.length - 1;
-  const cats = [["versions", "apps", d.all_versions.length], ["devices", "computers", d.devices], ["vulns", "warn", d.vulnerabilities.length]];
+  const cats = [["versions", "apps", d.all_versions.length], ["devices", "computers", d.devices], ["vulns", "warn", d.vulnerabilities.filter((v) => !v.hidden).length]];
   $("#swin-cats").innerHTML = cats.map(([id, ic, n]) => `<div class="cat${sw.cat === id ? " sel" : ""}${n === 0 ? " empty-cat" : ""}" data-swcat="${id}">${icon(ic, 18)}<span>${esc(t("sw.cat." + id))}</span>${n ? `<span class="cnt">${n}</span>` : ""}</div>`).join("");
   $("#swin-head").innerHTML = `${icon("apps", 30)}<span>${esc(d.name)}</span><span class="faint">${esc(d.publisher)}</span><span class="grow"></span>`
     + `<span class="faint">${esc(d.cpe ? tText("sw.cpe", { cpe: d.cpe }) : t("sw.no_cpe"))}</span>`;
@@ -127,7 +133,7 @@ function renderSwContent() {
     const shown = q ? rows.filter((r) => cols.some(([, get]) => String(get(r) ?? "").toLowerCase().includes(q))) : rows;
     return `<div class="subtable-tools"><input class="page-filter" id="sw-wfilter" type="search" placeholder="${esc(t("cw.filter"))}" value="${esc(sw.filter)}"><span class="faint">${shown.length} / ${rows.length}</span></div>`
       + (rows.length ? `<div class="grid-wrap"><table class="grid"><thead><tr><th class="rn"></th>${cols.map(([h]) => `<th>${esc(t(h))}</th>`).join("")}</tr></thead><tbody>
-        ${shown.map((r) => `<tr${r.__cve ? ` data-cve="${esc(r.__cve)}"` : ""}><td class="rn"></td>${cols.map(([, get, fmt]) => `<td class="${fmt === "num" ? "num" : ""}">${fmt === "html" ? get(r) : esc(get(r) ?? "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`
+        ${shown.map((r) => `<tr${r.__cve ? ` data-cve="${esc(r.__cve)}"` : ""}${r.hidden ? ` class="vu-hidden" title="${esc(hiddenTip(r))}"` : ""}><td class="rn"></td>${cols.map(([, get, fmt]) => `<td class="${fmt === "num" ? "num" : ""}">${fmt === "html" ? get(r) : esc(get(r) ?? "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`
         : `<div class="empty">${esc(t("cw.no_data"))}</div>`);
   };
   let html = "";
@@ -139,25 +145,30 @@ function renderSwContent() {
     const rows = d.all_versions.flatMap((v) => v.devices.map((x) => ({ ...x, version: v.version })));
     html = table([["t.computer", (x) => `<a href="#" data-comp="${esc(x.guid)}">${esc(x.name)}</a>`, "html"], ["t.version", (x) => x.version]], rows);
   } else {
-    const rows = d.vulnerabilities.map((v) => ({ ...v, __cve: v.cve }));
-    html = d.cpe || rows.length ? table(vulnCols(), rows) : `<div class="empty">${esc(t("sw.no_cpe_help"))}</div>`;
+    const rows = vuVisible(d.vulnerabilities).map((v) => ({ ...v, __cve: v.cve }));
+    const n = d.vulnerabilities.filter((v) => v.hidden).length;
+    html = (n ? `<label class="chk" style="margin-bottom:6px" title="${esc(t("vu.hidden_tip"))}"><input type="checkbox" id="sw-vuhidden" ${VU.showHidden ? "checked" : ""}> ${esc(tText("vu.show_hidden", { n }))}</label>` : "")
+      + (d.cpe || rows.length ? table(vulnCols(), rows) : `<div class="empty">${esc(t("sw.no_cpe_help"))}</div>`);
   }
   el.innerHTML = html;
   const f = $("#sw-wfilter");
   if (f) f.oninput = (e) => { sw.filter = e.target.value; const pos = e.target.selectionStart; renderSwContent(); const nf = $("#sw-wfilter"); nf.focus(); nf.setSelectionRange(pos, pos); };
   $$("[data-comp]", el).forEach((a) => (a.onclick = (e) => { e.preventDefault(); closeSoftware(); S.section = "devices"; renderRail(); applySection(); renderPage(); openComputer(a.dataset.comp); }));
   $$("tr[data-cve]", el).forEach((tr) => (tr.ondblclick = () => openVuln(tr.dataset.cve)));
+  bindLinks(el);
+  const hc = $("#sw-vuhidden", el);
+  if (hc) hc.onchange = () => { VU.showHidden = hc.checked; store.set("vuhidden", VU.showHidden); renderSwContent(); };
 }
 
 /* ================================================================== vulnerabilities */
 const vulnCols = () => [
-  ["vucol.cve", (v) => v.cve], ["vucol.score", (v) => (v.score == null ? "" : v.score.toFixed(1)), "num"],
+  ["vucol.cve", (v) => cveLink(v.cve), "html"], ["vucol.score", (v) => (v.score == null ? "" : v.score.toFixed(1)), "num"],
   ["vucol.severity", (v) => sevChip(v.severity), "html"], ["vucol.kev", (v) => (v.kev ? `<span class="kev" title="${esc(t("vu.kev_tip"))}">KEV</span>` : ""), "html"],
   ["vucol.range", (v) => v.range], ["vucol.devices", (v) => v.devices, "num"],
 ];
 
 const VU_COLS = [
-  { id: "cve", get: (v) => v.cve, html: (v) => `${icon("warn", 16)}${esc(v.cve)}` },
+  { id: "cve", get: (v) => v.cve, html: (v) => `${icon("warn", 16)}${cveLink(v.cve)}` },
   { id: "software", get: (v) => v.software.toLowerCase(), html: (v) => esc(v.software) },
   { id: "range", get: (v) => v.range, html: (v) => esc(v.range) },
   { id: "score", get: (v) => v.score ?? -1, num: true, html: (v) => (v.score == null ? "" : v.score.toFixed(1)) },
@@ -169,7 +180,7 @@ const VU_COLS = [
 
 function vuFiltered() {
   const q = VU.filter.trim().toLowerCase();
-  let rows = VU.data?.items || [];
+  let rows = vuVisible(VU.data?.items || []);
   if (VU.sev === "kev") rows = rows.filter((v) => v.kev);
   else if (VU.sev) rows = rows.filter((v) => v.severity === VU.sev);
   if (q) rows = rows.filter((v) => [v.cve, v.software, v.range].join(" ").toLowerCase().includes(q));
@@ -191,10 +202,14 @@ function drawVulns() {
   const st = d.status;
   $("#vu-status").innerHTML = (st.error ? `<span class="st-bad">${esc(st.error)}</span><br>` : "")
     + esc(tText("vu.coverage", { mapped: d.coverage.mapped, total: d.coverage.total }))
-    + (st.fetched_at ? " · " + esc(tText("vu.fetched", { when: fmtDate(st.fetched_at) })) : " · " + esc(t("vu.never")));
+    + (st.fetched_at ? " · " + esc(tText("vu.fetched", { when: fmtDate(st.fetched_at) })) : " · " + esc(t("vu.never")))
+    + (d.counts.hidden ? ` · <label class="chk" style="display:inline-flex" title="${esc(t("vu.hidden_tip"))}"><input type="checkbox" id="vu-hidden" ${VU.showHidden ? "checked" : ""}> ${esc(tText("vu.show_hidden", { n: d.counts.hidden }))}</label>` : "");
+  const hc = $("#vu-hidden");
+  if (hc) hc.onchange = () => { VU.showHidden = hc.checked; store.set("vuhidden", VU.showHidden); drawVulns(); };
   const head = `<th class="rn"></th>` + VU_COLS.map((c) => `<th data-vusort="${c.id}">${esc(t("vucol." + c.id))}${VU.sort.key === c.id ? `<span class="arr">${VU.sort.dir > 0 ? "▲" : "▼"}</span>` : ""}</th>`).join("");
-  const body = rows.slice(0, 3000).map((v) => `<tr data-vcve="${esc(v.cve)}"${VU.sel === v.cve ? ' class="sel"' : ""}><td class="rn"></td>${VU_COLS.map((c) => `<td class="${c.num ? "num" : ""}">${c.html(v)}</td>`).join("")}</tr>`).join("");
+  const body = rows.slice(0, 3000).map((v) => `<tr data-vcve="${esc(v.cve)}" class="${VU.sel === v.cve ? "sel" : ""}${v.hidden ? " vu-hidden" : ""}"${v.hidden ? ` title="${esc(hiddenTip(v))}"` : ""}><td class="rn"></td>${VU_COLS.map((c) => `<td class="${c.num ? "num" : ""}">${c.html(v)}</td>`).join("")}</tr>`).join("");
   wrap.innerHTML = rows.length ? `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>` : `<div class="empty">${esc(d.items.length ? t("page.empty") : t("vu.empty"))}</div>`;
+  bindLinks(wrap);
   $("#sb-left").textContent = tText("vu.count", { n: rows.length });
 }
 
@@ -268,18 +283,21 @@ async function loadVuln() {
   $('#vwin-toolbar [data-vw="prev"]').disabled = i <= 0;
   $('#vwin-toolbar [data-vw="next"]').disabled = i >= vw.list.length - 1;
   $("#vwin-cats").innerHTML = `<div class="cat sel">${icon("warn", 18)}<span>${esc(t("vu.sec.cve"))}</span></div>`;
-  $("#vwin-head").innerHTML = `${icon("warn", 30)}<span>${esc(d.cve)}</span>${sevChip(d.severity)}${d.kev ? `<span class="kev" title="${esc(t("vu.kev_tip"))}">KEV</span>` : ""}<span class="grow"></span><span class="faint">${esc(t("vu.probably"))}</span>`;
+  $("#vwin-head").innerHTML = `${icon("warn", 30)}<span>${cveLink(d.cve)}</span>${sevChip(d.severity)}${d.kev ? `<span class="kev" title="${esc(t("vu.kev_tip"))}">KEV</span>` : ""}<span class="grow"></span><span class="faint">${esc(t("vu.probably"))}</span>`;
   $("#vwin-status").textContent = tText("vu.devices_n", { n: d.devices });
   $("#vwin-content").innerHTML = `<div class="form2"><div>
       <div class="fsec">${t("vu.sec.cve")}</div>
       ${fieldRow(t("vucol.score"), d.score == null ? "" : d.score.toFixed(1))}${fieldRow(t("vucol.severity"), sevChip(d.severity), { html: true })}
       ${fieldRow(t("vucol.kev"), d.kev ? t("v.yes") : t("v.no"))}${fieldRow(t("vucol.published"), d.published)}${fieldRow(t("vucol.range"), d.range)}
       ${fieldRow(t("vu.summary"), d.summary, { wrap: true })}
+      ${fieldRow(t("vu.nvd"), cveLink(d.cve), { html: true })}${d.hidden ? fieldRow(t("vu.hidden"), hiddenTip(d)) : ""}
     </div><div>
       <div class="fsec">${t("vu.sec.affected")}</div>
       ${d.affected.map((a) => `<div class="frow"><label>${esc(a.name)}</label><div class="fval wrap">${a.versions.map((v) => `<div><b>${esc(v.version)}</b> – ${v.devices.map((x) => `<a href="#" data-comp="${esc(x.guid)}">${esc(x.name)}</a>`).join(", ")}</div>`).join("")}
         ${(a.fixes || []).map((f, i) => `<div style="margin-top:6px"><button class="btn primary" type="button" data-fix="${esc(a.key)}|${i}">${icon("rocket", 16)}${esc(tText("vu.fix_btn", { pkg: f.package_name, ver: f.version, n: f.devices.length }))}</button></div>`).join("")}</div></div>`).join("")}
     </div></div>`;
+  bindLinks($("#vwin-head"));
+  bindLinks($("#vwin-content"));
   $$("#vwin-content [data-fix]").forEach((b) => (b.onclick = () => {
     const [key, i] = b.dataset.fix.split("|");
     const a = d.affected.find((x) => x.key === key);

@@ -62,7 +62,7 @@ public class DbTests
         }
         using (var store = new Store(path))
         {
-            Assert.Equal(11, store.SchemaVersion);
+            Assert.Equal(12, store.SchemaVersion);
             var c = store.Computer("g1")!;
             Assert.Equal("2024-01-01T00:00:00+00:00", c["added"]);
             Assert.Equal(true, c["allow_scan"]);
@@ -70,7 +70,7 @@ public class DbTests
             Assert.Equal("X", (string?)((JsonObject)c["inventory"]!)["model"]);
         }
         using var again = new Store(path);
-        Assert.Equal(11, again.SchemaVersion);                   // idempotent
+        Assert.Equal(12, again.SchemaVersion);                   // idempotent
     }
 
     [Fact]
@@ -224,6 +224,31 @@ public class DbTests
         ]);
         var logons = s.Items("g-lt1")["logons"];
         Assert.Equal(["bela", "ANNA"], logons.Select(l => (string?)l["user"]));
+    }
+
+    [Fact]
+    public void LocalAccountsAreNotStoredAsLogonsOrLoggedOnUser()
+    {
+        using var s = NewStore();
+        var inv = Inventory();
+        inv["logged_on_user"] = @"lt-001\helyi";
+        inv["user_display_name"] = "Helyi";
+        inv["logons"] = new JsonArray(
+            new JsonObject { ["time"] = "2026-03-01T08:00:00", ["user"] = "Administrator", ["domain"] = "LT-001", ["type"] = 2 },
+            new JsonObject { ["time"] = "2026-03-02T08:00:00", ["user"] = "helyi", ["domain"] = ".", ["type"] = 2 },
+            new JsonObject { ["time"] = "2026-03-03T08:00:00", ["user"] = "anna", ["domain"] = "CORP", ["type"] = 2 });
+        inv["user_accounts"] = new JsonArray(new JsonObject { ["name"] = "Administrator", ["domain"] = "LT-001", ["type"] = "local" },
+                                             new JsonObject { ["name"] = "anna", ["domain"] = "CORP", ["type"] = "domain" });
+        s.RecordInventory("g-lt1", inv);
+        Assert.Equal(["anna"], s.Items("g-lt1")["logons"].Select(l => (string?)l["user"]));
+        var c = (JsonObject)s.Computer("g-lt1")!["inventory"]!;
+        Assert.Null(c["logged_on_user"]);
+        Assert.Null(c["user_display_name"]);
+        Assert.Equal(2, s.Items("g-lt1")["user_accounts"].Count);       // the account list keeps the local ones
+        // a domain user stays the logged-on user
+        inv["logged_on_user"] = @"CORP\anna";
+        s.RecordInventory("g-lt1", inv);
+        Assert.Equal(@"CORP\anna", (string?)((JsonObject)s.Computer("g-lt1")!["inventory"]!)["logged_on_user"]);
     }
 
     [Fact]

@@ -108,6 +108,95 @@ function pkAskHash(file) {
   });
 }
 
+/* ---------------------------------------------------------------- package chain (steps) */
+const CH_TYPES = ["install", "copy", "delete", "scan", "reboot", "shutdown", "wol", "powershell", "cmd"];
+const CH_ICONS = { install: "package", copy: "copy", delete: "delete", scan: "scan", reboot: "refresh", shutdown: "block", wol: "ping", powershell: "log", cmd: "log" };
+const chDefaults = (type, p) => {
+  const inst = p.files.find((f) => dpExt(f.path)), any = p.files[0];
+  return { install: { type, file: inst?.path || "", args: inst ? DP_PRESETS[dpExt(inst.path)][0] : "" }, copy: { type, file: any?.path || "", path: "C:\\ProgramData\\" },
+    delete: { type, path: "C:\\" }, scan: { type }, reboot: { type, seconds: 30, wait: true }, shutdown: { type, seconds: 30 }, wol: { type, seconds: 300 },
+    powershell: { type, script: "" }, cmd: { type, script: "" } }[type];
+};
+
+/* New package without files: name, ID, version; then its chain editor opens. */
+function pkNewDialog() {
+  const box = dialog(t("ch.new_title"), `
+    <label class="fld"><span>${esc(t("pk.meta.name"))}</span><input id="pkn-name" type="text"></label>
+    <label class="fld"><span>${esc(t("pk.meta.id"))}</span><input id="pkn-id" type="text" class="mono" placeholder="Ceg.Beallitasok"></label>
+    <label class="fld"><span>${esc(t("pk.meta.ver"))}</span><input id="pkn-ver" type="text" placeholder="1.0"></label>
+    <div class="faint">${esc(t("ch.new_hint"))}</div>`,
+    `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" id="pkn-ok">${t("d.create")}</button>`);
+  $("#pkn-name", box).oninput = (e) => { const id = $("#pkn-id", box); if (!id.dataset.touched) id.value = "Manual." + e.target.value.trim().replace(/[^A-Za-z0-9._+-]+/g, "-").replace(/^[^A-Za-z0-9]+|[-.]+$/g, ""); };
+  $("#pkn-id", box).oninput = (e) => (e.target.dataset.touched = "1");
+  $("#pkn-ok", box).onclick = () => guard(async () => {
+    const e = await api("POST", "/api/packages-new", { id: $("#pkn-id", box).value.trim(), name: $("#pkn-name", box).value.trim(), version: $("#pkn-ver", box).value.trim() });
+    closeDialog();
+    await pkLoad();
+    pkStepsDialog(e.id);
+  });
+}
+
+/* The chain editor: an ordered list of steps; each row has its own fields by type, move / remove buttons and
+   "continue on error". Saved as a whole (the server checks every step). */
+function pkStepsDialog(id) {
+  const p = PK.data?.packages.find((x) => x.id === id);
+  if (!p) return;
+  const steps = (p.steps || []).map((s) => ({ ...s }));
+  const fileOpts = (cur, onlyInst) => p.files.filter((f) => !onlyInst || dpExt(f.path)).map((f) => `<option value="${esc(f.path)}" ${f.path === cur ? "selected" : ""}>${esc(`${f.path.split("/").pop()} (${f.version || "–"})`)}</option>`).join("")
+    || `<option value="">${esc(t(onlyInst ? "ch.no_installer" : "ch.no_file"))}</option>`;
+  const fields = (s, i) => {
+    const inp = (k, ph, extra = "") => `<input data-si="${i}" data-sk="${k}" value="${esc(s[k] ?? "")}" placeholder="${esc(ph)}" ${extra}>`;
+    switch (s.type) {
+      case "install": return `<select data-si="${i}" data-sk="file">${fileOpts(s.file, true)}</select>${inp("args", t("dp.args"), 'class="mono"')}`;
+      case "copy": return `<select data-si="${i}" data-sk="file">${fileOpts(s.file, false)}</select>${inp("path", t("ch.dest"), 'class="mono"')}`;
+      case "delete": return inp("path", t("ch.del_path"), 'class="mono"');
+      case "reboot": return `<label class="chk">${t("ch.delay")} <input type="number" min="15" max="3600" style="width:80px" data-si="${i}" data-sk="seconds" value="${esc(s.seconds ?? 30)}"> s</label>
+        <label class="chk"><input type="checkbox" data-si="${i}" data-sk="wait" ${s.wait !== false ? "checked" : ""}> ${esc(t("ch.wait_back"))}</label>`;
+      case "shutdown": return `<label class="chk">${t("ch.delay")} <input type="number" min="15" max="3600" style="width:80px" data-si="${i}" data-sk="seconds" value="${esc(s.seconds ?? 30)}"> s</label>`;
+      case "wol": return `<label class="chk">${t("ch.wol_wait")} <input type="number" min="0" max="3600" style="width:80px" data-si="${i}" data-sk="seconds" value="${esc(s.seconds ?? 300)}"> s</label>`;
+      case "powershell": case "cmd": return `<textarea data-si="${i}" data-sk="script" rows="4" class="mono" spellcheck="false" placeholder="${esc(t("ch.ph." + s.type))}">${esc(s.script || "")}</textarea>`;
+      default: return `<span class="faint">${esc(t("ch.scan_hint"))}</span>`;
+    }
+  };
+  const box = dialog(tText("ch.title", { name: p.name }), `<div class="faint">${esc(t("ch.hint"))}</div><div id="ch-list" class="ch-list"></div>
+    <div class="ch-add"><span class="muted">${esc(t("ch.add"))}</span>${CH_TYPES.map((ty) => `<button type="button" class="btn" data-chadd="${ty}">${icon(CH_ICONS[ty], 14)}${esc(t("ch.type." + ty))}</button>`).join("")}</div>`,
+    `<span class="faint" id="ch-count"></span><span style="flex:1"></span><button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" id="ch-save">${t("d.save")}</button>`);
+  box.classList.add("dlg-big");
+  const draw = () => {
+    $("#ch-list", box).innerHTML = steps.map((s, i) => `<div class="ch-step">
+      <div class="ch-num">${i + 1}.</div>
+      <div class="ch-type">${icon(CH_ICONS[s.type], 16)}<b>${esc(t("ch.type." + s.type))}</b></div>
+      <div class="ch-fields">${fields(s, i)}</div>
+      <div class="ch-tools"><label class="chk" title="${esc(t("ch.continue_tip"))}"><input type="checkbox" data-si="${i}" data-sk="continue_on_error" ${s.continue_on_error ? "checked" : ""}> ${esc(t("ch.continue"))}</label>
+        <button type="button" class="btn" data-chmv="${i}:-1" ${i === 0 ? "disabled" : ""} aria-label="${esc(t("dl.up"))}">▲</button><button type="button" class="btn" data-chmv="${i}:1" ${i === steps.length - 1 ? "disabled" : ""} aria-label="${esc(t("dl.down"))}">▼</button>
+        <button type="button" class="btn" data-chrm="${i}" aria-label="${esc(t("d.remove"))}">✕</button></div></div>`).join("") || `<div class="empty">${esc(t("ch.empty"))}</div>`;
+    $("#ch-count", box).textContent = tText("ch.count", { n: steps.length });
+  };
+  draw();
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.chadd) { steps.push(chDefaults(b.dataset.chadd, p)); draw(); $("#ch-list", box).lastElementChild?.scrollIntoView({ block: "nearest" }); }
+    else if (b.dataset.chrm !== undefined) { steps.splice(Number(b.dataset.chrm), 1); draw(); }
+    else if (b.dataset.chmv) { const [i, d] = b.dataset.chmv.split(":").map(Number); [steps[i], steps[i + d]] = [steps[i + d], steps[i]]; draw(); }
+  });
+  const onEdit = (e) => {
+    const { si, sk } = e.target.dataset;
+    if (si === undefined) return;
+    const s = steps[Number(si)];
+    s[sk] = e.target.type === "checkbox" ? e.target.checked : e.target.type === "number" ? Number(e.target.value) : e.target.value;
+    if (sk === "file" && s.type === "install") { const ext = dpExt(s.file || ""); if (ext) { s.args = DP_PRESETS[ext][0]; draw(); } }
+  };
+  box.addEventListener("input", onEdit);
+  box.addEventListener("change", onEdit);
+  $("#ch-save", box).onclick = () => guard(async () => {
+    await api("POST", "/api/packages-steps", { id: p.id, steps });
+    closeDialog();
+    toast(tText("ch.saved", { n: steps.length }));
+    await pkLoad();
+  });
+}
+
 function drawPackages() {
   const wrap = $("#pkgrid");
   if (!wrap || !PK.data) return;
@@ -123,7 +212,8 @@ function drawPackages() {
         ${p.verified ? `<div class="faint" style="margin-top:4px">${esc(tText("pk.verified", { d: fmtDate(p.verified) }))}</div>` : ""}</td></tr>` : "";
     return `<tr data-pk="${esc(p.id)}"><td class="rn"></td><td>${icon("package", 16)}${esc(p.name)}</td><td class="mono">${esc(p.id)}</td><td>${esc(p.publisher)}</td><td>${esc(p.version)}${p.versions.length > 1 ? ` <span class="faint">${esc(tText("pk.n_versions", { n: p.versions.length }))}</span>` : ""}</td>
       <td class="num">${p.files.length ? esc(pkSize(p.size)) : ""}</td><td>${esc(fmtDate(p.downloaded))}</td><td>${pkState(p)}</td>
-      <td class="nowrap"><button class="btn" data-pkact="addfile" data-id="${esc(p.id)}">${esc(t("pk.addfile_row"))}</button>
+      <td class="nowrap"><button class="btn" data-pkact="steps" data-id="${esc(p.id)}" title="${esc(t("ch.btn_tip"))}">${icon("rocket", 14)}${esc(tText("ch.btn", { n: (p.steps || []).length }))}</button>
+      <button class="btn" data-pkact="addfile" data-id="${esc(p.id)}">${esc(t("pk.addfile_row"))}</button>
       <button class="btn" data-pkact="verify" data-id="${esc(p.id)}"${p.files.length ? "" : " disabled"}>${esc(t("pk.verify"))}</button>
       <button class="btn" data-pkact="remove" data-id="${esc(p.id)}">${esc(t("pk.remove"))}</button></td></tr>${files}`;
   }).join("");
@@ -142,10 +232,12 @@ async function pkLoad() {
 
 function renderPackagesPage(el) {
   el.innerHTML = pageHead("package", t("nav.packages"), t("pk.sub"),
-    `<button class="btn primary" data-pkhead="file">${icon("package", 16)}${esc(t("pk.addfile"))}</button>
+    `<button class="btn primary" data-pkhead="new">${icon("rocket", 16)}${esc(t("ch.new"))}</button>
+     <button class="btn" data-pkhead="file">${icon("package", 16)}${esc(t("pk.addfile"))}</button>
      <button class="btn" data-pkhead="verify">${esc(t("pk.verify_all"))}</button>`)
     + `<div class="faint mono" id="pk-info" style="padding:2px 10px"></div><div class="grid-wrap" id="pkgrid" tabindex="0"></div>`;
   $('[data-pkhead="file"]', el).onclick = () => pkPick();
+  $('[data-pkhead="new"]', el).onclick = () => pkNewDialog();
   $('[data-pkhead="verify"]', el).onclick = () => guard(async () => {
     const r = await api("POST", "/api/packages-verify", {});
     toast(tText("pk.verify_res", { n: r.length, bad: r.filter((x) => !x.ok && !x.problems.every((p) => p.problem === "not_downloaded")).length }));
@@ -156,6 +248,7 @@ function renderPackagesPage(el) {
     if (b) {
       const id = b.dataset.id;
       if (b.dataset.pkact === "addfile") return pkPick(id);
+      if (b.dataset.pkact === "steps") return pkStepsDialog(id);
       if (b.dataset.pkact === "vendor") {
         const file = b.dataset.file;
         return guard(async () => {

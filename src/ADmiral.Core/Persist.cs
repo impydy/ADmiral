@@ -85,6 +85,13 @@ public sealed class SecretStore
                                   + "profile?); they must be entered again", path, string.Join(", ", _foreign.Keys.Order(StringComparer.Ordinal)));
     }
 
+    /// <summary>True when the saved file holds <paramref name="name"/> but this Windows user cannot decrypt it (it was
+    /// saved by another account): it must not be replaced, or the other account loses it.</summary>
+    public bool IsForeign(string name)
+    {
+        lock (_lock) return _foreign.ContainsKey(name);
+    }
+
     public string Get(string name)
     {
         lock (_lock) return _mem.GetValueOrDefault(name, "");

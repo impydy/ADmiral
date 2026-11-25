@@ -72,7 +72,7 @@ public static partial class DesktopLogic
     /// <summary>Hosts of the links the UI may open in the default browser.</summary>
     public static readonly IReadOnlySet<string> OpenUrlHosts = new HashSet<string>(StringComparer.Ordinal)
     {
-        "tidecrestlabs.com", "www.tidecrestlabs.com", "ko-fi.com", "discord.gg",
+        "tidecrestlabs.com", "www.tidecrestlabs.com", "ko-fi.com", "discord.gg", "nvd.nist.gov",
     };
 
     // ------------------------------------------------------------------ the Windows service
@@ -541,7 +541,7 @@ public static partial class DesktopLogic
     // ------------------------------------------------------------------ the JS bridge (window.pywebview.api)
     /// <summary>Methods the page may call (the same names the Python shell exposed).</summary>
     public static readonly IReadOnlyList<string> BridgeMethods =
-        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "save_log_package", "remote_assist", "open_url", "set_theme"];
+        ["save_file", "save_binary", "quit", "open_data_folder", "open_logs_folder", "save_log_package", "remote_assist", "event_viewer", "computer_management", "open_url", "set_theme"];
 
     // ------------------------------------------------------------------ the window frame (title bar)
     /// <summary>Dark title bar? The ADmiral theme setting; "system" (or anything else) follows Windows' app mode.</summary>
@@ -618,7 +618,8 @@ public static partial class DesktopLogic
 
 /// <summary>Executes the page's bridge calls: <c>{"id": n, "method": "...", "args": [...]}</c> in,
 /// <c>{"id": n, "ok": true, "result": ...}</c> or <c>{"id": n, "ok": false, "error": "..."}</c> out.</summary>
-public sealed class DesktopBridge(IDesktopShell shell, string home, Action<string>? remoteAssist = null, Func<string?>? logFolder = null)
+public sealed class DesktopBridge(IDesktopShell shell, string home, Action<string>? remoteAssist = null, Func<string?>? logFolder = null,
+                                  Action<string>? eventViewer = null, Action<string>? computerManagement = null)
 {
     /// <summary>Handle one message from the page (already checked to come from the local origin). Never throws.</summary>
     public string Handle(string json)
@@ -675,6 +676,14 @@ public sealed class DesktopBridge(IDesktopShell shell, string home, Action<strin
             case "remote_assist":
                 if (remoteAssist is null) throw new InvalidOperationException("Remote Assistance is not available");
                 remoteAssist(arg(0));
+                return null;
+            case "event_viewer":
+                if (eventViewer is null) throw new InvalidOperationException("The Event Viewer is not available");
+                eventViewer(arg(0));
+                return null;
+            case "computer_management":
+                if (computerManagement is null) throw new InvalidOperationException("Computer Management is not available");
+                computerManagement(arg(0));
                 return null;
             default:
                 throw new ArgumentException($"unknown bridge method '{method}'");

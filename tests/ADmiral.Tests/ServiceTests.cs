@@ -464,6 +464,20 @@ public sealed class ServiceTests : IDisposable
         Assert.NotEmpty((List<Row>)one["affected"]!);
         Assert.Throws<NotFound>(() => App.Vulnerability("CVE-1999-0001"));
         Assert.NotEmpty((List<Row>)App.SoftwareDetail(chrome.Key)["vulnerabilities"]!);
+        // hidden ones (no affected version / older than 10 years) are flagged and not counted
+        var counted = items.Where(i => i["hidden"] is false).ToList();
+        Assert.Equal(counted.Count(i => (bool)i["kev"]!), (int)((Row)v["counts"]!)["kev"]!);
+        Assert.Equal(items.Count - counted.Count, (int)((Row)v["counts"]!)["hidden"]!);
+    }
+
+    [Fact]
+    public void VulnHiddenReason()
+    {
+        var today = new DateTime(2026, 11, 25);
+        Assert.Equal("no_range", AdmiralService.VulnHiddenReason("", "2026-01-01", today));
+        Assert.Equal("old", AdmiralService.VulnHiddenReason("< 1.2", "2016-11-24", today));
+        Assert.Null(AdmiralService.VulnHiddenReason("< 1.2", "2016-11-25", today));
+        Assert.Null(AdmiralService.VulnHiddenReason("<= 3.0", "", today));         // no date: shown
     }
 
     [Fact]
@@ -735,6 +749,40 @@ public sealed class ServiceTests : IDisposable
         Assert.Equal("", info.Arguments);
         foreach (var bad in new[] { "", "pc1 & calc", "pc1\" /x", "-pc", "/expert", "a;b", "pc\n2", "..", new string('a', 300) })
             Assert.ThrowsAny<ArgumentException>(() => App.RemoteAssist(bad));
+        Assert.Single(starter.Started);
+    }
+
+    [Fact]
+    public void EventViewerValidatesTheNameAndPassesItAsOneArgument()
+    {
+        var starter = new FakeStarter();
+        App.ProcessStarter = starter;
+        App.EventViewer("LT-001.contoso.local");
+        var info = Assert.Single(starter.Started);
+        Assert.Equal("eventvwr.exe", Path.GetFileName(info.FileName));
+        Assert.Equal(new[] { "LT-001.contoso.local" }, info.ArgumentList);
+        Assert.Equal("", info.Arguments);
+        Assert.Equal("", info.Verb);                                      // no elevation: runs as the signed-in user
+        foreach (var bad in new[] { "", "pc1 & calc", "/c:x", "-pc", "a;b", new string('a', 300) })
+            Assert.ThrowsAny<ArgumentException>(() => App.EventViewer(bad));
+        Assert.Single(starter.Started);
+    }
+
+    [Fact]
+    public void ComputerManagementStartsTheSnapInForTheValidatedHost()
+    {
+        var starter = new FakeStarter();
+        App.ProcessStarter = starter;
+        App.ComputerManagement("LT-001.contoso.local.");
+        var info = Assert.Single(starter.Started);
+        Assert.Equal("mmc.exe", Path.GetFileName(info.FileName));
+        Assert.Equal("compmgmt.msc", Path.GetFileName(info.ArgumentList[0]));
+        Assert.True(Path.IsPathRooted(info.ArgumentList[0]) || info.ArgumentList[0].StartsWith("C:", StringComparison.Ordinal));   // never a planted .msc
+        Assert.Equal("/computer=LT-001.contoso.local", info.ArgumentList[1]);
+        Assert.Equal(2, info.ArgumentList.Count);
+        Assert.Equal("", info.Arguments);
+        foreach (var bad in new[] { "", "pc1 & calc", "pc1 /a", "-pc", "a;b", new string('a', 300) })
+            Assert.ThrowsAny<ArgumentException>(() => App.ComputerManagement(bad));
         Assert.Single(starter.Started);
     }
 

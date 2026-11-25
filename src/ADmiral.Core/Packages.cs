@@ -26,6 +26,27 @@ public sealed class PackageFile
     public PackageFile Copy() => (PackageFile)MemberwiseClone();
 }
 
+/// <summary>One step of a package's chain (see <see cref="Chain"/>). Which fields count depends on <see cref="Type"/>.</summary>
+public sealed class PackageStep
+{
+    /// <summary>install | copy | delete | scan | reboot | shutdown | wol | powershell | cmd</summary>
+    [JsonPropertyName("type")] public string Type { get; set; } = "";
+    /// <summary>install / copy: a file of this package (register path).</summary>
+    [JsonPropertyName("file"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? File { get; set; }
+    /// <summary>install: the installer's switches.</summary>
+    [JsonPropertyName("args"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Args { get; set; }
+    /// <summary>copy: the destination folder on the computer; delete: the file to delete.</summary>
+    [JsonPropertyName("path"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Path { get; set; }
+    /// <summary>powershell / cmd: the script run as SYSTEM.</summary>
+    [JsonPropertyName("script"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Script { get; set; }
+    /// <summary>reboot / shutdown: delay before it happens; wol: how long to wait for the computer to come up.</summary>
+    [JsonPropertyName("seconds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? Seconds { get; set; }
+    /// <summary>reboot: wait until the computer is back before the next step.</summary>
+    [JsonPropertyName("wait"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? Wait { get; set; }
+    /// <summary>Go on with the next step when this one fails (the computer's result is still "failed").</summary>
+    [JsonPropertyName("continue_on_error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? ContinueOnError { get; set; }
+}
+
 public sealed class PackageEntry
 {
     [JsonPropertyName("id")] public string Id { get; set; } = "";
@@ -38,6 +59,8 @@ public sealed class PackageEntry
     [JsonPropertyName("verify_ok")] public bool? VerifyOk { get; set; }
     [JsonPropertyName("source_hash_checked")] public bool? SourceHashChecked { get; set; }
     [JsonPropertyName("files")] public List<PackageFile> Files { get; set; } = [];
+    /// <summary>The chain run on each computer when the package is deployed as a whole (empty: only single installers).</summary>
+    [JsonPropertyName("steps")] public List<PackageStep> Steps { get; set; } = [];
 }
 
 public sealed class PackageManifest
@@ -73,7 +96,8 @@ public sealed record PackageRow(
     [property: JsonPropertyName("source_hash_checked")] bool? SourceHashChecked,
     [property: JsonPropertyName("size")] long Size,
     [property: JsonPropertyName("versions")] IReadOnlyList<PackageVersionRow> Versions,
-    [property: JsonPropertyName("files")] IReadOnlyList<PackageFile> Files);
+    [property: JsonPropertyName("files")] IReadOnlyList<PackageFile> Files,
+    [property: JsonPropertyName("steps")] IReadOnlyList<PackageStep> Steps);
 
 /// <summary>Package library: application installers added by hand into a folder, with versions and a hash register.
 /// <para>Files are stored under <c>&lt;folder&gt;/&lt;id&gt;/&lt;version&gt;/</c> and <c>&lt;folder&gt;/packages.json</c>
@@ -211,7 +235,7 @@ public sealed partial class PackageLibrary(string folder)
                 if (fi.Length > MaxManifestBytes) throw new PackageError($"{ManifestPath} cannot be read: too large");
                 var data = JsonSerializer.Deserialize<PackageManifest>(System.IO.File.ReadAllBytes(ManifestPath)) ?? new PackageManifest();
                 data.Packages ??= [];
-                foreach (var p in data.Packages) p.Files ??= [];
+                foreach (var p in data.Packages) { p.Files ??= []; p.Steps ??= []; }
                 data.Packages.RemoveAll(p => p is null || string.IsNullOrEmpty(p.Id));
                 return data;
             }
@@ -262,6 +286,38 @@ public sealed partial class PackageLibrary(string folder)
             else if (di.Exists) di.Delete(recursive: true);
         }
         catch (Exception exc) when (exc is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>A new package without files (its chain can then be put together and files added).</summary>
+    public PackageEntry Create(string pkgId, string name, string version = "", string publisher = "")
+    {
+        var id = ValidId(pkgId);
+        lock (Sync)
+        {
+            var data = Load();
+            if (Find(data, id) is not null) throw new PackageError($"{id} is already in the library.");
+            var entry = new PackageEntry
+            {
+                Id = id, Name = string.IsNullOrWhiteSpace(name) ? id : LooseValue.Cut(name.Trim(), 200),
+                Version = LooseValue.Cut((version ?? "").Trim(), 64), Publisher = LooseValue.Cut((publisher ?? "").Trim(), 200), Added = Now(),
+            };
+            data.Packages.Add(entry);
+            Save(data);
+            return entry;
+        }
+    }
+
+    /// <summary>Replace the chain of a package (checked by <see cref="Chain.ValidateSteps"/>).</summary>
+    public PackageEntry SetSteps(string pkgId, IReadOnlyList<PackageStep> steps)
+    {
+        lock (Sync)
+        {
+            var data = Load();
+            var entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId} is not in the library.");
+            entry.Steps = Chain.ValidateSteps(entry, steps);
+            Save(data);
+            return entry;
+        }
     }
 
     /// <summary>Remove one stored file (e.g. an old version) from the library and the disk.</summary>
@@ -391,7 +447,7 @@ public sealed partial class PackageLibrary(string folder)
                 p.Added, p.Downloaded, p.Verified, p.VerifyOk ?? (files.Count > 0 ? true : null), p.SourceHashChecked,
                 files.Where(f => f.Kind != "manifest").Sum(f => f.Size),
                 versions.OrderByDescending(v => v.Added, StringComparer.Ordinal).Select(v => new PackageVersionRow(v.Version, v.Files, v.Size, v.Added)).ToList(),
-                files));
+                files, p.Steps ?? []));
         }
         return rows;
     }

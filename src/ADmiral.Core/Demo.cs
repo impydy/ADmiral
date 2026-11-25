@@ -232,6 +232,31 @@ public static class Demo
                 ["drive"] = "D:", ["label"] = "Data", ["file_system"] = "NTFS", ["size_gb"] = 500.0, ["free_gb"] = Math.Round(rng.Uniform(40, 400), 1),
             });
 
+        // BitLocker: laptops encrypted (one still encrypting), desktops partly, servers off; fake recovery keys
+        // derived from the name (no random draws, so the rest of the demo data stays the same)
+        var blOn = name.StartsWith("LT-", StringComparison.Ordinal) || (!isServer && name.Length > 0 && (name[^1] - '0') % 2 == 0);
+        var blBusy = blOn && name.EndsWith('7');
+        var bitlocker = new JsonArray();
+        var blKeys = new JsonArray();
+        foreach (var d in disks.Select(x => (string)x!["drive"]!))
+        {
+            bitlocker.Add(new JsonObject
+            {
+                ["drive"] = d, ["volume_type"] = d == "C:" ? "OperatingSystem" : "Data",
+                ["status"] = !blOn ? "FullyDecrypted" : blBusy ? "EncryptionInProgress" : "FullyEncrypted",
+                ["protection"] = blOn && !blBusy ? "On" : "Off", ["percent"] = !blOn ? 0 : blBusy ? 63 : 100,
+                ["method"] = blOn ? "XtsAes128" : "None", ["lock"] = "Unlocked", ["auto_unlock"] = null,
+                ["protectors"] = blOn ? "Tpm, RecoveryPassword" : "",
+            });
+            if (!blOn) continue;
+            var h = (uint)string.Concat(name, d).Aggregate(17, (a, ch) => unchecked(a * 31 + ch));
+            var groups = Enumerable.Range(0, 8).Select(i => (((h >> (i % 4 * 8)) * 7919u + (uint)i * 104729u) % 90909u * 11u % 1000000u).ToString("D6", CultureInfo.InvariantCulture));
+            blKeys.Add(new JsonObject
+            {
+                ["drive"] = d, ["id"] = $"{{{h:X8}-{(h >> 3) & 0xFFFF:X4}-4A1B-9C2D-{h:X8}{h % 65536:X4}}}", ["plain"] = string.Join("-", groups),
+            });
+        }
+
         var svcRows = new List<(string, string, string, string, string)>
         {
             ("BITS", "Background Intelligent Transfer Service", "Running", "Auto", "LocalSystem"),
@@ -263,7 +288,54 @@ public static class Demo
                     });
             }
             logons.Add(new JsonObject { ["time"] = Db.FormatUtc(now), ["user"] = "DWM-1", ["domain"] = "Window Manager", ["type"] = 2, ["ip"] = "" });
+            // a local account's logon: the store drops it (local accounts are not tracked)
+            logons.Add(new JsonObject { ["time"] = Db.FormatUtc(now.AddDays(-3)), ["user"] = "Administrator", ["domain"] = name, ["type"] = 2, ["ip"] = "" });
         }
+
+        // every user account of the computer: the local ones, and the domain users with a profile (no random draws, so
+        // the rest of the demo data stays the same)
+        var accounts = new JsonArray
+        {
+            new JsonObject { ["name"] = "Administrator", ["domain"] = name, ["full_name"] = "", ["type"] = "local", ["enabled"] = isServer, ["last_use"] = null, ["profile"] = "", ["sid"] = "S-1-5-21-1004336348-1177238915-682003330-500" },
+            new JsonObject { ["name"] = "Guest", ["domain"] = name, ["full_name"] = "", ["type"] = "local", ["enabled"] = false, ["last_use"] = null, ["profile"] = "", ["sid"] = "S-1-5-21-1004336348-1177238915-682003330-501" },
+        };
+        if (!isServer)
+            accounts.Add(new JsonObject { ["name"] = "helpdesk", ["domain"] = name, ["full_name"] = "Helpdesk", ["type"] = "local", ["enabled"] = true, ["last_use"] = Db.FormatUtc(now.AddDays(-12)), ["profile"] = @"C:\Users\helpdesk", ["sid"] = "S-1-5-21-1004336348-1177238915-682003330-1001" });
+        // local groups (members as text) and the connected displays; deterministic like the accounts above
+        var localGroups = new JsonArray
+        {
+            new JsonObject { ["name"] = "Administrators", ["description"] = "Administrators have complete and unrestricted access to the computer/domain", ["sid"] = "S-1-5-32-544",
+                ["members"] = "", ["member_count"] = 0 },          // filled in from the administrators below
+            new JsonObject { ["name"] = "Remote Desktop Users", ["description"] = "Members in this group are granted the right to logon remotely", ["sid"] = "S-1-5-32-555",
+                ["members"] = isServer ? "" : "CONTOSO\\Helpdesk", ["member_count"] = isServer ? 0 : 1 },
+            new JsonObject { ["name"] = "Users", ["description"] = "Users are prevented from making accidental or intentional system-wide changes", ["sid"] = "S-1-5-32-545",
+                ["members"] = "NT AUTHORITY\\INTERACTIVE, NT AUTHORITY\\Authenticated Users, CONTOSO\\Domain Users", ["member_count"] = 3 },
+            new JsonObject { ["name"] = "Guests", ["description"] = "Guests have the same access as members of the Users group by default", ["sid"] = "S-1-5-32-546",
+                ["members"] = $"{name}\\Guest", ["member_count"] = 1 },
+        };
+        var monitors = new JsonArray();
+        static JsonObject Mon(string mfr, string model, string code, string serial, int year, int week, int w, int h, int conn) => new()
+        {
+            ["manufacturer"] = mfr, ["name"] = model, ["product_code"] = code, ["serial"] = serial, ["year"] = year, ["week"] = week,
+            ["width_cm"] = w, ["height_cm"] = h, ["size_in"] = Math.Round(Math.Sqrt(w * w + h * h) / 2.54, 1), ["connection"] = conn, ["active"] = true,
+            ["instance"] = $"DISPLAY\\{mfr}{code}\\5&1a2b3c&0&UID{serial.Length}_0",
+        };
+        var digit = name.Length > 0 ? name[^1] - '0' : 0;
+        if (name.StartsWith("LT-", StringComparison.Ordinal))
+        {
+            monitors.Add(Mon("BOE", "", "0BCA", "", 2023, 14, 31, 17, unchecked((int)0x80000000)));
+            if (digit % 2 == 0) monitors.Add(Mon("DEL", "DELL P2422H", "A0D1", $"7Q2V{digit}Y3", 2022, 30, 53, 30, 10));
+        }
+        else if (!isServer)
+        {
+            monitors.Add(Mon("DEL", "DELL P2422H", "A0D1", $"3J8K{digit}P1", 2022, 41, 53, 30, 10));
+            if (digit % 3 == 0) monitors.Add(Mon("SAM", "S24R35x", "7158", $"H4ZT{digit}00211", 2021, 8, 53, 30, 5));
+        }
+        var rid = 4100;
+        foreach (var u in logons.Select(l => (string?)l!["user"]).Where(u => u is not null && u != "DWM-1" && u != "Administrator").Distinct())
+            accounts.Add(new JsonObject { ["name"] = u, ["domain"] = "CONTOSO", ["full_name"] = "", ["type"] = "domain", ["enabled"] = null,
+                ["last_use"] = logons.Where(l => (string?)l!["user"] == u).Select(l => (string)l!["time"]!).Max(StringComparer.Ordinal),
+                ["profile"] = $@"C:\Users\{u}", ["sid"] = $"S-1-5-21-3623811015-3361044348-30300820-{rid++}" });
 
         var admins = new JsonArray
         {
@@ -272,6 +344,8 @@ public static class Demo
         };
         if (user is not null && rng.Next() < 0.2)
             admins.Add(new JsonObject { ["name"] = $"CONTOSO\\{user}", ["type"] = "User", ["source"] = "ActiveDirectory" });
+        localGroups[0]!["members"] = string.Join(", ", admins.Select(a => (string)a!["name"]!));
+        localGroups[0]!["member_count"] = admins.Count;
 
         var gateway = string.Join(".", ip.Split('.').Take(3).Append("1"));
         var raw = new JsonObject
@@ -311,7 +385,7 @@ public static class Demo
                     ["mac"] = mac, ["ip"] = ip, ["gateway"] = gateway, ["dns"] = "10.10.0.11, 10.10.0.12", ["dhcp"] = !isServer,
                 },
             },
-            ["hotfixes"] = new JsonArray([.. hotfixes]), ["apps"] = apps, ["services"] = services, ["local_admins"] = admins,
+            ["hotfixes"] = new JsonArray([.. hotfixes]), ["apps"] = apps, ["services"] = services, ["local_admins"] = admins, ["user_accounts"] = accounts, ["local_groups"] = localGroups, ["monitors"] = monitors, ["bitlocker"] = bitlocker, ["bitlocker_keys"] = blKeys,
         };
         return Collector.Normalize(raw);
     }

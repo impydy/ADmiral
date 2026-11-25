@@ -29,7 +29,7 @@ public partial class CollectorTests
     internal static readonly HashSet<string> AllowedCmdlets =
     [
         "get-ciminstance", "get-winevent", "get-itemproperty", "get-service", "get-smbserverconfiguration",
-        "get-localgroupmember", "test-path", "select-object", "where-object", "sort-object", "foreach-object",
+        "get-localgroupmember", "get-localgroup", "get-bitlockervolume", "test-path", "select-object", "where-object", "sort-object", "foreach-object",
         "measure-object", "convertto-json", "new-object",
     ];
 
@@ -63,6 +63,10 @@ public partial class CollectorTests
             Assert.All(script, c => Assert.True(c < 128));
         }
         Assert.Contains("$r.logons = @(Get-WinEvent", Collector.CombinedScript());
+        Assert.Contains("$r.user_accounts = ", Collector.CombinedScript());
+        Assert.Contains("$r.local_groups = $lg", Collector.CombinedScript());
+        Assert.Contains("$r.monitors = @(Get-CimInstance -Namespace root\\wmi WmiMonitorID", Collector.CombinedScript());
+        Assert.Contains("Win32_UserAccount -Filter 'LocalAccount=True'", Collector.CombinedScript());   // never enumerates the domain
         Assert.Contains("$r.os_caption = $os.Caption", Collector.CombinedScript());
         Assert.Throws<ArgumentException>(() => Collector.Script("nope"));
     }

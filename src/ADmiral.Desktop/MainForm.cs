@@ -44,7 +44,8 @@ internal sealed class MainForm : Form, IDesktopShell
         _webviewDir = webviewDir;
         _debug = debug;
         _uiTest = uiTest;
-        _bridge = new DesktopBridge(this, home, service.RemoteAssist);
+        _bridge = new DesktopBridge(this, home, service.RemoteAssist, eventViewer: service.EventViewer,
+                                    computerManagement: service.ComputerManagement);
 
         Text = DesktopLogic.AppName;
         try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? Application.ExecutablePath); }

@@ -2,6 +2,8 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -93,7 +95,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     /// <summary>Controls the Windows retry service (default: <see cref="Retry.DefaultControl"/>).</summary>
     public IRetryServiceControl RetryService { get; set; } = Retry.DefaultControl;
 
-    /// <summary>Starts msra.exe for Remote Assistance.</summary>
+    /// <summary>Starts msra.exe (Remote Assistance), eventvwr.exe (Event Viewer) and mmc.exe (Computer Management).</summary>
     public IProcessStarter ProcessStarter { get; set; } = new ShellProcessStarter();
 
     /// <summary>Owner checks of the shared-folder files (null = the real Windows check).</summary>
@@ -393,6 +395,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         var items = Store.Items(guid);
         c["items"] = items;
         c["apps"] = items.GetValueOrDefault("apps")?.Select(a => Str(a["name"])).ToList() ?? [];
+        c["bitlocker_keys"] = Store.BitlockerKeyList(guid);              // which keys are stored - never the key
         var comps = Computers(withApps: true);
         c["fleets"] = Store.Fleets().Where(f => Resolve(f, comps).Any(m => (string)m["guid"]! == guid))
                            .Select(f => new Row { ["id"] = f["id"], ["name"] = f["name"] }).ToList();
@@ -516,11 +519,23 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         return state;
     }
 
+    /// <summary>Why a CVE is hidden by default and left out of the counts: "no_range" (NVD names no affected version
+    /// bound, so every version "matches"), "old" (published more than 10 years ago), or null when it is shown.</summary>
+    internal static string? VulnHiddenReason(string range, string? published, DateTime? today = null)
+    {
+        if (string.IsNullOrWhiteSpace(range)) return "no_range";
+        if (DateTime.TryParseExact(published, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var p)
+            && p < (today ?? DateTime.UtcNow).Date.AddYears(-10)) return "old";
+        return null;
+    }
+
     private static Row VulnRow(VulnItem it, string? only = null)
     {
         var devices = only is null ? it.Devices : it.Software[only].Versions.Values.SelectMany(g => g).ToHashSet();
+        var hidden = VulnHiddenReason(it.Range, it.Published);
         return new Row
         {
+            ["hidden"] = hidden is not null, ["hidden_reason"] = hidden,
             ["cve"] = it.Cve, ["software"] = string.Join(", ", it.Software.Values.Select(s => s.Name).Order(StringComparer.Ordinal)),
             ["range"] = it.Range, ["score"] = it.Score, ["severity"] = it.Severity, ["kev"] = it.Kev, ["published"] = it.Published,
             ["devices"] = devices.Count,
@@ -535,9 +550,12 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         var rows = state.Items.Values.Select(it => VulnRow(it))
             .OrderBy(r => (bool)r["kev"]! ? 0 : 1).ThenBy(r => -((double?)r["score"] ?? 0)).ThenBy(r => (string)r["cve"]!, StringComparer.Ordinal)
             .ToList();
+        // hidden CVEs (no affected version / older than 10 years) are not counted; the page can still list them
+        var counted = rows.Where(r => r["hidden"] is false).ToList();
         var counts = new Row();
-        foreach (var k in new[] { "critical", "high", "medium", "low" }) counts[k] = rows.Count(r => (string)r["severity"]! == k);
-        counts["kev"] = rows.Count(r => (bool)r["kev"]!);
+        foreach (var k in new[] { "critical", "high", "medium", "low" }) counts[k] = counted.Count(r => (string)r["severity"]! == k);
+        counts["kev"] = counted.Count(r => (bool)r["kev"]!);
+        counts["hidden"] = rows.Count - counted.Count;
         var meta = Store.UpdateReference().Meta;
         var fetched = Store.CveFetched();
         return new Row
@@ -838,7 +856,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         JobInfo job;
         try
         {
-            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, local, rec.Path, rec.Sha256, kind, cleanArgs, timeout, p));
+            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, () => RunDeployment(dep, local, rec.Path, rec.Sha256, kind, cleanArgs, timeout, p)));
         }
         catch (Exception)
         {
@@ -858,8 +876,466 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         if ((string?)d["status"] == "running") throw new ArgumentException(T("err.dep_running"));
         var bad = ((List<Row>)d["targets"]!).Where(t => t["outcome"] as string is "failed" or "unreachable").Select(t => (string)t["guid"]!).ToList();
         if (bad.Count == 0) throw new ArgumentException(T("err.dep_no_failed"));
+        if ((string?)d["kind"] == "chain")
+        {
+            // a repeat runs the same steps as the original: refused when the package's chain was changed since
+            var was = Store.DeploymentEvents(depId).Select(e => e["message"] as string ?? "")
+                .FirstOrDefault(m => m.StartsWith(ChainFingerprintPrefix, StringComparison.Ordinal))?[ChainFingerprintPrefix.Length..];
+            var pkg = Pkg(() => Library().Get((string)d["package_id"]!)) ?? throw new ArgumentException($"{d["package_id"]} is not in the library.");
+            if (was is null || was != ChainFingerprint(Chain.ValidateSteps(pkg, pkg.Steps))) throw new ArgumentException(T("err.chain_changed"));
+            return StartChainDeployment((string)d["package_id"]!, bad, retryOf: depId);
+        }
         return StartDeployment((string)d["package_id"]!, (string)d["file"]!, d["args"] as string ?? "", bad, retryOf: depId);
     }
+
+    // ------------------------------------------------------------------ BitLocker recovery keys
+    /// <summary>ADmiral's key pair for the recovery keys (see <see cref="BitlockerVault"/>).</summary>
+    public BitlockerVault Bitlocker => _bitlocker ??= new BitlockerVault(Secrets, () => IsDemo);
+    private BitlockerVault? _bitlocker;
+
+    /// <summary>Replaces the administrator password check (tests): password -> correct?</summary>
+    internal Func<string, bool>? AdminPasswordCheck { get; set; }
+
+    public const int BitlockerMaxFailures = 5;
+    public static readonly TimeSpan BitlockerLockout = TimeSpan.FromMinutes(15);
+    private readonly Lock _blGate = new();
+    private readonly List<DateTime> _blFailures = [];
+    private DateTime _blLockedUntil = DateTime.MinValue;
+
+    /// <summary>Take the encrypted recovery keys out of a collected record and store them (only when this run asked for
+    /// them: the record then carries them, and an empty list means none). Each entry is checked; nothing readable is
+    /// accepted from a computer - except the demo, whose fake keys are encrypted here.</summary>
+    private void SaveBitlockerKeys(string guid, JsonObject rec, bool requested)
+    {
+        if (!rec.Remove("bitlocker_keys", out var node) || !requested || node is not JsonArray arr) return;
+        var keys = new List<(string, string, string)>();
+        foreach (var n in arr.Take(32))
+        {
+            if (n is not JsonObject o) continue;
+            string S(string k) => o[k] is JsonValue v && v.GetValueKind() == JsonValueKind.String ? v.GetValue<string>().Trim() : "";
+            var (drive, id, cipher) = (S("drive"), S("id"), S("cipher"));
+            if (IsDemo && cipher.Length == 0 && BitlockerVault.ValidRecoveryPassword(S("plain"))) cipher = Bitlocker.Encrypt(S("plain"));
+            if (drive.Length is 0 or > 64 || id.Length is 0 or > 80 || cipher.Length is 0 or > 4096) continue;
+            try { _ = Convert.FromBase64String(cipher); }
+            catch (FormatException) { continue; }
+            keys.Add((drive, id, cipher));
+        }
+        Store.SetBitlockerKeys(guid, keys);
+    }
+
+    /// <summary>Is <paramref name="password"/> the administrator's (the configured AD account's) password now? Checked
+    /// with a fresh LDAP bind, so a stale saved password does not count. Demo: "demo".</summary>
+    private bool CheckAdminPassword(string password)
+    {
+        if (string.IsNullOrEmpty(password) || password.Length > 256) return false;
+        if (AdminPasswordCheck is { } check) return check(password);
+        if (IsDemo) return CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(password), "demo"u8);
+        if (string.IsNullOrWhiteSpace(Settings.Ldap.User)) throw new ArgumentException(T("err.bl_no_account"));
+        var s = Clone(Settings);
+        s.Ldap.Password = password;
+        try
+        {
+            MakeDirectory(s).Test();
+            return true;
+        }
+        catch (Exception exc) when (exc is not OutOfMemoryException)
+        {
+            Log.Logger.LogInformation("BitLocker key: the administrator password check failed ({Type})", exc.GetType().Name);
+            return false;
+        }
+    }
+
+    /// <summary>One recovery key in clear text, after the administrator's password was entered again. Wrong passwords
+    /// are counted: after <see cref="BitlockerMaxFailures"/> within the lockout time no key is shown for
+    /// <see cref="BitlockerLockout"/>. Every look (and every refusal) goes to the activity log - never the key.</summary>
+    public Row RevealBitlockerKey(string guid, string id, string password)
+    {
+        var c = Store.Computer(guid) ?? throw new NotFound(T("err.computer_not_found", ("ref", guid)));
+        var name = Str(c["name"]);
+        var meta = Store.BitlockerKeyList(guid).FirstOrDefault(k => (string?)k["id"] == id)
+                   ?? throw new NotFound(T("err.bl_none"));
+        lock (_blGate)
+        {
+            var now = DateTime.UtcNow;
+            if (now < _blLockedUntil)
+                throw new ArgumentException(T("err.bl_locked", ("min", (int)Math.Ceiling((_blLockedUntil - now).TotalMinutes))));
+        }
+        if (!CheckAdminPassword(password ?? ""))
+        {
+            lock (_blGate)
+            {
+                var now = DateTime.UtcNow;
+                _blFailures.RemoveAll(t => now - t > BitlockerLockout);
+                _blFailures.Add(now);
+                if (_blFailures.Count >= BitlockerMaxFailures)
+                {
+                    _blLockedUntil = now + BitlockerLockout;
+                    _blFailures.Clear();
+                }
+            }
+            Store.Log("bitlocker", T("log.bl_denied", ("name", name), ("drive", meta["drive"])));
+            throw new ArgumentException(T("err.bl_password"));
+        }
+        lock (_blGate) _blFailures.Clear();
+        string key;
+        try
+        {
+            key = Bitlocker.Decrypt(Store.BitlockerCipher(guid, id) ?? "");
+        }
+        catch (Exception exc) when (exc is CryptographicException or FormatException or InvalidOperationException)
+        {
+            throw new ArgumentException(T("err.bl_decrypt"), exc);
+        }
+        if (!BitlockerVault.ValidRecoveryPassword(key)) throw new ArgumentException(T("err.bl_decrypt"));
+        Store.Log("bitlocker", T("log.bl_view", ("name", name), ("drive", meta["drive"]), ("id", id)));
+        return new Row { ["drive"] = meta["drive"], ["id"] = id, ["key"] = key, ["collected_at"] = meta["collected_at"] };
+    }
+
+    // ------------------------------------------------------------------ package chains
+    /// <summary>A new package without files: its chain is put together afterwards.</summary>
+    public PackageEntry PackageCreate(string pkgId, string name, string version = "", string publisher = "")
+    {
+        var e = Pkg(() => Library().Create(pkgId, name, version, publisher));
+        Store.Log("packages", T("log.pkg_create", ("id", e.Id)));
+        return e;
+    }
+
+    /// <summary>Replace the chain (steps) of a package.</summary>
+    public PackageEntry PackageSetSteps(string pkgId, IReadOnlyList<PackageStep> steps)
+    {
+        var e = Pkg(() => Library().SetSteps(pkgId, steps));
+        Store.Log("packages", T("log.pkg_steps", ("id", e.Id), ("n", e.Steps.Count)));
+        return e;
+    }
+
+    /// <summary>Replaces sending the Wake-on-LAN packet (tests): (host, packet, addresses).</summary>
+    internal Action<string, byte[], IReadOnlyList<string>>? WolSender { get; set; }
+
+    /// <summary>Deploy the whole chain of a package: every step on every computer, in order. Returns {id, job}.</summary>
+    public Row StartChainDeployment(string packageId, IReadOnlyList<string> names, int? timeoutSeconds = null, long? retryOf = null)
+    {
+        if (names is null || names.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
+        var timeout = timeoutSeconds is > 0 ? timeoutSeconds.Value : Settings.Deploy.TimeoutMinutes * 60;
+        var lib = Library();
+        var pkg = Pkg(() => lib.Get(packageId)) ?? throw new ArgumentException($"{packageId} is not in the library.");
+        var steps = Chain.ValidateSteps(pkg, pkg.Steps);                     // checked again: the register may have changed
+        if (steps.Count == 0) throw new ArgumentException(T("err.chain_empty"));
+        // every file the chain sends: present and unchanged before anything starts
+        var files = new Dictionary<string, (string Local, string Sha)>();
+        foreach (var s in steps.Where(s => s.File is not null))
+        {
+            var rec = pkg.Files.First(f => f.Path == s.File);
+            var local = Pkg(() => lib.File(rec.Path));
+            if (!File.Exists(local) || !string.Equals(PackageLibrary.Sha256File(local), rec.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
+            files[rec.Path] = (local, rec.Sha256);
+        }
+        var guids = Store.ResolveNames(names);
+        var comps = Computers().ToDictionary(c => (string)c["guid"]!);
+        var unconfirmed = SyncUnconfirmed();
+        var refused = guids.Distinct().Where(g => comps.ContainsKey(g) && unconfirmed.Contains(g)).Select(g => Str(comps[g]["name"])).ToList();
+        var targets = guids.Distinct().Where(g => comps.ContainsKey(g) && !unconfirmed.Contains(g)).Select(g => (g, Str(comps[g]["name"]))).ToList();
+        if (targets.Count == 0 && refused.Count > 0)
+            throw new ArgumentException($"Not confirmed by this instance's AD sync yet (received from a sync peer): {string.Join(", ", refused)}");
+        var summary = string.Join(" → ", steps.Select(s => s.Type));
+        var dep = Store.CreateDeployment(pkg.Id, pkg.Name, pkg.Version, "", "chain", summary, targets);
+        Store.Log("deploy", T("log.dep_start", ("id", dep), ("pkg", pkg.Id), ("n", targets.Count)));
+        void Ev(string msg) => Store.AddDeploymentEvent(dep, msg);
+        Ev($"Deployment #{dep} started (chain of {steps.Count} steps)" + (retryOf is { } r ? $" (repeat of #{r}, failed computers only)" : ""));
+        Ev($"Package: {(pkg.Name.Length > 0 ? pkg.Name : pkg.Id)} ({pkg.Id}) version {(pkg.Version.Length > 0 ? pkg.Version : "-")}");
+        for (var i = 0; i < steps.Count; i++) Ev($"Step {i + 1}: {Chain.Describe(steps[i])}");
+        foreach (var (path, (_, sha)) in files) Ev($"File: {path}, SHA-256 {sha} (re-checked before sending)");
+        Ev($"Timeout per step: {timeout} s");
+        Ev(ChainFingerprintPrefix + ChainFingerprint(steps));
+        Ev($"Targets ({targets.Count}): " + string.Join(", ", targets.Select(t => t.Item2)));
+        if (refused.Count > 0)
+            Ev($"Skipped ({refused.Count}, received from a sync peer and not yet confirmed by this instance's AD sync): " + string.Join(", ", refused));
+        JobInfo job;
+        try
+        {
+            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, () => RunChain(dep, steps, files, timeout, p)));
+        }
+        catch (Exception)
+        {
+            foreach (var (g, _) in targets)
+                UpdateTarget(dep, g, ("step", "done"), ("outcome", "failed"), ("error", "not started: another deployment is running"));
+            Ev("Not started: another deployment is running");
+            Store.FinishDeployment(dep);
+            throw;
+        }
+        return new Row { ["id"] = dep, ["job"] = job };
+    }
+
+    private const string ChainFingerprintPrefix = "Chain SHA-256: ";
+
+    /// <summary>SHA-256 of the checked steps (with the hashes of the files they send): what exactly a deployment ran.</summary>
+    private string ChainFingerprint(List<PackageStep> steps)
+    {
+        var pkgFiles = new Dictionary<string, string>();
+        try
+        {
+            foreach (var p in Library().Load().Packages) foreach (var f in p.Files) pkgFiles[f.Path] = f.Sha256;
+        }
+        catch (PackageError) { }
+        var text = System.Text.Json.JsonSerializer.Serialize(steps) + "|" +
+                   string.Join("|", steps.Where(s => s.File is not null).Select(s => s.File + "=" + pkgFiles.GetValueOrDefault(s.File!, "")));
+        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+    }
+
+    /// <summary>Is the computer up (SMB or RPC answers)?</summary>
+    private bool Reachable(string host)
+    {
+        Scanner.ProbeFn probe = ProbeOverride ?? (IsDemo ? new Scanner.ProbeFn(Demo.Probe) : (h, p, t) => Scanner.Probe(h, p, t));
+        return probe(host, [445, 135], 1.5).OpenPorts.Count > 0;
+    }
+
+    /// <summary>Poll <see cref="Reachable"/> until it equals <paramref name="up"/> or <paramref name="seconds"/> pass.</summary>
+    private bool WaitReachable(string host, bool up, int seconds)
+    {
+        var until = DateTime.UtcNow.AddSeconds(Math.Max(0, seconds));
+        while (true)
+        {
+            if (Reachable(host) == up) return true;
+            if (DateTime.UtcNow >= until) return false;
+            Thread.Sleep(IsDemo ? TimeSpan.FromSeconds(0.2 * Math.Max(DemoDelayScale, 0.05)) : TimeSpan.FromSeconds(5));
+        }
+    }
+
+    private void SendWol(string host, byte[] packet, IReadOnlyList<string> addresses)
+    {
+        if (WolSender is { } fake) { fake(host, packet, addresses); return; }
+        if (IsDemo) return;
+        using var udp = new System.Net.Sockets.UdpClient { EnableBroadcast = true };
+        foreach (var a in addresses)
+            foreach (var port in new[] { 9, 7 })
+                for (var k = 0; k < 3; k++) udp.Send(packet, packet.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Parse(a), port));
+    }
+
+    private Row RunChain(long dep, List<PackageStep> steps, Dictionary<string, (string Local, string Sha)> files, int timeout, Progress progress)
+    {
+        var d = Store.Deployment(dep)!;
+        var targets = ((List<Row>)d["targets"]!).ToDictionary(t => (string)t["guid"]!);
+        var comps = Computers().Where(c => targets.ContainsKey((string)c["guid"]!)).ToDictionary(c => (string)c["guid"]!);
+        var col = Settings.Collect;
+        SmbCreds? creds = null;
+        var denied = new Dictionary<string, string>();
+        if (!IsDemo)
+        {
+            var realm = Kerberos.RealmFromBaseDn(Settings.Ldap.BaseDn);
+            var ous = comps.Values.Select(c => DnUtil.ParentDn(c["dn"] as string ?? "")).ToHashSet();
+            var scope = ous.Count > 0 ? Directory.OuAdminScope(Settings.Ldap.User, ous) : [];
+            foreach (var (g, c) in comps)
+            {
+                var ou = DnUtil.ParentDn(c["dn"] as string ?? "");
+                var (okay, detail) = scope.TryGetValue(ou, out var s) ? s : (true, "");
+                if (!okay)
+                {
+                    var msg = T("err.not_admin_ou", ("ou", ou), ("detail", detail));
+                    denied[g] = msg.Length > 500 ? msg[..500] : msg;
+                }
+            }
+            creds = Pdq.CredsFromLdap(Settings.Ldap, realm);
+            if (!creds.HasExplicitCredential) throw new ArgumentException(T("err.pdq_creds"));
+        }
+        var total = targets.Count;
+        var finished = 0;
+        var gate = new Lock();
+        void Ev(string msg, string guid) => Store.AddDeploymentEvent(dep, msg, Str(targets[guid]["name"]));
+        void DemoSleep(double s) { if (DemoDelayScale > 0) Thread.Sleep(TimeSpan.FromSeconds(s * DemoDelayScale)); }
+
+        // the remote steps as a demo: same steps and timing feel, no network
+        RemoteRunResult DemoRemote(PackageStep s, Action<string, int?> onStep)
+        {
+            onStep("connecting", null); DemoSleep(0.3);
+            if (s.File is not null) for (var pct = 0; pct <= 100; pct += 25) { onStep("copying", pct); DemoSleep(0.1); }
+            onStep("running", null); DemoSleep(0.6);
+            onStep("cleanup", null); DemoSleep(0.2);
+            return s.Type switch
+            {
+                "copy" => new RemoteRunResult(0, "", $"Copied to {s.Path}\\{Path.GetFileName(s.File)}", 1),
+                "delete" => new RemoteRunResult(0, "", $"Deleted {s.Path}", 0),
+                "reboot" or "shutdown" => new RemoteRunResult(0, "", "", 0),
+                _ => new RemoteRunResult(0, "", $"demo: {s.Type} ran ({(s.Script ?? "").Split('\n').Length} line(s))", 1),
+            };
+        }
+
+        RemoteRunResult Remote(string host, PackageStep s, Action<string, int?> onStep)
+        {
+            if (IsDemo) return DemoRemote(s, onStep);
+            switch (s.Type)
+            {
+                case "copy":
+                {
+                    var (local, sha) = files[s.File!];
+                    return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-f1.bin", local, Sha256: sha)],
+                        (p, run, o, tmp) => Chain.CopyScript(p["-f1.bin"], s.Path!, Path.GetFileName(local), sha, run, o, tmp), onStep, timeout);
+                }
+                case "delete":
+                    return Chain.RunRemote(host, creds!, col, [], (_, run, o, tmp) => Chain.DeleteScript(s.Path!, run, o, tmp), onStep, timeout);
+                case "powershell":
+                    return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-user.ps1", Bytes: Pdq.ScriptBytes(s.Script!))],
+                        (p, run, o, tmp) => Chain.ScriptRunner("powershell", p["-user.ps1"], run, o, tmp), onStep, timeout);
+                case "cmd":
+                    return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-user.cmd", Bytes: Chain.CmdFileBytes(s.Script!))],
+                        (p, run, o, tmp) => Chain.ScriptRunner("cmd", p["-user.cmd"], run, o, tmp), onStep, timeout);
+                default:                                                         // reboot / shutdown
+                    return Chain.RunRemote(host, creds!, col, [],
+                        (_, run, o, tmp) => Chain.PowerScript(s.Type == "reboot", s.Seconds ?? Chain.DefaultPowerDelay, run, o, tmp), onStep, timeout);
+            }
+        }
+
+        void Work(string guid)
+        {
+            var now = Db.UtcNow();
+            if (denied.ContainsKey(guid) || !comps.TryGetValue(guid, out var c))
+            {
+                var why = denied.GetValueOrDefault(guid) ?? "computer not found";
+                UpdateTarget(dep, guid, ("step", "done"), ("outcome", "failed"), ("started", now), ("finished", now), ("error", why));
+                Ev("Failed before start: " + why, guid);
+                return;
+            }
+            var host = c["dns_hostname"] is string { Length: > 0 } dns ? dns : Str(c["name"]);
+            Ev($"Start on {host}", guid);
+            Jobs_Track(progress, guid, "deploy");
+            UpdateTarget(dep, guid, ("step", "connecting"), ("started", now));
+            string outcome = "ok", error = "";
+            int? lastCode = null;
+            var needReboot = false;
+            try
+            {
+                for (var i = 0; i < steps.Count; i++)
+                {
+                    var s = steps[i];
+                    var label = $"chain:{i + 1}:{steps.Count}:{s.Type}";
+                    var basePct = i * 100 / steps.Count;
+                    UpdateTarget(dep, guid, ("step", label), ("percent", basePct));
+                    Ev($"Step {i + 1}/{steps.Count}: {Chain.Describe(s)}", guid);
+                    Action<string, int?> onStep = (sub, pct) =>
+                        UpdateTarget(dep, guid, ("step", label), ("percent", basePct + (sub == "copying" && pct is { } p ? p / steps.Count / 2 : 0)));
+                    string? fail = null;
+                    var unreachable = false;
+                    try
+                    {
+                        switch (s.Type)
+                        {
+                            case "install":
+                            {
+                                var (local, sha) = files[s.File!];
+                                var kind = Deploy.InstallerKind(s.File!)!;
+                                var res = IsDemo
+                                    ? Demo.Deploy(host, local, kind, s.Args ?? "", onStep, DemoDelayScale)
+                                    : Deploy.DeployOne(host, creds!, Library(), s.File!, kind, s.Args ?? "", col, onStep, timeout, expectedSha256: sha);
+                                lastCode = res.ExitCode;
+                                Ev($"Install result: {res.Outcome}, exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"}"
+                                   + (res.Error.Length > 0 ? $", error: {res.Error}" : ""), guid);
+                                if (res.Log.Length > 0) Ev("Installer output:\n" + Cap(res.Log.Trim(), 20000), guid);
+                                if (res.Outcome == "reboot") needReboot = true;
+                                if (res.Outcome == "failed") fail = $"install failed (exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"})" + (res.Error.Length > 0 ? $": {res.Error}" : "");
+                                break;
+                            }
+                            case "scan":
+                            {
+                                FullScan(guids: [guid]);
+                                var st = Store.Computer(guid);
+                                Ev($"Scan: online {(st?["online"] is true ? "yes" : "no")}, inventory {st?["scan_status"] ?? "-"}", guid);
+                                if (st?["online"] is not true) fail = "scan: the computer did not answer";
+                                break;
+                            }
+                            case "wol":
+                            {
+                                if (Reachable(host)) { Ev("Wake on LAN: the computer is already on", guid); break; }
+                                var mac = (c["inventory"] as JsonObject)?["mac_address"] is JsonValue mv && mv.TryGetValue<string>(out var ms) ? ms : null;
+                                var packet = Chain.MagicPacket(mac);
+                                if (packet is null) { fail = "wake on LAN: no MAC address known (collect the inventory once while it is on)"; break; }
+                                var addrs = Chain.WolAddresses(c["ip"] as string);
+                                SendWol(host, packet, addrs);
+                                Ev($"Wake on LAN sent to {mac} via {string.Join(", ", addrs)}; waiting up to {s.Seconds}s", guid);
+                                if ((s.Seconds ?? 0) > 0 && !WaitReachable(host, true, s.Seconds!.Value))
+                                    fail = $"wake on LAN: the computer did not come up within {s.Seconds}s";
+                                break;
+                            }
+                            default:                                             // remote steps
+                            {
+                                var res = Remote(host, s, onStep);
+                                lastCode = res.ExitCode;
+                                Ev($"Result: exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"}"
+                                   + (res.Error.Length > 0 ? $", error: {res.Error}" : ""), guid);
+                                if (res.Output.Length > 0) Ev("Output:\n" + Cap(res.Output, 20000), guid);
+                                if (res.Error.Length > 0 || res.ExitCode is not 0)
+                                {
+                                    fail = $"{s.Type} failed (exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"})" + (res.Error.Length > 0 ? $": {res.Error}" : "");
+                                    break;
+                                }
+                                if (s.Type is "reboot" or "shutdown") needReboot = false;
+                                if (s.Type == "reboot" && s.Wait == true)
+                                {
+                                    var delay = s.Seconds ?? Chain.DefaultPowerDelay;
+                                    Ev($"Waiting for the restart (down within {delay + 300}s, back within {timeout}s)", guid);
+                                    if (IsDemo) DemoSleep(1.0);
+                                    else if (!WaitReachable(host, false, delay + 300)) fail = "reboot: the computer did not go down";
+                                    else if (!WaitReachable(host, true, timeout)) fail = $"reboot: the computer did not come back within {timeout}s";
+                                    else Thread.Sleep(TimeSpan.FromSeconds(30));         // let the services start
+                                    if (fail is null) Ev("The computer is back", guid);
+                                }
+                                if (s.Type == "shutdown" && i < steps.Count - 1) Ev("NOTE: the computer is shutting down; the next steps need it on (e.g. a wake on LAN step)", guid);
+                                break;
+                            }
+                        }
+                    }
+                    catch (Unreachable exc)
+                    {
+                        unreachable = true;
+                        fail = $"{s.Type}: {exc.Message}";
+                    }
+                    catch (Exception exc) when (exc is DeployError or ArgumentException or CollectError or IOException or InvalidOperationException
+                                                    or System.Net.Sockets.SocketException or UnauthorizedAccessException)
+                    {
+                        fail = $"{s.Type}: {exc.GetType().Name}: {exc.Message}";
+                    }
+                    if (fail is null) continue;
+                    Ev($"Step {i + 1} failed: {fail}", guid);
+                    if (error.Length == 0) error = $"step {i + 1}: {fail}";
+                    outcome = unreachable && outcome == "ok" && i == 0 ? "unreachable" : "failed";
+                    if (s.ContinueOnError != true) { Ev("Chain stopped", guid); break; }
+                    Ev("Continuing with the next step (continue on error)", guid);
+                }
+                if (outcome == "ok" && needReboot) outcome = "reboot";
+                UpdateTarget(dep, guid, ("step", "done"), ("percent", null), ("outcome", outcome), ("exit_code", lastCode),
+                             ("error", Cap(error, 500)), ("finished", Db.UtcNow()));
+                Ev($"Result: {outcome}", guid);
+            }
+            catch (Exception exc)          // one computer's failure must not stop the others
+            {
+                Log.Logger.LogWarning(exc, "Chain on {Host} failed: {Error}", host, exc.Message);
+                var err = $"{exc.GetType().Name}: {exc.Message}";
+                UpdateTarget(dep, guid, ("step", "done"), ("percent", null), ("outcome", "failed"), ("error", Cap(err, 500)), ("finished", Db.UtcNow()));
+                Ev(Cap("Failed: " + err, 1000), guid);
+            }
+            finally
+            {
+                Jobs_Track(progress, guid, null);
+            }
+        }
+
+        Parallel.ForEach(targets.Keys.ToList(), new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(8, total)) }, g =>
+        {
+            Work(g);
+            lock (gate)
+            {
+                finished++;
+                progress.Report(finished, total, "");
+            }
+        });
+        var status = Store.FinishDeployment(dep);
+        var done = (List<Row>)Store.Deployment(dep)!["targets"]!;
+        var ok = done.Count(t => t["outcome"] as string is "ok" or "reboot");
+        var failedN = done.Count(t => t["outcome"] as string == "failed");
+        Store.AddDeploymentEvent(dep, $"Deployment finished: {status} (ok {ok}, failed {failedN})");
+        Store.Log("deploy", T("log.dep_done", ("id", dep), ("status", status)));
+        return new Row { ["id"] = dep, ["status"] = status, ["ok"] = ok, ["failed"] = failedN };
+    }
+
+    private static string Cap(string s, int n) => s.Length > n ? s[..n] : s;
 
     /// <summary>The full event log of a deployment as text.</summary>
     public string DeploymentLog(long depId)
@@ -884,11 +1360,11 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
 
     /// <summary>Like <see cref="RunDeployment"/>, but a failure before / outside the per-computer work (directory lookup,
     /// missing credentials, ...) must not leave the computers 'queued' forever: they are marked failed with the reason.</summary>
-    private object? RunDeploymentSafe(long dep, string local, string relPath, string sha256, string kind, string args, int timeout, Progress progress)
+    private object? RunDeploymentSafe(long dep, Func<object?> run)
     {
         try
         {
-            return RunDeploymentHook is { } hook ? hook(dep) : RunDeployment(dep, local, relPath, sha256, kind, args, timeout, progress);
+            return RunDeploymentHook is { } hook ? hook(dep) : run();
         }
         catch (Exception exc)
         {
@@ -1847,6 +2323,10 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             failed++;
         }
         var total = comps.Count;
+        // the public key for the recovery keys (null: they are not collected, e.g. no protected secret store)
+        string? blKey = null;
+        try { blKey = Bitlocker.PublicKeyXml; }
+        catch (CryptographicException exc) { Log.Logger.LogWarning(exc, "BitLocker key pair unavailable; recovery keys are not collected"); }
 
         JsonObject WorkInner(Row c)
         {
@@ -1858,21 +2338,21 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             {
                 try
                 {
-                    var rec = Pdq.Collect(host, smbCreds!, col, onCleanup: LogCleanup);
+                    var rec = Pdq.Collect(host, smbCreds!, col, onCleanup: LogCleanup, bitlockerKey: blKey);
                     Log.Logger.LogInformation("Collect {Host}: PDQ ok in {Seconds:F1}s", host, Stopwatch.GetElapsedTime(started).TotalSeconds);
                     return rec;
                 }
                 catch (CollectError exc) when (col.WinrmFallback && ports.Overlaps(WinRMPorts))
                 {
                     Log.Logger.LogWarning(exc, "PDQ collection of {Host} failed ({Error}); falling back to WinRM", host, exc.Message);
-                    var rec = Collector.WinrmCollect(host, cfg, realm);
+                    var rec = Collector.WinrmCollect(host, cfg, realm, bitlockerKey: blKey);
                     Log.Logger.LogInformation("Collect {Host}: WinRM fallback ok in {Seconds:F1}s", host, Stopwatch.GetElapsedTime(started).TotalSeconds);
                     return rec;
                 }
             }
             if (ports.Overlaps(WinRMPorts))
             {
-                var rec = Collector.WinrmCollect(host, cfg, realm);
+                var rec = Collector.WinrmCollect(host, cfg, realm, bitlockerKey: blKey);
                 Log.Logger.LogInformation("Collect {Host}: WinRM ok in {Seconds:F1}s", host, Stopwatch.GetElapsedTime(started).TotalSeconds);
                 return rec;
             }
@@ -1896,6 +2376,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                 {
                     if (Db.Truthy(rec["section_errors"]))
                         Log.Logger.LogWarning("Collect {Host}: partial inventory, failed sections: {Errors}", HostOf(c), rec["section_errors"]?.ToJsonString());
+                    SaveBitlockerKeys(guid, rec, requested: blKey is not null);
                     Store.RecordInventory(guid, rec);
                     ok++;
                 }
@@ -2261,6 +2742,70 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         catch (System.ComponentModel.Win32Exception exc)
         {
             throw new InvalidOperationException($"msra.exe could not be started ({exc.Message})", exc);
+        }
+    }
+
+    /// <summary>Full path of eventvwr.exe in the System directory (never resolved through PATH or the current folder).</summary>
+    public static string EventViewerPath => Path.Combine(OperatingSystem.IsWindows() ? Environment.SystemDirectory : "C:\\Windows\\System32", "eventvwr.exe");
+
+    /// <summary>The Event Viewer pointed at <paramref name="host"/> (<c>eventvwr.exe &lt;host&gt;</c>; the name validated and
+    /// passed as a separate argument). It runs as the signed-in user: reading the remote logs needs that user's rights there.</summary>
+    public static ProcessStartInfo EventViewerStartInfo(string host)
+    {
+        var info = new ProcessStartInfo(EventViewerPath) { UseShellExecute = true };
+        info.ArgumentList.Add(ValidRemoteHost(host));
+        return info;
+    }
+
+    /// <summary>Open the target computer's event logs in the Windows Event Viewer (read-only for ADmiral: it only starts
+    /// the viewer).</summary>
+    public void EventViewer(string host)
+    {
+        var info = EventViewerStartInfo(host);
+        if (ProcessStarter is ShellProcessStarter && !OperatingSystem.IsWindows())
+            throw new InvalidOperationException("The Event Viewer (eventvwr.exe) is only available on Windows");
+        Log.Logger.LogInformation("Event Viewer opened for {Host}", info.ArgumentList[0]);
+        try
+        {
+            ProcessStarter.Start(info);
+        }
+        catch (System.ComponentModel.Win32Exception exc)
+        {
+            throw new InvalidOperationException($"eventvwr.exe could not be started ({exc.Message})", exc);
+        }
+    }
+
+    private static string SystemDir => OperatingSystem.IsWindows() ? Environment.SystemDirectory : "C:\\Windows\\System32";
+
+    /// <summary>Full paths of mmc.exe and the Computer Management snap-in in the System directory (never PATH / current folder).</summary>
+    public static string MmcPath => Path.Combine(SystemDir, "mmc.exe");
+    public static string CompMgmtPath => Path.Combine(SystemDir, "compmgmt.msc");
+
+    /// <summary>Computer Management (MMC) connected to <paramref name="host"/>: <c>mmc.exe compmgmt.msc /computer=&lt;host&gt;</c>,
+    /// each argument a separate item and the name validated.</summary>
+    public static ProcessStartInfo ComputerManagementStartInfo(string host)
+    {
+        var info = new ProcessStartInfo(MmcPath) { UseShellExecute = true };
+        info.ArgumentList.Add(CompMgmtPath);
+        info.ArgumentList.Add("/computer=" + ValidRemoteHost(host));
+        return info;
+    }
+
+    /// <summary>Open Computer Management (event logs, services, shares, local users and groups, disks...) for the
+    /// target computer. ADmiral only starts the console; whatever is done there is the admin's own action.</summary>
+    public void ComputerManagement(string host)
+    {
+        var info = ComputerManagementStartInfo(host);
+        if (ProcessStarter is ShellProcessStarter && !OperatingSystem.IsWindows())
+            throw new InvalidOperationException("Computer Management (mmc.exe) is only available on Windows");
+        Log.Logger.LogInformation("Computer Management opened for {Host}", info.ArgumentList[1]);
+        try
+        {
+            ProcessStarter.Start(info);
+        }
+        catch (System.ComponentModel.Win32Exception exc)
+        {
+            throw new InvalidOperationException($"mmc.exe could not be started ({exc.Message})", exc);
         }
     }
 
