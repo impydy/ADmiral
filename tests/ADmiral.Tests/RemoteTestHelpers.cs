@@ -30,15 +30,43 @@ internal static class Pwsh
 
     public const string SkipReason = "PowerShell 7 (pwsh) is not installed on this machine";
 
-    /// <summary>Run <paramref name="script"/> with -EncodedCommand (exactly as ADmiral sends scripts).</summary>
+    /// <summary>Longest script passed with -EncodedCommand: base64 of UTF-16 is ~2.7x the text, and Windows refuses a
+    /// command line over 32767 characters ("The filename or extension is too long").</summary>
+    private const int MaxEncodedChars = 8000;
+
+    /// <summary>Run <paramref name="script"/> with -EncodedCommand (exactly as ADmiral sends scripts); a longer one
+    /// (e.g. the combined inventory script) from a temporary .ps1 file instead, as the PDQ collector runs it.</summary>
     public static (int Code, string Stdout, string Stderr, byte[] Raw) Run(string script, string? exe = null)
     {
         var psi = new ProcessStartInfo(exe ?? Exe ?? throw new InvalidOperationException(SkipReason))
         {
             UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
         };
-        foreach (var a in new[] { "-NoProfile", "-NonInteractive", "-EncodedCommand", Convert.ToBase64String(Encoding.Unicode.GetBytes(script)) })
-            psi.ArgumentList.Add(a);
+        string? file = null;
+        if (script.Length <= MaxEncodedChars)
+        {
+            foreach (var a in new[] { "-NoProfile", "-NonInteractive", "-EncodedCommand", Convert.ToBase64String(Encoding.Unicode.GetBytes(script)) })
+                psi.ArgumentList.Add(a);
+        }
+        else
+        {
+            file = Path.Combine(Path.GetTempPath(), $"admiral-test-{Guid.NewGuid():N}.ps1");
+            File.WriteAllText(file, script, new UTF8Encoding(true));
+            foreach (var a in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file })
+                psi.ArgumentList.Add(a);
+        }
+        try
+        {
+            return RunProcess(psi);
+        }
+        finally
+        {
+            if (file is not null) File.Delete(file);
+        }
+    }
+
+    private static (int Code, string Stdout, string Stderr, byte[] Raw) RunProcess(ProcessStartInfo psi)
+    {
         using var p = Process.Start(psi)!;
         var ms = new MemoryStream();
         var outTask = p.StandardOutput.BaseStream.CopyToAsync(ms);
