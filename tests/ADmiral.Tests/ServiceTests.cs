@@ -513,6 +513,7 @@ public sealed class ServiceTests : IDisposable
     [Fact]
     public void LogonHistoryAndUsers()
     {
+        App.Store.LogonRetentionDays = 3650;                              // the fixed logon dates are older than 2 months
         var comps = App.Computers();
         string ga = (string)comps[0]["guid"]!, gb = (string)comps[1]["guid"]!;
         static JsonObject Ev(string user, string dom, string t, int typ = 2) =>

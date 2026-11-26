@@ -46,6 +46,9 @@ domain user could hand in a file for any computer.
 When a computer's event log can't be read remotely, the login tracking script can record logons into a shared folder
 instead (**Settings -> Login tracking**). Same folder permissions as above.
 
+The user who's logged on when a computer gets scanned goes into the logon history too (once a day per user and
+computer). The history is kept for 60 days by default - change it under **Settings -> Login tracking**.
+
 ## The retry service
 
 ADmiral can install a small Windows service ("ADmiral retry") that keeps going while the window is closed: it retries
@@ -62,6 +65,10 @@ If more than one admin runs ADmiral (say, one per site), they can share computer
    every instance.
 2. List the peers (`host` or `host:port`).
 3. The allowed network defaults to your own `/24`. Widen it if the peers are elsewhere.
+4. If one instance sees the other but not the other way round, the firewall of the one that isn't seen blocks the
+   sync port. Hit **Add to the firewall rules** there (desktop app) - it adds the smallest rule that does the job:
+   inbound TCP on the sync port only, for ADmiral only, from the sync network only, Domain and Private profiles.
+   **Save firewall script...** gives you the same thing as `ADmiral-Firewall.ps1`, to run as admin on another machine.
 
 What to know:
 
@@ -74,8 +81,27 @@ What to know:
 
 ## Packages and deployments
 
-Add installers to the package library (**Packages -> Add file...**), with the vendor's SHA-256 if you have it. When you deploy, ADmiral re-checks the file's hash, copies it to each machine, runs it with the switches you
-picked (presets for the usual silent switches are there), and collects the exit codes and logs.
+Add installers to the package library (**Package library -> Add file...**), with the vendor's SHA-256 if you have it. The
+copy shows in the status bar, and you can keep working meanwhile. When you deploy, ADmiral re-checks the file's hash,
+copies it to each machine, runs it with the switches you picked (presets for the usual silent switches are there), and
+collects the exit codes and logs.
+
+**Windows updates.** Once you've queried the Windows updates (**Windows updates -> Refresh**), the
+**Windows build update...** button in the package library lights up. Pick one of the builds your machines run, drop in
+the `.msu` / `.cab` from the Microsoft Update Catalog, and it's filed under that build with the KB as its name and the
+build version (e.g. `26100.4061`) as its version. Microsoft doesn't publish a plain SHA-256 for these: the catalog
+shows SHA-1 and SHA-256 in base64 and puts the SHA-1 into the file name. ADmiral checks the file name's SHA-1 when you
+add the file, and **Catalog check** looks the file up in the catalog (through your proxy) to confirm it's the real thing.
+
+Updates are installed the way they have to be on a remote machine (wusa won't run remotely): copied over, then
+`DISM /Online /Add-Package /NoRestart` as SYSTEM. Machines on another build are skipped before anything is copied, and an
+update that's already there is reported as "already up to date". DISM's progress goes into the deployment log while it
+runs, and an update install runs in its own job, so it doesn't hold up other deployments. The restart is up to you -
+add a restart step to a package for that.
+
+**Packages** (under Actions) are installation chains: steps run in order on each machine - install, copy, delete, scan,
+restart, shut down, wake on LAN, wait, send a message to the logged-on users, PowerShell or CMD. The files come from the
+package library. Click a package to see its steps.
 
 Before anything starts, the confirmation lists every target computer by name. Read it. :)
 

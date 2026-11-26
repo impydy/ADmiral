@@ -142,6 +142,9 @@ function net { @('Alias name     Administrators', 'Comment        Administrators
         d.Add("loader");
         d.Add("deploy");
         d.Add("kill");
+        d.Add("winupdate");
+        d.Add("winupdate_cab");
+        d.Add("message");
         return d;
     }
 
@@ -152,6 +155,10 @@ function net { @('Alias name     Administrators', 'Comment        Administrators
         "loader" => Collector.Loader,
         "deploy" => Deploy.InstallScript("msi", @"C:\Windows\Temp\admiral-0123456789ab-inst.msi", "/qn 'x' \u2019y\u2019", "r", "o", "t"),
         "kill" => Encoding.Unicode.GetString(Convert.FromBase64String(Pdq.KillCommand("0123456789ab").Split(' ')[^1])),
+        "winupdate" or "winupdate_cab" => WinUpdate.InstallScript($@"C:\Windows\ADmiral\0123456789ab\admiral-0123456789ab-wu.{(name == "winupdate" ? "msu" : "cab")}",
+            "KB5043080", "10.0.26100", new Dictionary<string, string> { [WinUpdate.ProgressSuffix] = @"C:\r\p.txt", ["-dism.txt"] = @"C:\r\d.txt", ["-dism.log"] = @"C:\r\d.log" },
+            "r", "o", "t"),
+        "message" => Chain.MessageScript(@"C:\r\admiral-0123456789ab-user.txt", 60, "r", "o", "t"),
         _ => Collector.Script(name),
     };
 

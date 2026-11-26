@@ -34,7 +34,8 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
   const waitTitle = (text) => p.waitForFunction((t) => document.querySelector("#cwin-title").textContent.includes(t), text, { timeout: 10000 });
 
   await p.goto(url);
-  await p.waitForSelector(".tn[data-node='all']");
+  // the app opens on the Overview (its own rail item, above Inventory)
+  await p.waitForSelector(".rail-it[data-sec='overview'].on");
 
   await step("token removed from address bar", async () => check(!p.url().includes("token="), "token still in URL"));
   await step("hungarian by default", async () => {
@@ -42,10 +43,14 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     check((await p.textContent("[data-tb='adsync']")).includes("AD beolvasás"), "AD import label");
   });
   await step("welcome tiles", async () => {
+    check((await p.locator(".tn[data-node='welcome']").count()) === 0, "overview still in the device tree");
     await p.waitForSelector(".tile");
     check((await p.locator(".tile").count()) >= 8, "tiles missing");
     await p.click(".tile[data-node='b:online']");
     check((await p.getAttribute(".tn.sel", "data-node")) === "b:online", "tile did not open collection");
+    check((await p.locator("[data-tb='settings']").count()) === 0, "settings still in the device toolbar");
+    check((await p.locator(".rail-it[data-sec='message']").count()) === 1, "send message missing from the Tools rail");
+    check((await p.locator(".rail-it[data-rail='discord']").count()) === 0, "discord still in the rail");
   });
   await step("all computers grid + sort", async () => {
     await p.click(".tn[data-node='all']");

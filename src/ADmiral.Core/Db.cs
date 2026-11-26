@@ -587,18 +587,57 @@ public sealed class Store : IDisposable
             + "WHERE guid = ?", ip, online, Db.ToJson(ports), Db.UtcNow(), online, guid));
     }
 
-    /// <summary>Union of the stored logon events and <paramref name="rows"/> (newest first, no duplicates, capped).
-    /// Runs inside the caller's transaction.</summary>
+    /// <summary>How long logon events are kept (days; logins.retention_days). Older ones are dropped when a computer's
+    /// history is written, and by <see cref="PruneLogons"/>.</summary>
+    public int LogonRetentionDays { get; set; } = 60;
+
+    /// <summary>The oldest logon time still kept (UTC ISO, compared as text like the stored times).</summary>
+    private string LogonCutoff() => Db.FormatUtc(DateTimeOffset.UtcNow.AddDays(-Math.Max(1, LogonRetentionDays)));
+
+    /// <summary>Union of the stored logon events and <paramref name="rows"/> (newest first, no duplicates, capped, none
+    /// older than the retention). Runs inside the caller's transaction.</summary>
     private void MergeLogons(string guid, IEnumerable<JsonNode?> rows)
     {
         var old = Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'logons' ORDER BY pos", guid)
             .Select(r => ParseJson(r["data"]));
         // local accounts of the computer are not kept (also cleans what an older version stored)
         var name = Query("SELECT name FROM computers WHERE guid = ?", guid).Select(r => r["name"] as string).FirstOrDefault();
-        var merged = CollectorModel.CleanLogons(rows.Concat(old), name);
+        var cutoff = LogonCutoff();
+        var merged = CollectorModel.CleanLogons(rows.Concat(old), name).Where(e => KeepLogon(e, cutoff)).ToList();
         Execute("DELETE FROM computer_items WHERE guid = ? AND kind = 'logons'", guid);
         for (var i = 0; i < merged.Count; i++)
             Execute("INSERT INTO computer_items (guid, kind, pos, data) VALUES (?, 'logons', ?, ?)", guid, i, merged[i].ToJsonString());
+    }
+
+    private static bool KeepLogon(JsonObject e, string cutoff) =>
+        Db.ParseIso(e["time"]?.GetValue<string>()) is not { } t || t >= Db.ParseIso(cutoff)!.Value;
+
+    /// <summary>Drop the logon events older than the retention from every computer. Returns how many were dropped.</summary>
+    public int PruneLogons() => InTx(() =>
+    {
+        var cutoff = LogonCutoff();
+        var drop = Query("SELECT rowid AS id, data FROM computer_items WHERE kind = 'logons'")
+            .Where(r => !KeepLogon(ParseObject(r["data"]), cutoff)).Select(r => (long)r["id"]!).ToList();
+        foreach (var id in drop) Execute("DELETE FROM computer_items WHERE rowid = ?", id);
+        if (drop.Count > 0) Bump();
+        return drop.Count;
+    });
+
+    /// <summary>A logon event for the user logged on at collection time (<c>DOMAIN\user</c>), at most one per user and
+    /// computer a day. Null when there is nothing to add.</summary>
+    private JsonObject? CurrentUserLogon(string guid, string? loggedOn, DateTimeOffset now)
+    {
+        var raw = (loggedOn ?? "").Trim();
+        var cut = raw.IndexOf('\\');
+        if (cut <= 0 || cut == raw.Length - 1) return null;
+        var (domain, user) = (raw[..cut], raw[(cut + 1)..]);
+        var day = Db.FormatUtc(now)[..10];
+        var already = Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'logons'", guid)
+            .Select(r => ParseObject(r["data"]))
+            .Any(e => string.Equals(e["user"]?.GetValue<string>(), user, StringComparison.OrdinalIgnoreCase)
+                      && string.Equals(e["domain"]?.GetValue<string>(), domain, StringComparison.OrdinalIgnoreCase)
+                      && (e["time"]?.GetValue<string>() ?? "").StartsWith(day, StringComparison.Ordinal));
+        return already ? null : new JsonObject { ["time"] = Db.FormatUtc(now), ["user"] = user, ["domain"] = domain, ["type"] = 2, ["ip"] = "" };
     }
 
     /// <summary>Add logon events (from the login-tracking files) to a computer's history.</summary>
@@ -641,6 +680,10 @@ public sealed class Store : IDisposable
                 : partial ? Text(sectionErrors) : null;
             Execute("UPDATE computers SET inventory = ?, collected_at = ?, last_scan_attempt = ?, collect_error = ?, "
                     + "scan_status = ? WHERE guid = ?", scalars.ToJsonString(), now, now, errText, partial ? "partial" : "ok", guid);
+            // the user logged on while the computer was scanned goes into the logon history too (once a day)
+            var current = CurrentUserLogon(guid, scalars["logged_on_user"] is JsonValue cu && cu.GetValueKind() == JsonValueKind.String ? cu.GetValue<string>() : null,
+                                           DateTimeOffset.UtcNow);
+            if (current is not null && !inventory.ContainsKey("logons")) MergeLogons(guid, [current]);
             foreach (var kind in Db.ListKinds)
             {
                 if (!inventory.TryGetPropertyValue(kind, out var section)) continue;   // section failed: keep the old rows
@@ -653,6 +696,7 @@ public sealed class Store : IDisposable
                 }
                 if (kind == "logons")
                 {
+                    if (current is not null) list = [.. list, current];
                     MergeLogons(guid, list);                  // event log + login-tracking files: merge, do not replace
                     continue;
                 }

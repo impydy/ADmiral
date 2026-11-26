@@ -14,10 +14,12 @@ const store = {
 
 const S = {
   status: null, computers: [], byGuid: new Map(), fleets: [], tags: [],
-  node: store.get("node", "welcome"), expanded: new Set(store.get("expanded", ["ad", "my"])),
+  node: store.get("node", "all"), expanded: new Set(store.get("expanded", ["ad", "my"])),
   sel: new Set(), anchor: null, filter: "", treeFilter: "", sort: store.get("sort", { key: "name", dir: 1 }),
-  list: [], cols: store.get("cols", null), job: null, cw: null, theme: "system", section: store.get("section", "devices"),
+  list: [], cols: store.get("cols", null), job: null, cw: null, theme: "system", section: store.get("section", "overview"),
 };
+// the overview moved from the device tree to its own item in the rail
+if (S.node === "welcome") { S.node = "all"; S.section = "overview"; }
 // the Collection Library starts collapsed; close it once also for trees saved while it was open by default
 if (!store.get("lib_closed_v1", false)) { S.expanded.delete("lib"); store.set("expanded", [...S.expanded]); store.set("lib_closed_v1", true); }
 
@@ -205,7 +207,6 @@ function buildTree() {
   const C = S.computers;
   const count = (fn) => C.filter(fn).length;
   const nodes = [
-    { id: "welcome", label: t("tree.welcome"), icon: "home" },
     { id: "all", label: t("tree.all"), icon: "computers", count: C.length },
     {
       id: "lib", label: t("tree.library"), icon: "library", children: [
@@ -507,15 +508,16 @@ function pageHead(iconName, title, sub, buttons) {
 /* ================================================================== navigation rail */
 const RAIL = [
   ["rail.inventory", [["devices", "computers"], ["users", "users"], ["printers", "printer"], ["-"], ["software", "apps"], ["vulns", "shield"], ["winupdates", "patch"]]],
-  ["rail.actions", [["deployments", "rocket"], ["packages", "package"]]],
-  ["rail.tools", [["remote", "ra"], ["reports", "report", true], ["scanners", "scan", true]]],
+  ["rail.actions", [["deployments", "rocket"], ["chains", "package"], ["packages", "library"]]],
+  ["rail.tools", [["remote", "ra"], ["message", "message"]]],
 ];
 
 function renderRail() {
   $("#rail").innerHTML = `<div class="rail-brand"><img src="/static/favicon.svg" width="24" height="24" alt=""><span>ADmiral</span></div>`
+    + `<div class="rail-sep"></div><div class="rail-it${S.section === "overview" ? " on" : ""}" data-sec="overview" role="button">${icon("home", 18)}<span>${esc(t("nav.overview"))}</span></div>`
     + RAIL.map(([sec, items]) => `<div class="rail-sec">${esc(t(sec))}</div>` + items.map(([id, ic, soon]) => id === "-" ? `<div class="rail-sep"></div>` :
       `<div class="rail-it${S.section === id ? " on" : ""}${soon ? " soon" : ""}" ${soon ? `title="${esc(t("rail.soon"))}"` : `data-sec="${id}"`} role="button">${icon(ic, 18)}<span>${esc(t("nav." + id))}</span></div>`).join("")).join("")
-    + `<div class="rail-grow"></div><div class="rail-it" data-rail="discord" role="button">${icon("discord", 18)}<span>${esc(t("nav.discord"))}</span></div>`
+    + `<div class="rail-grow"></div>`
     + `<div class="rail-it" data-rail="support" role="button">${icon("coffee", 18)}<span>${esc(t("nav.support"))}</span></div>`
     + `<div class="rail-it" data-sec="settings" role="button">${icon("settings", 18)}<span>${esc(t("nav.settings"))}</span></div>`;
 }
@@ -545,12 +547,14 @@ function renderPage() {
   if (S.section === "users") return renderUsersPage(el);
   if (S.section === "printers") return renderPrintersPage(el);
   if (S.section === "packages") return renderPackagesPage(el);
+  if (S.section === "chains") return renderChainsPage(el);
   if (S.section === "deployments") return renderDeploymentsPage(el);
   if (S.section === "remote") return renderRemotePage(el);
   if (S.section === "settings") return renderSettings(el);
   if (S.section === "winupdates") return renderWinUpdatesPage(el);
+  if (S.section === "overview") return renderWelcome(el);
+  if (S.section === "message") return renderMessagePage(el);
   const id = S.node;
-  if (id === "welcome") return renderWelcome(el);
   if (id === "log") return renderLog(el);
   if (["lib", "my", "tags", "os", "hw", "upd"].includes(id)) return renderCollectionList(el, id);
   const node = findNode(S.treeNodes || buildTree(), id);
@@ -608,6 +612,7 @@ function renderWelcome(el) {
   updateStatus();
   guard(async () => {
     const s = await api("GET", "/api/summary");
+    if (!$("#welcome")) return;                       // the page was left meanwhile
     const tile = (n, label, node) => `<div class="tile" data-node="${esc(node)}"><div class="n">${esc(n)}</div><div class="l">${esc(label)}</div></div>`;
     const pct = (n) => (s.total ? (n / s.total) * 100 : 0);
     const bars = (items, prefix) => {
@@ -637,6 +642,7 @@ function renderWelcome(el) {
       if (!n) return;
       let id = n.dataset.node;
       if (id.endsWith("/(root)")) id = "ad";
+      setSection("devices", { render: false });
       selectNode(id);
     };
   });
@@ -668,9 +674,21 @@ function updateStatus() {
     const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
     $("#sb-mid").innerHTML = `${esc(t("job." + job.kind))}<span class="meter"><span style="width:${pct}%"></span></span>${esc(job.message || "")}`;
   } else {
-    right.textContent = t("sb.idle");
-    $("#sb-mid").textContent = S.status?.mode === "demo" ? t("sb.demo") : "";
+    right.textContent = S.upload ? t("pk.up.busy") : t("sb.idle");
+    if (S.upload) sbUpload();
+    else $("#sb-mid").textContent = S.status?.mode === "demo" ? t("sb.demo") : "";
   }
+}
+
+/* A file being copied into the package library (packages.js): name, n/total files, percent and bytes, in the
+   middle of the status bar. A running scan job keeps the bar; the copy goes on in the background either way. */
+function sbUpload() {
+  const u = S.upload;
+  if (!u || (S.job && S.job.status === "running")) return;
+  const pct = u.total ? Math.min(100, Math.round((u.sent / u.total) * 100)) : 0;
+  const what = u.phase === "check" ? t("pk.up.check") : tText("pk.up.copy", { i: u.i, n: u.n });
+  $("#sb-mid").innerHTML = `${icon("copy", 14)} ${esc(what)}<span class="meter"><span style="width:${u.phase === "check" ? 100 : pct}%"></span></span>`
+    + `<span class="trunc" style="max-width:280px">${esc(u.name)}</span> ${u.phase === "check" ? "" : esc(`${pct}% · ${pkSize(u.sent)} / ${pkSize(u.total)}`)}`;
 }
 
 function updateToolbar() {
@@ -759,8 +777,7 @@ function renderToolbar() {
   $("#toolbar").innerHTML = b("scan", "scan", "tb.scan", true) + b("adsync", "sync", "tb.ad_sync") + sep
     + b("library", "library", "tb.library") + b("new-coll", "dyn", "tb.new_coll") + sep
     + b("export", "export", "tb.export") + b("group", "group", "tb.group") + sep
-    + b("details", "details", "tb.details") + b("columns", "columns", "m.columns") + b("copy", "copy", "tb.copy") + b("delete", "delete", "tb.delete") + sep
-    + b("settings", "settings", "tb.settings");
+    + b("details", "details", "tb.details") + b("columns", "columns", "m.columns") + b("copy", "copy", "tb.copy") + b("delete", "delete", "tb.delete");
   $$("#toolbar .tb").forEach((btn) => (btn.onclick = (e) => {
     const id = btn.dataset.tb;
     if (id === "scan") {
@@ -776,7 +793,7 @@ function renderToolbar() {
         { label: t("m.ad_sync"), icon: "sync", action: () => adBrowserDialog() },
       ], r.left, r.bottom, btn);
     }
-    const map = { columns: () => columnsDialog(), adsync: () => adBrowserDialog(), library: () => selectNode("lib"), settings: () => setSection("settings") };
+    const map = { columns: () => columnsDialog(), adsync: () => adBrowserDialog(), library: () => selectNode("lib") };
     (map[id] || ACTIONS[id])();
   }));
   updateToolbar();
@@ -977,7 +994,7 @@ async function pollJob(id) {
   S.job = null;
   if (typeof US !== "undefined") US.list = null;          // the Users list may have changed (AD user import)
   await reload();
-  if (S.section === "packages") pkLoad();
+  if (S.section === "packages" || S.section === "chains") pkLoad();
   updateStatus();
   if (S.cw) loadComputer();
 }
@@ -1926,6 +1943,7 @@ function renderSettings(el) {
           <div class="grid2">
             ${inp("lg-path", t("s.lg_path"), cfg.logins.path, 'class="mono" placeholder="\\\\server\\logins$"')}
             ${inp("lg-interval", t("s.lg_interval"), cfg.logins.interval_minutes, 'type="number" min="1" max="1440"')}
+            ${inp("lg-retention", t("s.lg_retention"), cfg.logins.retention_days ?? 60, 'type="number" min="1" max="3650"')}
           </div>
           <div class="faint">${esc(t("s.lg_hint"))}</div>
           ${shareAclBox()}
@@ -1978,6 +1996,8 @@ function renderSettings(el) {
           <div class="faint">${esc(t("s.sy_hint"))}</div>
           <div id="sy-status" class="faint" style="margin:6px 0"></div>
           <div class="chk" style="gap:10px"><button class="btn" id="sy-test" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.sy_test"))}</button><button class="btn" id="sy-run" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.sy_run"))}</button><button class="btn" id="sy-gen" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.sy_gen"))}</button></div>
+          <div class="faint" style="margin-top:8px">${esc(t("s.sy_fw_hint"))}</div>
+          <div class="chk" style="gap:10px"><button class="btn" id="sy-fw" type="button" ${cfg.editable ? "" : "disabled"}>${icon("shield", 14)}${esc(t("s.sy_fw"))}</button><button class="btn" id="sy-fw-save" type="button">${esc(t("s.sy_fw_save"))}</button><span id="sy-fw-out" class="muted"></span></div>
         </div></div>
       <div class="section"><h3>${t("s.diag")}</h3><div class="in">
           <div class="faint">${esc(t("s.diag_hint"))}</div>
@@ -2032,7 +2052,7 @@ function renderSettings(el) {
         collect: { method: v("collect-method"), winrm_fallback: c("collect-fb"), smb_timeout: Number(v("collect-timeout")), response_timeout: Number(v("collect-response")), cleanup_delay: Number(v("collect-delay")) },
         vulns: { enabled: c("vuln-enabled"), refresh_days: Number(v("vuln-days")) },
         filecollect: { inbox: v("off-inbox").trim(), offline_allow_users: c("off-users") },
-        logins: { enabled: c("lg-track"), path: v("lg-path").trim(), interval_minutes: Number(v("lg-interval")) },
+        logins: { enabled: c("lg-track"), path: v("lg-path").trim(), interval_minutes: Number(v("lg-interval")), retention_days: Number(v("lg-retention")) || 60 },
         packages: { folder: v("pk-folder").trim() },
         deploy: { timeout_minutes: Number(v("dep-timeout")) },
         proxy: { url: v("proxy-url").trim(), pac: v("proxy-pac").trim(), user: v("proxy-user").trim(), allow_untrusted_pac: c("proxy-untrusted-pac") },
@@ -2251,6 +2271,20 @@ function renderSettings(el) {
       toast((r.peers || []).filter((p) => p.ok).map((p) => tText("s.sy_test_ok", { host: p.host, version: p.version })).join(" · ")
         + (bad.length ? " · " + bad.map((p) => `${p.peer}: ${p.error}`).join(" · ") : ""), bad.length > 0);
     });
+    // the Windows Firewall rule the sync listener needs (this computer); the script can be saved for another one
+    $("#sy-fw").onclick = () => guard(async () => {
+      await api("PUT", "/api/settings", collect());
+      const sc = await api("GET", "/api/sync/firewall-script");
+      if (!(await confirmDialog(tText("s.sy_fw_confirm", { port: sc.port, net: sc.network })))) return;
+      const r = await api("POST", "/api/sync/firewall");
+      $("#sy-fw-out").textContent = r.message;
+      toast(t("s.sy_fw_ok"));
+    });
+    $("#sy-fw-save").onclick = () => guard(async () => {
+      if (cfg.editable) await api("PUT", "/api/settings", collect());
+      const sc = await api("GET", "/api/sync/firewall-script");
+      saveText(sc.filename, sc.content);
+    });
     $("#sy-run").onclick = () => guard(async () => {
       if (noPeer()) return;
       await api("PUT", "/api/settings", collect());
@@ -2261,6 +2295,7 @@ function renderSettings(el) {
     // ---- retry service (Windows service on this machine)
     const drawSvc = (st) => {
       const box = $("#svc-status"), btns = $("#svc-buttons");
+      if (!box || !btns) return;                         // the settings page was left before the answer came
       if (!st.supported) { box.innerHTML = `<span class="faint">${esc(t("s.svc_unsupported"))}</span>`; btns.innerHTML = ""; return; }
       const label = !st.installed ? t("s.svc_none") : st.running ? t("s.svc_running") : t("s.svc_stopped");
       const cls = !st.installed ? "faint" : st.running ? "st-ok" : "st-warn";
@@ -2382,7 +2417,7 @@ function bindGlobal() {
   bindSoftwareWindows();
   $("#rail").addEventListener("click", (e) => {
     const act = e.target.closest("[data-rail]");
-    if (act) return act.dataset.rail === "discord" ? openUrl(LINK_DISCORD) : supportDialog();
+    if (act) return supportDialog();
     const it = e.target.closest("[data-sec]"); if (it) setSection(it.dataset.sec);
   });
 }
@@ -2404,9 +2439,9 @@ async function boot() {
   applyTheme(S.status.theme);
   bindGlobal();
   await guard(loadAll);
-  if (!findNode(buildTree(), S.node)) S.node = "welcome";
+  if (!findNode(buildTree(), S.node)) S.node = "all";
   renderAll();
-  selectNode(S.node);
+  if (S.section === "devices") selectNode(S.node);     // otherwise renderAll already showed the remembered page (e.g. the overview)
   const running = (S.status.jobs || []).find((j) => j.status === "running");
   if (running) pollJob(running.id);
   // the background check runs shortly after start-up: tell once if a new version was found

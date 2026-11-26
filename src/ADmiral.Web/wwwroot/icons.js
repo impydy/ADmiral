@@ -57,6 +57,7 @@ const ICONS = {
   refresh: `<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3" fill="none" stroke="#16a34a" stroke-width="2.4" stroke-linecap="round"/><path d="M19.8 3.5v4.4h-4.4" fill="none" stroke="#16a34a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>`,
   edit: `<path d="m4 16.5 11-11 3.5 3.5-11 11H4z" fill="#f59e0b"/><path d="m15 5.5 1.8-1.8a1.2 1.2 0 0 1 1.7 0l1.8 1.8a1.2 1.2 0 0 1 0 1.7L18.5 9z" fill="#ef4444"/>`,
   block: `<circle cx="12" cy="12" r="9" fill="none" stroke="#dc2626" stroke-width="2.5"/><path d="m5.8 5.8 12.4 12.4" stroke="#dc2626" stroke-width="2.5"/>`,
+  message: `<path d="M3.5 5.5A2 2 0 0 1 5.5 3.5h13a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H10l-4.5 4v-4h0a2 2 0 0 1-2-2z" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8" stroke-linejoin="round"/><path d="M7.5 8.5h9M7.5 12h6" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round"/>`,
   info: `<circle cx="12" cy="12" r="10" fill="#1d8ce0"/><path d="M12 10.5v6.5" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><circle cx="12" cy="7.2" r="1.4" fill="#fff"/>`,
   warn: `<path d="M12 2.5 22.5 21h-21z" fill="#f59e0b"/><path d="M12 9v5.5" stroke="#fff" stroke-width="2.3" stroke-linecap="round"/><circle cx="12" cy="17.6" r="1.3" fill="#fff"/>`,
   columns: `<rect x="3" y="4" width="18" height="16" rx="1.5" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/><path d="M9 4v16M15 4v16" stroke="#64748b" stroke-width="1.5"/><rect x="3" y="4" width="18" height="4" fill="#64748b"/>`,

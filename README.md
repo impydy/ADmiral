@@ -20,6 +20,8 @@ The UI speaks Hungarian and English.
 - **Windows updates** - which machines are behind on Microsoft's monthly security releases.
 - **Deployments** - push an `.msi` or `.exe` from your package library to a selection of machines and watch the
   results come in. Failed ones can be retried with one click.
+- **Packages** - installation chains (install, copy, restart, wait, message the users, scripts ...) built from the
+  package library's files, and Windows updates (`.msu`) per Windows build, checked against the Update Catalog.
 - **Printers** - poll network printers over SNMP for toner levels and page counts, with a simple forecast.
 - **Users** - AD users and where they've logged on.
 - **Offline computers** - machines that can't be reached directly can drop their inventory into a shared folder

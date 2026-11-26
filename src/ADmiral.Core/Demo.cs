@@ -397,7 +397,12 @@ public static class Demo
         var rel = DateTimeOffset.UtcNow.AddDays(-20).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         var builds = new[] { "10.0.22631", "10.0.26100", "10.0.19045", "10.0.19044", "10.0.20348", "10.0.17763", "10.0.14393" }
             .ToDictionary(k => k, _ => new UpdateRef(2800, "demo", rel));
-        return new UpdateReferenceData(builds, ["demo"]);
+        var kbs = new Dictionary<string, string>
+        {
+            ["10.0.26100"] = "KB5072033", ["10.0.22631"] = "KB5072035", ["10.0.19045"] = "KB5071546", ["10.0.19044"] = "KB5071546",
+            ["10.0.20348"] = "KB5071547", ["10.0.17763"] = "KB5071544", ["10.0.14393"] = "KB5071543",
+        };
+        return new UpdateReferenceData(builds, ["demo"]) { Kbs = kbs };
     }
 
     /// <summary>The demo CVEs that are on CISA's known-exploited list.</summary>
@@ -428,6 +433,20 @@ public static class Demo
     // ------------------------------------------------------------------ deployment
     /// <summary>Stands in for the real copy + install (a few seconds per computer, about one in seven fails).
     /// <paramref name="delayScale"/> scales the pauses (0 = none; tests).</summary>
+    /// <summary>A Windows Update Catalog stand-in: one entry, whose file has the given hashes (so the demo check succeeds).</summary>
+    public static Func<string, IReadOnlyDictionary<string, string>?, string> CatalogFetch(string sha1Hex, string sha256Hex) => (url, form) =>
+    {
+        const string id = "00000000-0000-4000-8000-000000000001";
+        if (form is null)
+            return $"<a id='{id}_link' href=\"javascript:void(0);\">Demo Cumulative Update for Windows 11 (demo)</a>";
+        var b1 = Convert.ToBase64String(Convert.FromHexString(sha1Hex));
+        var b2 = Convert.ToBase64String(Convert.FromHexString(sha256Hex));
+        return "downloadInformation[0].enTitle ='Demo Cumulative Update for Windows 11 (demo)';\n" +
+               $"downloadInformation[0].files[0].url = 'https://catalog.example/demo_{sha1Hex}.msu';\n" +
+               $"downloadInformation[0].files[0].digest = '{b1}';\ndownloadInformation[0].files[0].sha256 = '{b2}';\n" +
+               $"downloadInformation[0].files[0].fileName = 'demo_{sha1Hex}.msu';\n";
+    };
+
     public static DeployResult Deploy(string host, string localFile, string kind, string args, Action<string, int?> onStep, double delayScale = 1.0)
     {
         void Sleep(double s)

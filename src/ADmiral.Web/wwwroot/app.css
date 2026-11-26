@@ -495,3 +495,14 @@ table.grid th.ts-th:hover { background: var(--head-hover); }
   #print-root .empty { padding: 10px 0; color: #555; }
   #print-root svg { width: 12px; height: 12px; }
 }
+
+/* package library: Windows update groups (one per Windows build); packages page: the steps of an opened package */
+.grid tr.pk-group td { background: var(--panel); border-top: 1px solid var(--border-soft); padding-top: 6px; padding-bottom: 6px; }
+.grid tr.pk-group td svg { vertical-align: -3px; margin-right: 6px; }
+.ch-view { display: flex; align-items: center; gap: 6px; padding: 3px 0; flex-wrap: wrap; }
+.ch-view .ch-num { min-width: 22px; padding-top: 0; }
+.ch-caret { display: inline-block; width: 14px; color: var(--muted); }
+/* Send message page (Tools) */
+.msg-page { display: flex; flex-direction: column; gap: 8px; padding: 4px 10px 12px; overflow: auto; min-height: 0; max-width: 900px; }
+.msg-list { max-height: 260px; overflow: auto; border: 1px solid var(--border-soft); }
+.msg-list .chk { display: flex; padding: 2px 8px; }

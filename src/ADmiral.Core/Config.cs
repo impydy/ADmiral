@@ -148,6 +148,8 @@ public sealed class LoginSettings
     [JsonPropertyName("path")] public string Path { get; set; } = "";
     /// <summary>how often the folder is read; the files are deleted after reading</summary>
     [JsonPropertyName("interval_minutes")] public int IntervalMinutes { get; set; } = 5;
+    /// <summary>how long the logon history is kept (days); older events are dropped</summary>
+    [JsonPropertyName("retention_days")] public int RetentionDays { get; set; } = 60;
 }
 
 /// <summary>Inventory files delivered by computers that cannot reach this machine (ADmiral-Collect.ps1).</summary>
@@ -266,7 +268,7 @@ public static class Config
         ["proxy"] = ["url", "pac", "user", "allow_untrusted_pac"],
         ["updates"] = ["enabled", "refresh_hours", "grace_days"],
         ["appupdate"] = ["enabled", "use_proxy"],
-        ["logins"] = ["enabled", "path", "interval_minutes"],
+        ["logins"] = ["enabled", "path", "interval_minutes", "retention_days"],
         ["filecollect"] = ["inbox", "offline_allow_users"],
         ["vulns"] = ["enabled", "refresh_days"],
         ["packages"] = ["folder"],
@@ -505,6 +507,7 @@ public static class Config
         Check(settings.Vulns.RefreshDays is >= 1 and <= 90, "vulns.refresh_days must be between 1 and 90");
         Check(settings.Deploy.TimeoutMinutes is >= 1 and <= 1440, "deploy.timeout_minutes must be between 1 and 1440");
         Check(settings.Logins.IntervalMinutes is >= 1 and <= 1440, "logins.interval_minutes must be between 1 and 1440");
+        Check(settings.Logins.RetentionDays is >= 1 and <= 3650, "logins.retention_days must be between 1 and 3650");
         var sy = settings.Sync;
         Check(sy.Port is >= 1 and <= 65535, "sync.port must be between 1 and 65535");
         Check(sy.IntervalMinutes is >= 0 and <= 1440, "sync.interval_minutes must be between 0 and 1440");
@@ -595,6 +598,7 @@ public static class Config
         enabled = false
         path = ""                # shared folder the GPO startup script (ADmiral-Logins.ps1) writes the log files to
         interval_minutes = 5     # how often ADmiral reads (and deletes) the files
+        retention_days = 60      # how long the logon history is kept (older events are dropped)
 
         [proxy]
         # Only needed when this machine reaches the internet (Microsoft security-update data) through a proxy.

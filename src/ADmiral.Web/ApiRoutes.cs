@@ -16,7 +16,7 @@ namespace ADmiral.Web;
 public static partial class WebApp
 {
     private static readonly string[] JobKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "scan", "collect", "full"];
-    private static readonly string[] NonScanKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "deploy"];
+    private static readonly string[] NonScanKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "deploy", "wuinstall", "message"];
     private static readonly string[] ServiceActions = ["install", "enable", "disable", "delete"];
     private static readonly string[] FleetKinds = ["static", "dynamic"];
     private static readonly string[] PrinterFields =
@@ -249,7 +249,10 @@ public static partial class WebApp
             SetBodyLimit(ctx, PackageLibrary.MaxUploadBytes);
             var id = QueryStr(ctx, "id");
             var name = QueryStr(ctx, "name");
-            using var up = a.UploadPackage(id, name, QueryStr(ctx, "version", ""), QueryStr(ctx, "title", ""), QueryStr(ctx, "sha256", ""));
+            // kind=winupdate: a Windows update for one build (os_build, kb, version = the build version it brings, digest)
+            using var up = QueryStr(ctx, "kind", "") == "winupdate"
+                ? a.UploadWinUpdate(QueryStr(ctx, "os_build"), QueryStr(ctx, "kb"), QueryStr(ctx, "version"), name, QueryStr(ctx, "digest", ""))
+                : a.UploadPackage(id, name, QueryStr(ctx, "version", ""), QueryStr(ctx, "title", ""), QueryStr(ctx, "sha256", ""));
             var buf = new byte[256 * 1024];
             try
             {
@@ -284,7 +287,14 @@ public static partial class WebApp
         app.MapPost("/api/packages-new", async (HttpContext ctx) =>
         {
             var b = await JsonBody.ReadAsync(ctx);
-            return J(a.PackageCreate(b.Str("id"), b.Str("name", ""), b.Str("version", ""), b.Str("publisher", "")), 201);
+            var kind = b.Str("kind", "");
+            if (kind is not ("" or "chain")) throw new ArgumentException($"Not a package kind: '{kind}'");
+            return J(a.PackageCreate(b.Str("id"), b.Str("name", ""), b.Str("version", ""), b.Str("publisher", ""), kind.Length > 0 ? kind : null), 201);
+        });
+        app.MapPost("/api/packages-catalog", async (HttpContext ctx) =>
+        {
+            var b = await JsonBody.ReadAsync(ctx);
+            return J(a.PackageCatalogCheck(b.Str("id"), b.Str("file")));
         });
         app.MapPost("/api/packages-steps", async (HttpContext ctx) =>
         {
@@ -408,6 +418,19 @@ public static partial class WebApp
         // ----------------------------------------------------------------- sync, retry service, AD browser
         app.MapGet("/api/sync", () => J(a.Sync.Status()));
         app.MapPost("/api/sync/test", () => J(a.Sync.Test()));
+        app.MapGet("/api/sync/firewall-script", () => J(a.FirewallScript()));
+        app.MapPost("/api/sync/firewall", () =>
+        {
+            // changes this computer's firewall: only where the settings are editable (the desktop app), not in server mode
+            if (a.ConfigPath is null) throw new ArgumentException(I18n.T("err.firewall_readonly"));
+            return J(a.FirewallApply());
+        });
+        app.MapPost("/api/messages", async (HttpContext ctx) =>
+        {
+            // a message to the users of computers: {ids, fleet_ids, text, seconds}
+            var b = await JsonBody.ReadAsync(ctx);
+            return J(a.SendMessage(b.StrListOr("ids"), b.OptLongList("fleet_ids") ?? [], b.Str("text"), (int?)b.OptLong("seconds")), 202);
+        });
         app.MapGet("/api/retry-service", () => J(a.RetryServiceAction()));
         app.MapPost("/api/retry-service", async (HttpContext ctx) =>
         {

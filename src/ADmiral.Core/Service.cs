@@ -147,6 +147,8 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Settings = settings;
         _applyProcessSettings = applyProcessSettings;
         Store = store ?? new Store(settings.DbPath);
+        Store.LogonRetentionDays = settings.Logins.RetentionDays;
+        Store.PruneLogons();                                                 // the history is kept for logins.retention_days
         Directory = directory ?? MakeDirectory(settings);
         ConfigPath = configPath;
         Secrets = secrets ?? new SecretStore(null);
@@ -352,7 +354,10 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Persist.SaveSettings(next, ConfigPath);
         var modeChanged = next.Mode != Settings.Mode;
         var directoryChanged = modeChanged || Fingerprint(next.Ldap) != Fingerprint(Settings.Ldap);
+        var retentionChanged = next.Logins.RetentionDays != Settings.Logins.RetentionDays;
         Settings = next;
+        Store.LogonRetentionDays = next.Logins.RetentionDays;
+        if (retentionChanged) Store.PruneLogons();
         ApplyProcessSettings(next);
         if (directoryChanged) Directory = MakeDirectory(next);
         ReconfigureSync();
@@ -758,9 +763,51 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
 
     public PackageEntry PackageVendorCheck(string pkgId, string path, string sha256)
     {
-        var entry = Pkg(() => Library().CheckVendorHash(pkgId, path, sha256));
-        Store.Log("packages", T("log.pkg_vendor", ("id", pkgId), ("file", path)));
+        var lib = Library();
+        var wu = Pkg(() => lib.Get(pkgId))?.Kind == "winupdate";
+        var entry = Pkg(() => lib.CheckVendorHash(pkgId, path, sha256, wu ? "catalog" : "vendor"));
+        Store.Log("packages", T(wu ? "log.pkg_catalog" : "log.pkg_vendor", ("id", pkgId), ("file", path)));
         return entry;
+    }
+
+    /// <summary>Start an upload of a Windows update (.msu / .cab) for one Windows build (see <see cref="PackageLibrary.UploadWinUpdate"/>).</summary>
+    public PackageUpload UploadWinUpdate(string osBuild, string kb, string version, string filename, string digest = "")
+    {
+        var up = Pkg(() => Library().UploadWinUpdate(osBuild, kb, version, filename, digest));
+        Store.Log("packages", T("log.wu_upload", ("kb", kb), ("build", osBuild), ("file", filename)));
+        return up;
+    }
+
+    /// <summary>Replaces the Windows Update Catalog requests (tests / demo): (url, form or null) -> body.</summary>
+    internal Func<string, IReadOnlyDictionary<string, string>?, string>? CatalogFetch { get; set; }
+
+    /// <summary>Look a stored Windows update up in the Windows Update Catalog (through the proxy): the file counts as
+    /// checked when the catalog lists a file of its KB with the same SHA-1 / SHA-256. Returns {ok, title, file, url}.</summary>
+    public Row PackageCatalogCheck(string pkgId, string path)
+    {
+        var lib = Library();
+        var pkg = Pkg(() => lib.Get(pkgId)) ?? throw new ArgumentException($"{pkgId} is not in the library.");
+        if (pkg.Kind != "winupdate" || pkg.Kb is null) throw new ArgumentException(T("err.wu_not_update"));
+        var rec = pkg.Files.FirstOrDefault(f => f.Path == path) ?? throw new ArgumentException($"{pkgId}: no such file in the package.");
+        var local = Pkg(() => lib.File(rec.Path));
+        if (!File.Exists(local)) throw new ArgumentException($"{rec.Path} is missing from the library.");
+        var (sha256, sha1) = PackageLibrary.HashesFile(local);
+        if (sha256 != rec.Sha256) throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
+        CatalogMatch m;
+        try
+        {
+            var fetch = CatalogFetch ?? (IsDemo ? Demo.CatalogFetch(sha1, sha256) : Updates.MakeTextFetcher(Settings.Proxy));
+            m = WinUpdate.CatalogLookup(pkg.Kb, sha1, sha256, fetch);
+        }
+        catch (Exception exc) when (exc is HttpRequestException or IOException or TaskCanceledException or OperationCanceledException
+                                        or InvalidOperationException or PacError or UriFormatException)
+        {
+            throw new ArgumentException(T("err.catalog_fetch", ("err", Updates.ExplainError(exc))), exc);
+        }
+        if (!m.Found) throw new ArgumentException(T("err.catalog_none", ("kb", pkg.Kb), ("n", m.Searched)));
+        Pkg(() => lib.CheckVendorHash(pkgId, path, sha1, "catalog", m.Title));
+        Store.Log("packages", T("log.pkg_catalog", ("id", pkgId), ("file", path)));
+        return new Row { ["ok"] = true, ["title"] = m.Title, ["file"] = m.FileName, ["url"] = m.Url };
     }
 
     public PackageEntry PackageRemoveFile(string pkgId, string path)
@@ -823,6 +870,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                                long? retryOf = null)
     {
         if (names is null || names.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
+        if (WinUpdate.IsUpdateFile(file)) return StartWinUpdateDeployment(packageId, file, names, timeoutSeconds, retryOf);
         var timeout = timeoutSeconds is > 0 ? timeoutSeconds.Value : Settings.Deploy.TimeoutMinutes * 60;
         var lib = Library();
         var pkg = Pkg(() => lib.Get(packageId)) ?? throw new ArgumentException($"{packageId} is not in the library.");
@@ -993,9 +1041,9 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
 
     // ------------------------------------------------------------------ package chains
     /// <summary>A new package without files: its chain is put together afterwards.</summary>
-    public PackageEntry PackageCreate(string pkgId, string name, string version = "", string publisher = "")
+    public PackageEntry PackageCreate(string pkgId, string name, string version = "", string publisher = "", string? kind = null)
     {
-        var e = Pkg(() => Library().Create(pkgId, name, version, publisher));
+        var e = Pkg(() => Library().Create(pkgId, name, version, publisher, kind));
         Store.Log("packages", T("log.pkg_create", ("id", e.Id)));
         return e;
     }
@@ -1015,20 +1063,47 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     public Row StartChainDeployment(string packageId, IReadOnlyList<string> names, int? timeoutSeconds = null, long? retryOf = null)
     {
         if (names is null || names.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
-        var timeout = timeoutSeconds is > 0 ? timeoutSeconds.Value : Settings.Deploy.TimeoutMinutes * 60;
         var lib = Library();
-        var pkg = Pkg(() => lib.Get(packageId)) ?? throw new ArgumentException($"{packageId} is not in the library.");
-        var steps = Chain.ValidateSteps(pkg, pkg.Steps);                     // checked again: the register may have changed
+        var data = Pkg(lib.Load);
+        var pkg = data.Packages.FirstOrDefault(p => string.Equals(p.Id, packageId, StringComparison.OrdinalIgnoreCase))
+                  ?? throw new ArgumentException($"{packageId} is not in the library.");
+        var steps = Chain.ValidateSteps(pkg, pkg.Steps, data.Packages);     // checked again: the register may have changed
         if (steps.Count == 0) throw new ArgumentException(T("err.chain_empty"));
+        return StartChainRun(lib, data, pkg, steps, names, timeoutSeconds, retryOf, single: null);
+    }
+
+    /// <summary>Install one Windows update (.msu / .cab) of the library on the computers: a one-step chain with the
+    /// Windows update flow (<see cref="WinUpdate"/>), in its own job ("wuinstall"), so a long update installation does not
+    /// hold up other deployments. Returns {id, job}.</summary>
+    public Row StartWinUpdateDeployment(string packageId, string file, IReadOnlyList<string> names, int? timeoutSeconds = null, long? retryOf = null)
+    {
+        if (names is null || names.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
+        var lib = Library();
+        var data = Pkg(lib.Load);
+        var pkg = data.Packages.FirstOrDefault(p => string.Equals(p.Id, packageId, StringComparison.OrdinalIgnoreCase))
+                  ?? throw new ArgumentException($"{packageId} is not in the library.");
+        if (pkg.Files.All(f => f.Path != file) || !WinUpdate.IsUpdateFile(file)) throw new ArgumentException(T("err.dep_file"));
+        var steps = Chain.ValidateSteps(pkg, [new PackageStep { Type = "install", File = file }]);
+        return StartChainRun(lib, data, pkg, steps, names, timeoutSeconds, retryOf, single: file);
+    }
+
+    /// <summary>A file a chain sends: the local copy, its registered SHA-256 and - for a Windows update - its KB / build.</summary>
+    private sealed record ChainFile(string Local, string Sha, string? Kb, string? OsBuild);
+
+    private Row StartChainRun(PackageLibrary lib, PackageManifest data, PackageEntry pkg, List<PackageStep> steps, IReadOnlyList<string> names,
+                              int? timeoutSeconds, long? retryOf, string? single)
+    {
+        var timeout = timeoutSeconds is > 0 ? timeoutSeconds.Value : Settings.Deploy.TimeoutMinutes * 60;
         // every file the chain sends: present and unchanged before anything starts
-        var files = new Dictionary<string, (string Local, string Sha)>();
+        var files = new Dictionary<string, ChainFile>();
         foreach (var s in steps.Where(s => s.File is not null))
         {
-            var rec = pkg.Files.First(f => f.Path == s.File);
+            var rec = Chain.FindFile(pkg, data.Packages, s.File)!;
+            var owner = data.Packages.FirstOrDefault(p => p.Files.Contains(rec)) ?? pkg;
             var local = Pkg(() => lib.File(rec.Path));
             if (!File.Exists(local) || !string.Equals(PackageLibrary.Sha256File(local), rec.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
-            files[rec.Path] = (local, rec.Sha256);
+            files[rec.Path] = new ChainFile(local, rec.Sha256, owner.Kind == "winupdate" ? owner.Kb : null, owner.Kind == "winupdate" ? owner.OsBuild : null);
         }
         var guids = Store.ResolveNames(names);
         var comps = Computers().ToDictionary(c => (string)c["guid"]!);
@@ -1037,29 +1112,35 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         var targets = guids.Distinct().Where(g => comps.ContainsKey(g) && !unconfirmed.Contains(g)).Select(g => (g, Str(comps[g]["name"]))).ToList();
         if (targets.Count == 0 && refused.Count > 0)
             throw new ArgumentException($"Not confirmed by this instance's AD sync yet (received from a sync peer): {string.Join(", ", refused)}");
-        var summary = string.Join(" → ", steps.Select(s => s.Type));
-        var dep = Store.CreateDeployment(pkg.Id, pkg.Name, pkg.Version, "", "chain", summary, targets);
+        var wu = steps.Any(s => s.Type == "install" && WinUpdate.IsUpdateFile(s.File));
+        var dep = single is not null
+            ? Store.CreateDeployment(pkg.Id, pkg.Name, pkg.Version, single, "msu", "", targets)
+            : Store.CreateDeployment(pkg.Id, pkg.Name, pkg.Version, "", "chain", string.Join(" → ", steps.Select(s => s.Type)), targets);
         Store.Log("deploy", T("log.dep_start", ("id", dep), ("pkg", pkg.Id), ("n", targets.Count)));
         void Ev(string msg) => Store.AddDeploymentEvent(dep, msg);
-        Ev($"Deployment #{dep} started (chain of {steps.Count} steps)" + (retryOf is { } r ? $" (repeat of #{r}, failed computers only)" : ""));
-        Ev($"Package: {(pkg.Name.Length > 0 ? pkg.Name : pkg.Id)} ({pkg.Id}) version {(pkg.Version.Length > 0 ? pkg.Version : "-")}");
+        Ev($"Deployment #{dep} started" + (single is not null ? " (Windows update)" : $" (chain of {steps.Count} steps)")
+           + (retryOf is { } r ? $" (repeat of #{r}, failed computers only)" : ""));
+        Ev($"Package: {(pkg.Name.Length > 0 ? pkg.Name : pkg.Id)} ({pkg.Id}) version {(pkg.Version.Length > 0 ? pkg.Version : "-")}"
+           + (pkg.Kind == "winupdate" ? $", Windows build {pkg.OsBuild}" : ""));
         for (var i = 0; i < steps.Count; i++) Ev($"Step {i + 1}: {Chain.Describe(steps[i])}");
-        foreach (var (path, (_, sha)) in files) Ev($"File: {path}, SHA-256 {sha} (re-checked before sending)");
-        Ev($"Timeout per step: {timeout} s");
-        Ev(ChainFingerprintPrefix + ChainFingerprint(steps));
+        foreach (var (path, f) in files) Ev($"File: {path}, SHA-256 {f.Sha} (re-checked before sending)" + (f.Kb is not null ? $", {f.Kb} for {f.OsBuild}" : ""));
+        Ev($"Timeout per step: {timeout} s" + (wu ? $" (a Windows update step: at least {WinUpdate.MinTimeoutSeconds} s)" : ""));
+        if (single is null) Ev(ChainFingerprintPrefix + ChainFingerprint(steps));
         Ev($"Targets ({targets.Count}): " + string.Join(", ", targets.Select(t => t.Item2)));
         if (refused.Count > 0)
             Ev($"Skipped ({refused.Count}, received from a sync peer and not yet confirmed by this instance's AD sync): " + string.Join(", ", refused));
         JobInfo job;
         try
         {
-            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, () => RunChain(dep, steps, files, timeout, p)));
+            // a Windows update runs long: its own job kind, so it does not block the other deployments
+            job = Jobs.Start(wu ? "wuinstall" : "deploy", wu ? "wuinstall" : "deploy", p => RunDeploymentSafe(dep, () => RunChain(dep, steps, files, timeout, p)));
         }
         catch (Exception)
         {
+            var why = wu ? "not started: another Windows update installation is running" : "not started: another deployment is running";
             foreach (var (g, _) in targets)
-                UpdateTarget(dep, g, ("step", "done"), ("outcome", "failed"), ("error", "not started: another deployment is running"));
-            Ev("Not started: another deployment is running");
+                UpdateTarget(dep, g, ("step", "done"), ("outcome", "failed"), ("error", why));
+            Ev(char.ToUpperInvariant(why[0]) + why[1..]);
             Store.FinishDeployment(dep);
             throw;
         }
@@ -1111,7 +1192,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                 for (var k = 0; k < 3; k++) udp.Send(packet, packet.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Parse(a), port));
     }
 
-    private Row RunChain(long dep, List<PackageStep> steps, Dictionary<string, (string Local, string Sha)> files, int timeout, Progress progress)
+    private Row RunChain(long dep, List<PackageStep> steps, Dictionary<string, ChainFile> files, int timeout, Progress progress)
     {
         var d = Store.Deployment(dep)!;
         var targets = ((List<Row>)d["targets"]!).ToDictionary(t => (string)t["guid"]!);
@@ -1155,8 +1236,36 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                 "copy" => new RemoteRunResult(0, "", $"Copied to {s.Path}\\{Path.GetFileName(s.File)}", 1),
                 "delete" => new RemoteRunResult(0, "", $"Deleted {s.Path}", 0),
                 "reboot" or "shutdown" => new RemoteRunResult(0, "", "", 0),
+                "message" => new RemoteRunResult(0, "", "demo: shown in 1 session(s)", 0),
                 _ => new RemoteRunResult(0, "", $"demo: {s.Type} ran ({(s.Script ?? "").Split('\n').Length} line(s))", 1),
             };
+        }
+
+        // a Windows update as a demo: the progress file grows like DISM's would
+        RemoteRunResult DemoWinUpdate(string host, ChainFile f, Action<string, int?> onStep, Action<string> onProgress)
+        {
+            onStep("connecting", null); DemoSleep(0.3);
+            for (var pct = 0; pct <= 100; pct += 20) { onStep("copying", pct); DemoSleep(0.15); }
+            onStep("running", null);
+            var sb = new StringBuilder();
+            void Line(string l)
+            {
+                sb.Append(DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture)).Append(' ').Append(l).Append('\n');
+                onProgress(sb.ToString());
+            }
+            Line($"Windows build {f.OsBuild ?? "10.0.26100"}.1000");
+            if (host.Length % 4 == 0)
+            {
+                Line($"{f.Kb} is already installed (2026-11-12)");
+                onStep("cleanup", null);
+                return new RemoteRunResult(0, "", $"{f.Kb} is already installed", 1, "current");
+            }
+            Line("Free space on C: 48.2 GB, update 650 MB");
+            Line($"Installing {f.Kb} with DISM");
+            for (var p = 0; p <= 100; p += 10) { Line($"PROGRESS {p}%"); DemoSleep(0.25); }
+            Line("Installed; a restart is needed");
+            onStep("cleanup", null); DemoSleep(0.2);
+            return new RemoteRunResult(3010, "", "The operation completed successfully.\nRestart Windows to complete this operation.", 40, "reboot");
         }
 
         RemoteRunResult Remote(string host, PackageStep s, Action<string, int?> onStep)
@@ -1166,7 +1275,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             {
                 case "copy":
                 {
-                    var (local, sha) = files[s.File!];
+                    var (local, sha, _, _) = files[s.File!];
                     return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-f1.bin", local, Sha256: sha)],
                         (p, run, o, tmp) => Chain.CopyScript(p["-f1.bin"], s.Path!, Path.GetFileName(local), sha, run, o, tmp), onStep, timeout);
                 }
@@ -1178,6 +1287,9 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                 case "cmd":
                     return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-user.cmd", Bytes: Chain.CmdFileBytes(s.Script!))],
                         (p, run, o, tmp) => Chain.ScriptRunner("cmd", p["-user.cmd"], run, o, tmp), onStep, timeout);
+                case "message":
+                    return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-user.txt", Bytes: Chain.MessageFileBytes(s.Text!))],
+                        (p, run, o, tmp) => Chain.MessageScript(p["-user.txt"], s.Seconds ?? Chain.DefaultMessageSeconds, run, o, tmp), onStep, timeout);
                 default:                                                         // reboot / shutdown
                     return Chain.RunRemote(host, creds!, col, [],
                         (_, run, o, tmp) => Chain.PowerScript(s.Type == "reboot", s.Seconds ?? Chain.DefaultPowerDelay, run, o, tmp), onStep, timeout);
@@ -1201,6 +1313,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             string outcome = "ok", error = "";
             int? lastCode = null;
             var needReboot = false;
+            var alreadyCurrent = 0;
             try
             {
                 for (var i = 0; i < steps.Count; i++)
@@ -1218,9 +1331,67 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                     {
                         switch (s.Type)
                         {
+                            case "install" when WinUpdate.IsUpdateFile(s.File):
+                            {
+                                var f = files[s.File!];
+                                var have = Str((c["inventory"] as JsonObject)?["os_version"]);
+                                if (f.OsBuild is { Length: > 0 } want && have.Length > 0 && have != want)
+                                {
+                                    fail = $"the update is for Windows build {want}, the computer runs {have} (not copied)";
+                                    break;
+                                }
+                                var seen = 0;
+                                var logged = -100;                               // the log gets a line every 25% at most
+                                void OnProgress(string text)
+                                {
+                                    var lines = text.Replace("\r\n", "\n").Split('\n');
+                                    var complete = lines.Length - 1;                 // the last line may still be being written
+                                    for (; seen < complete; seen++)
+                                    {
+                                        if (WinUpdate.ParseProgress(lines[seen]) is not { } pl) continue;
+                                        if (pl.Percent is { } pc)
+                                        {
+                                            UpdateTarget(dep, guid, ("step", label), ("percent", basePct + pc / steps.Count));
+                                            if (pc == 100 ? logged < 100 : pc >= logged + 25)
+                                            {
+                                                logged = pc;
+                                                Ev($"Windows update: {pl.Time} installing {pc}%", guid);
+                                            }
+                                        }
+                                        else if (pl.Text.Length > 0) Ev($"Windows update: {pl.Time} {pl.Text}", guid);
+                                    }
+                                }
+                                RemoteRunResult res;
+                                if (IsDemo) res = DemoWinUpdate(host, f, onStep, OnProgress);
+                                else
+                                {
+                                    var ext = Path.GetExtension(f.Local).ToLowerInvariant();
+                                    res = Chain.RunRemote(host, creds!, col, [new Chain.Payload("-wu" + ext, f.Local, Sha256: f.Sha)],
+                                        (p, run, o, tmp) => WinUpdate.InstallScript(p["-wu" + ext], f.Kb ?? "", f.OsBuild, p, run, o, tmp), onStep,
+                                        Math.Max(timeout, WinUpdate.MinTimeoutSeconds), scratch: WinUpdate.Scratch,
+                                        progressSuffix: WinUpdate.ProgressSuffix, onProgress: OnProgress);
+                                }
+                                lastCode = res.ExitCode;
+                                var wuOutcome = WinUpdate.Outcome(res);
+                                Ev($"Windows update result: {wuOutcome}, exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"}"
+                                   + (res.Error.Length > 0 ? $", error: {res.Error}" : ""), guid);
+                                if (res.Output.Trim().Length > 0) Ev("Output:\n" + Cap(res.Output.Trim(), 20000), guid);
+                                if (wuOutcome == "reboot") needReboot = true;
+                                if (wuOutcome == "current") alreadyCurrent++;
+                                if (wuOutcome == "failed") fail = $"Windows update failed (exit code {res.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "None"})" + (res.Error.Length > 0 ? $": {res.Error}" : "");
+                                break;
+                            }
+                            case "wait":
+                            {
+                                var sec = s.Seconds ?? Chain.DefaultWait;
+                                Ev($"Waiting {sec}s", guid);
+                                if (IsDemo) DemoSleep(Math.Min(sec, 5) * 0.2);
+                                else Thread.Sleep(TimeSpan.FromSeconds(sec));
+                                break;
+                            }
                             case "install":
                             {
-                                var (local, sha) = files[s.File!];
+                                var (local, sha, _, _) = files[s.File!];
                                 var kind = Deploy.InstallerKind(s.File!)!;
                                 var res = IsDemo
                                     ? Demo.Deploy(host, local, kind, s.Args ?? "", onStep, DemoDelayScale)
@@ -1300,6 +1471,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                     Ev("Continuing with the next step (continue on error)", guid);
                 }
                 if (outcome == "ok" && needReboot) outcome = "reboot";
+                if (outcome == "ok" && steps.Count == 1 && alreadyCurrent == 1) outcome = "current";   // a single update that was already there
                 UpdateTarget(dep, guid, ("step", "done"), ("percent", null), ("outcome", outcome), ("exit_code", lastCode),
                              ("error", Cap(error, 500)), ("finished", Db.UtcNow()));
                 Ev($"Result: {outcome}", guid);
@@ -1337,6 +1509,121 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
 
     private static string Cap(string s, int n) => s.Length > n ? s[..n] : s;
 
+    // ------------------------------------------------------------------ messages to the computers
+    /// <summary>Replaces showing the message on a computer (tests): (host, text, seconds) -> result.</summary>
+    internal Func<string, string, int, RemoteRunResult>? MessageSender { get; set; }
+
+    /// <summary>Show <paramref name="text"/> to the users logged on to the computers (<paramref name="names"/> plus the
+    /// members of <paramref name="fleetIds"/>), with msg.exe as SYSTEM, like the chain's message step. Runs as the
+    /// "message" job; its result is {total, ok, nobody, failed, unreachable, results: [{name, outcome, detail}]}.</summary>
+    public JobInfo SendMessage(IReadOnlyList<string> names, IReadOnlyList<long> fleetIds, string text, int? seconds = null)
+    {
+        var msg = Chain.ValidMessage(text);
+        var secs = Math.Clamp(seconds ?? Chain.DefaultMessageSeconds, 10, 86400);
+        var pv = DeploymentPreview(names ?? [], fleetIds ?? []);
+        var ids = (List<string>)pv["ids"]!;
+        if (ids.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
+        var comps = Computers().ToDictionary(c => (string)c["guid"]!);
+        var targets = ids.Where(comps.ContainsKey).Select(g => comps[g]).ToList();
+        return Jobs.Start("message", "message", progress => RunMessage(targets, msg, secs, progress));
+    }
+
+    private Row RunMessage(List<Row> targets, string text, int seconds, Progress progress)
+    {
+        SmbCreds? creds = null;
+        if (!IsDemo && MessageSender is null)
+        {
+            creds = Pdq.CredsFromLdap(Settings.Ldap, Kerberos.RealmFromBaseDn(Settings.Ldap.BaseDn));
+            if (!creds.HasExplicitCredential) throw new ArgumentException(T("err.pdq_creds"));
+        }
+        var results = new List<Row>();
+        var gate = new Lock();
+        var done = 0;
+        Parallel.ForEach(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(8, targets.Count)) }, c =>
+        {
+            var name = Str(c["name"]);
+            var host = c["dns_hostname"] is string { Length: > 0 } dns ? dns : name;
+            string outcome, detail;
+            try
+            {
+                RemoteRunResult r;
+                if (MessageSender is { } fake) r = fake(host, text, seconds);
+                else if (IsDemo)
+                {
+                    if (DemoDelayScale > 0) Thread.Sleep(TimeSpan.FromSeconds(0.4 * DemoDelayScale));
+                    if (c["online"] is not true) throw new Unreachable("demo: the computer is offline");
+                    r = name.Length % 3 == 0 ? new RemoteRunResult(0, "", "No user is logged on: the message was not shown", 0)
+                                             : new RemoteRunResult(0, "", "Shown in 1 session(s)", 0);
+                }
+                else
+                    r = Chain.RunRemote(host, creds!, Settings.Collect, [new Chain.Payload("-user.txt", Bytes: Chain.MessageFileBytes(text))],
+                        (p, run, o, tmp) => Chain.MessageScript(p["-user.txt"], seconds, run, o, tmp), (_, _) => { }, 120);
+                detail = (r.Error.Length > 0 ? r.Error : r.Output).Trim();
+                outcome = r.Error.Length > 0 || r.ExitCode is not 0 ? "failed"
+                    : r.Output.StartsWith("No user is logged on", StringComparison.Ordinal) ? "nobody" : "ok";
+            }
+            catch (Unreachable exc) { (outcome, detail) = ("unreachable", exc.Message); }
+            catch (Exception exc) when (exc is DeployError or ArgumentException or CollectError or IOException or InvalidOperationException
+                                            or System.Net.Sockets.SocketException or UnauthorizedAccessException)
+            {
+                (outcome, detail) = ("failed", $"{exc.GetType().Name}: {exc.Message}");
+            }
+            lock (gate)
+            {
+                results.Add(new Row { ["name"] = name, ["outcome"] = outcome, ["detail"] = Cap(detail, 300) });
+                progress.Report(++done, targets.Count, name);
+            }
+        });
+        results.Sort((a, b) => string.Compare((string)a["name"]!, (string)b["name"]!, StringComparison.OrdinalIgnoreCase));
+        int N(string o) => results.Count(r => (string)r["outcome"]! == o);
+        var bad = results.Where(r => r["outcome"] as string is "failed" or "unreachable").Select(r => $"{r["name"]} ({r["outcome"]})").ToList();
+        Store.Log("message", T("log.message", ("n", targets.Count), ("ok", N("ok")), ("nobody", N("nobody")), ("bad", bad.Count), ("text", Cap(text, 120)))
+                             + (bad.Count > 0 ? " – " + Cap(string.Join(", ", bad), 600) : ""));
+        return new Row
+        {
+            ["total"] = targets.Count, ["ok"] = N("ok"), ["nobody"] = N("nobody"), ["failed"] = N("failed"), ["unreachable"] = N("unreachable"),
+            ["results"] = results,
+        };
+    }
+
+    // ------------------------------------------------------------------ firewall rule for the sync listener
+    /// <summary>The rule script for this instance's sync settings: {filename, content, port, network}.</summary>
+    public Row FirewallScript()
+    {
+        var sy = Settings.Sync;
+        string net;
+        try { net = SyncNet.AllowedNetwork(sy.Network).ToString(); }
+        catch (SyncError exc) { throw new ArgumentException(exc.Message, exc); }
+        return new Row
+        {
+            ["filename"] = Firewall.ScriptName, ["content"] = Firewall.RuleScript(sy.Port, net, Firewall.ProgramPath()),
+            ["port"] = sy.Port, ["network"] = net,
+        };
+    }
+
+    /// <summary>Replaces running the firewall script (tests): script -> output.</summary>
+    internal Func<string, string>? FirewallRunner { get; set; }
+
+    /// <summary>Add the sync firewall rule on this computer (the desktop app runs elevated). {ok, message}.</summary>
+    public Row FirewallApply()
+    {
+        var s = FirewallScript();
+        var script = (string)s["content"]!;
+        string outp;
+        if (FirewallRunner is { } fake) outp = fake(script);
+        else if (IsDemo) outp = $"demo: firewall rule '{Firewall.RuleName}' would be added (TCP {s["port"]} from {s["network"]})";
+        else
+        {
+            try { outp = Firewall.Apply(script); }
+            catch (Exception exc) when (exc is InvalidOperationException or PlatformNotSupportedException or System.ComponentModel.Win32Exception)
+            {
+                throw new ArgumentException(T("err.firewall", ("err", exc.Message)), exc);
+            }
+        }
+        Store.Log("sync", T("log.firewall", ("port", s["port"]), ("net", s["network"])));
+        return new Row { ["ok"] = true, ["message"] = outp };
+    }
+
     /// <summary>The full event log of a deployment as text.</summary>
     public string DeploymentLog(long depId)
     {
@@ -1349,7 +1636,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     /// <summary>Computers of running deployments that have not finished yet (0 = nothing to lose by closing).</summary>
     public int UnfinishedDeployments()
     {
-        if (!Jobs.List().Any(j => j.Kind == "deploy" && j.Status == "running")) return 0;
+        if (!Jobs.List().Any(j => j.Kind is "deploy" or "wuinstall" && j.Status == "running")) return 0;
         var n = 0L;
         foreach (var d in Store.Deployments(20))
             if ((string?)d["status"] == "running")
@@ -1901,6 +2188,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Store.SaveUpdateReference(reference.Builds, new Dictionary<string, string>
         {
             ["fetched_at"] = Db.UtcNow(), ["error"] = "", ["months"] = string.Join(",", reference.Months),
+            ["kbs"] = System.Text.Json.JsonSerializer.Serialize(reference.Kbs),
         });
         Store.Log("updates", T("log.updates", ("builds", reference.Builds.Count), ("months", string.Join(", ", reference.Months))));
         return new Row { ["builds"] = reference.Builds.Count, ["months"] = reference.Months };
@@ -1909,9 +2197,13 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     /// <summary>The Windows updates page: {status, reference: [{build, ubr, month, released}], computers: [...]}.</summary>
     public Row WinUpdates()
     {
-        var (builds, _) = Store.UpdateReference();
+        var (builds, meta) = Store.UpdateReference();
+        Dictionary<string, string> kbs;
+        try { kbs = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(meta.GetValueOrDefault("kbs") is { Length: > 0 } k ? k : "{}") ?? []; }
+        catch (System.Text.Json.JsonException) { kbs = []; }
         var reference = builds.OrderByDescending(kv => kv.Key, StringComparer.Ordinal)
-            .Select(kv => new Row { ["build"] = kv.Key, ["ubr"] = kv.Value.Ubr, ["month"] = kv.Value.Month, ["released"] = kv.Value.Released }).ToList();
+            .Select(kv => new Row { ["build"] = kv.Key, ["ubr"] = kv.Value.Ubr, ["month"] = kv.Value.Month, ["released"] = kv.Value.Released,
+                                    ["kb"] = kbs.GetValueOrDefault(kv.Key) }).ToList();
         var comps = new List<Row>();
         foreach (var c in Computers())
         {

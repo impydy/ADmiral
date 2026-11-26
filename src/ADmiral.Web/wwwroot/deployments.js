@@ -25,7 +25,8 @@ function dpCode(x) {
 function chStepText(s) {
   const f = (s.file || "").split("/").pop();
   const d = { install: `${f} ${s.args || ""}`, copy: `${f} → ${s.path}`, delete: s.path, reboot: tText(s.wait ? "ch.reboot_wait" : "ch.in_s", { s: s.seconds }),
-    shutdown: tText("ch.in_s", { s: s.seconds }), wol: tText("ch.wol_text", { s: s.seconds }), powershell: (s.script || "").split("\n")[0], cmd: (s.script || "").split("\n")[0] }[s.type] || "";
+    shutdown: tText("ch.in_s", { s: s.seconds }), wol: tText("ch.wol_text", { s: s.seconds }), powershell: (s.script || "").split("\n")[0], cmd: (s.script || "").split("\n")[0],
+    wait: tText("ch.wait_text", { s: s.seconds }), message: `„${s.text || ""}” (${tText("ch.msg_text", { s: s.seconds })})` }[s.type] || "";
   return `${t("ch.type." + s.type)}${d ? ": " + d.trim() : ""}${s.continue_on_error ? " (" + t("ch.continue") + ")" : ""}`;
 }
 
@@ -231,23 +232,29 @@ function dpConfirmText(pkg, pv) {
   return parts.join("\n\n");
 }
 
-async function dpNewDialog() {
+/* pre: {pid, chain} or {pid, path} - the option chosen when the dialog opens (from the Packages page). */
+async function dpNewDialog(pre) {
   const pk = await guard(() => api("GET", "/api/packages"));
   if (!pk) return;
   const options = [];
-  // a package with a chain is offered as a whole first; its single installers can still be deployed alone
-  for (const p of pk.packages) {
+  // the packages (installation chains) first, then the library's single installers, then the Windows updates
+  for (const p of pk.packages)
     if ((p.steps || []).length) options.push({ pid: p.id, chain: true, label: `${p.name} ${p.version || ""} — ${tText("ch.option", { n: p.steps.length })}`, steps: p.steps });
+  for (const p of pk.packages) {
+    if (p.kind === "chain" || p.kind === "winupdate") continue;
     for (const f of p.files) if (f.kind === "installer" && dpExt(f.path)) options.push({ pid: p.id, path: f.path, label: `${p.name} ${f.version || p.version} — ${f.path.split("/").pop()}` });
   }
+  for (const p of pk.packages.filter((x) => x.kind === "winupdate").sort((a, b) => (b.os_build || "").localeCompare(a.os_build || "", undefined, { numeric: true })))
+    for (const f of p.files) if (/\.(msu|cab)$/i.test(f.path)) options.push({ pid: p.id, path: f.path, wu: true, label: `${t("pk.wu.section")}: ${p.name} — ${p.os_build} (${p.version})` });
   if (!options.length) return toast(t("dp.no_installers"), true);
+  const preIdx = pre ? Math.max(0, options.findIndex((o) => o.pid === pre.pid && (pre.chain ? o.chain : o.path === pre.path))) : 0;
   const comps = [...S.computers].sort((a, b) => a.name.localeCompare(b.name));
   const sel = new Set(S.sel);
   const colSel = new Set();                                   // chosen collections: all their computers are targets
   const covered = () => new Set(S.fleets.filter((f) => colSel.has(f.id)).flatMap((f) => f.guids || []));
   const effective = () => new Set([...sel, ...covered()]);
   const box = dialog(t("dp.new"), `
-    <label class="fld"><span>${esc(t("dp.installer"))}</span><select id="dp-file">${options.map((o, i) => `<option value="${i}">${esc(o.label)}</option>`).join("")}</select></label>
+    <label class="fld"><span>${esc(t("dp.installer"))}</span><select id="dp-file">${options.map((o, i) => `<option value="${i}"${i === preIdx ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select></label>
     <div id="dp-argbox"><label class="fld"><span>${esc(t("dp.args"))}</span><input id="dp-args" class="field-in mono" type="text"></label>
     <div id="dp-presets" class="faint"></div>
     <div class="faint">${esc(t("dp.args_hint"))}</div></div>
@@ -261,8 +268,12 @@ async function dpNewDialog() {
   const cur = () => options[Number($("#dp-file", box).value)];
   const presets = () => {
     const o = cur();
-    $("#dp-argbox", box).hidden = !!o.chain;
-    $("#dp-chain", box).hidden = !o.chain;
+    $("#dp-argbox", box).hidden = !!o.chain || !!o.wu;
+    $("#dp-chain", box).hidden = !o.chain && !o.wu;
+    if (o.wu) {
+      $("#dp-chain", box).innerHTML = `${icon("patch", 14)} ${esc(t("dp.wu_hint"))}`;
+      return;
+    }
     if (o.chain) {
       $("#dp-chain", box).innerHTML = `<b>${esc(t("ch.steps"))}</b><ol style="margin:4px 0 0;padding-left:22px">${o.steps.map((s) => `<li>${esc(chStepText(s))}</li>`).join("")}</ol>`;
       return;
@@ -299,9 +310,10 @@ async function dpNewDialog() {
     const all = new Set(pv.ids);
     const args = $("#dp-args", box).value, inv = $("#dp-inv", box).checked;
     if (inv) { closeDialog(); await dpRefreshInventory([...all]); }
-    const r = await api("POST", "/api/deployments", o.chain ? { package_id: o.pid, chain: true, ids: [...all] } : { package_id: o.pid, file: o.path, args, ids: [...all] });
+    const r = await api("POST", "/api/deployments", o.chain ? { package_id: o.pid, chain: true, ids: [...all] } : { package_id: o.pid, file: o.path, args: o.wu ? "" : args, ids: [...all] });
     if (!inv) closeDialog();
     DP.sel = r.id;
+    if (S.section !== "deployments") setSection("deployments");
     await dpRefresh();
     dpWatch();
   });

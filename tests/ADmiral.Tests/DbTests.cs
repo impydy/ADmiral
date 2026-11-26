@@ -27,7 +27,8 @@ public class DbTests
 
     private static Store NewStore()
     {
-        var s = new Store(":memory:");
+        // the fixed dates below are older than the default retention (2 months)
+        var s = new Store(":memory:") { LogonRetentionDays = 3650 };
         s.UpsertFromAd(Fleet());
         return s;
     }
@@ -211,6 +212,45 @@ public class DbTests
         Assert.Equal(["Only"], items["apps"].Select(a => (string?)a["name"]));
         Assert.NotEmpty(items["services"]);                        // old rows kept
         Assert.Single(items["logons"]);                            // logons are merged, never dropped
+    }
+
+    [Fact]
+    public void LoggedOnUserGoesIntoTheHistoryOnceADay()
+    {
+        using var s = NewStore();
+        JsonObject Inv(string user, bool logons) => logons
+            ? new JsonObject { ["logged_on_user"] = user, ["logons"] = new JsonArray() }
+            : new JsonObject { ["logged_on_user"] = user };
+        s.RecordInventory("g-lt1", Inv("CORP\\anna", false));
+        s.RecordInventory("g-lt1", Inv("corp\\ANNA", true));                 // the same user the same day: not again
+        var logons = s.Items("g-lt1")["logons"];
+        var e = Assert.Single(logons);
+        Assert.Equal(("anna", "CORP", 2), ((string?)e["user"], (string?)e["domain"], (int?)e["type"]));
+        Assert.StartsWith(Db.FormatUtc(DateTimeOffset.UtcNow)[..10], (string?)e["time"], StringComparison.Ordinal);
+        s.RecordInventory("g-lt1", Inv("CORP\\bela", true));                 // another user: added
+        Assert.Equal(2, s.Items("g-lt1")["logons"].Count);
+        s.RecordInventory("g-lt2", Inv("LT-002\\Administrator", false));      // a local account: not recorded
+        s.RecordInventory("g-lt2", Inv("nobackslash", false));
+        Assert.Empty(s.Items("g-lt2")["logons"]);
+    }
+
+    [Fact]
+    public void LogonHistoryIsKeptForTheRetention()
+    {
+        using var s = NewStore();
+        var now = DateTimeOffset.UtcNow;
+        s.AddLogons("g-lt1", [
+            new JsonObject { ["time"] = Db.FormatUtc(now.AddDays(-10)), ["user"] = "anna", ["domain"] = "CORP", ["type"] = 2 },
+            new JsonObject { ["time"] = Db.FormatUtc(now.AddDays(-90)), ["user"] = "bela", ["domain"] = "CORP", ["type"] = 2 },
+        ]);
+        Assert.Equal(2, s.Items("g-lt1")["logons"].Count);
+        s.LogonRetentionDays = 60;
+        Assert.Equal(1, s.PruneLogons());
+        Assert.Equal(["anna"], s.Items("g-lt1")["logons"].Select(l => (string?)l["user"]));
+        // a merge never brings an old one back
+        s.AddLogons("g-lt1", [new JsonObject { ["time"] = Db.FormatUtc(now.AddDays(-61)), ["user"] = "cili", ["domain"] = "CORP", ["type"] = 2 }]);
+        Assert.Equal(["anna"], s.Items("g-lt1")["logons"].Select(l => (string?)l["user"]));
+        Assert.Equal(60, new Settings().Logins.RetentionDays);
     }
 
     [Fact]

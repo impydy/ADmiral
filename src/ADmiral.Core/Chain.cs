@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging;
 namespace ADmiral.Core;
 
 /// <summary>Result of one remote step (copy, delete, script, reboot ...) run as SYSTEM on a computer.</summary>
-public sealed record RemoteRunResult(int? ExitCode, string Error, string Output, int? Seconds);
+public sealed record RemoteRunResult(int? ExitCode, string Error, string Output, int? Seconds, string State = "");
 
 /// <summary>Package chains: the steps of a package (<see cref="PackageStep"/>) run one after the other on each target
 /// computer. The remote steps use the same agentless path as the installer (<see cref="Deploy"/>): the files go over SMB
@@ -19,7 +19,7 @@ public sealed record RemoteRunResult(int? ExitCode, string Error, string Output,
 /// is run as a file, and the computer name is validated like everywhere else.</para></summary>
 public static partial class Chain
 {
-    public static readonly IReadOnlyList<string> StepTypes = ["install", "copy", "delete", "scan", "reboot", "shutdown", "wol", "powershell", "cmd"];
+    public static readonly IReadOnlyList<string> StepTypes = ["install", "copy", "delete", "scan", "reboot", "shutdown", "wol", "powershell", "cmd", "wait", "message"];
 
     public const int MaxSteps = 50;
     public const int MaxScriptChars = 64 * 1024;
@@ -28,6 +28,10 @@ public static partial class Chain
     public const int MinPowerDelay = 15;
     public const int DefaultPowerDelay = 30;
     public const int DefaultWolWait = 300;
+    public const int MaxWait = 4 * 3600;
+    public const int DefaultWait = 60;
+    public const int MaxMessageChars = 500;
+    public const int DefaultMessageSeconds = 300;
 
     // C:\folder\file.ext - absolute, local drive, no wildcard / stream / control characters. Each segment is exactly
     // "\" + name, so the pattern matches in linear time (no nested optional quantifier to backtrack on). A time limit
@@ -67,10 +71,26 @@ public static partial class Chain
         return s;
     }
 
-    /// <summary>The cleaned chain of <paramref name="entry"/>: every step checked, unknown fields dropped. Files must belong
-    /// to the package; install needs an .msi / .exe. Throws <see cref="ArgumentException"/> naming the bad step.</summary>
-    public static List<PackageStep> ValidateSteps(PackageEntry entry, IEnumerable<PackageStep?>? steps)
+    /// <summary>The message text: one paragraph of at most <see cref="MaxMessageChars"/>; line breaks become spaces,
+    /// control characters and double quotes (they would break msg.exe's command line) are replaced, and it never starts
+    /// with '/' or '-' (msg.exe would take it for one of its options, e.g. /SERVER:).</summary>
+    public static string ValidMessage(string? text)
     {
+        var sb = new StringBuilder();
+        foreach (var ch in (text ?? "").Replace("\r\n", "\n"))
+            sb.Append(ch is '\n' or '\t' ? ' ' : ch == '"' ? '\'' : char.IsControl(ch) || ch is '\u2028' or '\u2029' ? ' ' : ch);
+        var t = string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries)).TrimEnd('\\', ' ').TrimStart('/', '-', ' ');
+        if (t.Length == 0 || t.Length > MaxMessageChars) throw new ArgumentException(I18n.T("err.chain_message", ("n", MaxMessageChars)));
+        return t;
+    }
+
+    /// <summary>The cleaned chain of <paramref name="entry"/>: every step checked, unknown fields dropped. Files must belong
+    /// to the package or - with <paramref name="library"/> - to any package of the library (an installation chain uses
+    /// the library's files); install needs an .msi / .exe or a Windows update (.msu / .cab). Throws
+    /// <see cref="ArgumentException"/> naming the bad step.</summary>
+    public static List<PackageStep> ValidateSteps(PackageEntry entry, IEnumerable<PackageStep?>? steps, IEnumerable<PackageEntry>? library = null)
+    {
+        var lib = library?.ToList() ?? [];
         var list = (steps ?? []).ToList();
         if (list.Count > MaxSteps) throw new ArgumentException(I18n.T("err.chain_many", ("n", MaxSteps)));
         var outp = new List<PackageStep>();
@@ -79,7 +99,7 @@ public static partial class Chain
             var s = list[i] ?? throw new ArgumentException(I18n.T("err.chain_step", ("n", i + 1), ("why", "empty")));
             try
             {
-                outp.Add(Clean(entry, s));
+                outp.Add(Clean(entry, lib, s));
             }
             catch (ArgumentException exc)
             {
@@ -89,22 +109,28 @@ public static partial class Chain
         return outp;
     }
 
-    private static PackageStep Clean(PackageEntry entry, PackageStep s)
+    /// <summary>The file of a step: one of the package's own, else one of the library's (never a chain's).</summary>
+    public static PackageFile? FindFile(PackageEntry entry, IEnumerable<PackageEntry> library, string? path) =>
+        entry.Files.FirstOrDefault(x => x.Path == path)
+        ?? library.Where(p => p.Kind != "chain").SelectMany(p => p.Files).FirstOrDefault(x => x.Path == path);
+
+    private static PackageStep Clean(PackageEntry entry, List<PackageEntry> library, PackageStep s)
     {
         var type = (s.Type ?? "").Trim().ToLowerInvariant();
         if (!StepTypes.Contains(type)) throw new ArgumentException($"unknown step type '{s.Type}'");
         var c = new PackageStep { Type = type, ContinueOnError = s.ContinueOnError == true ? true : null };
         PackageFile File()
         {
-            var f = entry.Files.FirstOrDefault(x => x.Path == s.File);
+            var f = FindFile(entry, library, s.File);
             return f ?? throw new ArgumentException(I18n.T("err.chain_file", ("file", s.File ?? "")));
         }
         switch (type)
         {
             case "install":
                 var inst = File();
-                if (Deploy.InstallerKind(inst.Path) is null) throw new ArgumentException(I18n.T("err.dep_file"));
                 c.File = inst.Path;
+                if (WinUpdate.IsUpdateFile(inst.Path)) break;                    // a Windows update: no switches
+                if (Deploy.InstallerKind(inst.Path) is null) throw new ArgumentException(I18n.T("err.dep_file"));
                 try { c.Args = Deploy.ValidArgs(s.Args); }
                 catch (DeployError exc) { throw new ArgumentException(exc.Message, exc); }
                 break;
@@ -127,6 +153,13 @@ public static partial class Chain
             case "wol":
                 c.Seconds = Math.Clamp(s.Seconds ?? DefaultWolWait, 0, 3600);
                 break;
+            case "wait":
+                c.Seconds = Math.Clamp(s.Seconds ?? DefaultWait, 1, MaxWait);
+                break;
+            case "message":
+                c.Text = ValidMessage(s.Text);
+                c.Seconds = Math.Clamp(s.Seconds ?? DefaultMessageSeconds, 10, 86400);
+                break;
         }
         return c;
     }
@@ -134,7 +167,10 @@ public static partial class Chain
     /// <summary>One line describing the step (the deployment list / log).</summary>
     public static string Describe(PackageStep s) => s.Type switch
     {
-        "install" => $"install {System.IO.Path.GetFileName(s.File)}" + (string.IsNullOrEmpty(s.Args) ? "" : $" {s.Args}"),
+        "install" => $"install {System.IO.Path.GetFileName(s.File)}" + (string.IsNullOrEmpty(s.Args) ? "" : $" {s.Args}")
+                     + (WinUpdate.IsUpdateFile(s.File) ? " (Windows update, DISM)" : ""),
+        "wait" => $"wait {s.Seconds}s",
+        "message" => $"message to the logged-on users ({s.Seconds}s): {FirstLine(s.Text)}",
         "copy" => $"copy {System.IO.Path.GetFileName(s.File)} -> {s.Path}",
         "delete" => $"delete {s.Path}",
         "reboot" => $"reboot in {s.Seconds}s" + (s.Wait == true ? " and wait" : ""),
@@ -227,6 +263,22 @@ public static partial class Chain
                                  "  if ($code -eq $null) { $code = 0 }"), run, out_, tmp);
     }
 
+    /// <summary>Show the message in <paramref name="textFile"/> (UTF-8) to every user logged on to the computer
+    /// (msg.exe *, for <paramref name="seconds"/>). No logged-on user is not an error: there is nobody to tell.</summary>
+    public static string MessageScript(string textFile, int seconds, string run, string out_, string tmp) => Frame(string.Join("\n",
+        $"  $m = [IO.File]::ReadAllText({Deploy.Q(textFile)}, [Text.Encoding]::UTF8).Trim()",
+        "  $s = @(Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" -ErrorAction SilentlyContinue)",
+        "  if ($s.Count -eq 0) { $code = 0; $out = 'No user is logged on: the message was not shown' }",
+        "  else {",
+        "    $ErrorActionPreference = 'Continue'",
+        $"    $r = (& \"$env:SystemRoot\\System32\\msg.exe\" '*' '/TIME:{Math.Clamp(seconds, 10, 86400).ToString(CultureInfo.InvariantCulture)}' $m 2>&1 | Out-String).Trim()",
+        "    $code = $LASTEXITCODE; if ($code -eq $null) { $code = 0 }",
+        "    $out = 'Shown in ' + $s.Count + ' session(s)' + $(if ($r) { ': ' + $r } else { '' })",
+        "  }"), run, out_, tmp);
+
+    /// <summary>The message as the file sent along (UTF-8, no BOM).</summary>
+    public static byte[] MessageFileBytes(string text) => new UTF8Encoding(false).GetBytes(text);
+
     /// <summary>shutdown.exe /r or /s after <paramref name="seconds"/> (planned, with a message), forced.</summary>
     public static string PowerScript(bool reboot, int seconds, string run, string out_, string tmp) => Frame(string.Join("\n",
         $"  $out = (& shutdown.exe {(reboot ? "/r" : "/s")} /f /t {Math.Clamp(seconds, MinPowerDelay, 3600).ToString(CultureInfo.InvariantCulture)} /d p:4:1 /c 'ADmiral' 2>&1 | Out-String)",
@@ -245,7 +297,8 @@ public static partial class Chain
     /// <see cref="DeployError"/>; a script that ran is a result (exit code, error, output).</summary>
     public static RemoteRunResult RunRemote(string host, SmbCreds creds, CollectSettings cfg, IReadOnlyList<Payload> payloads,
                                             Func<IReadOnlyDictionary<string, string>, string, string, string, string> buildScript,
-                                            Action<string, int?> onStep, int timeoutSeconds = 600, PdqBackend? backend = null)
+                                            Action<string, int?> onStep, int timeoutSeconds = 600, PdqBackend? backend = null,
+                                            IReadOnlyList<string>? scratch = null, string? progressSuffix = null, Action<string>? onProgress = null)
     {
         try { Remote.ValidateHost(host); }
         catch (CollectError exc) { throw new DeployError(exc.Message, exc); }
@@ -257,6 +310,8 @@ public static partial class Chain
         var names = new Dictionary<string, string>();
         foreach (var s in new[] { "ps1", "out", "tmp", "run", "log" }) names[s] = Pdq.SharePath(tag, "." + s);
         var shared = payloads.ToDictionary(p => p.Suffix, p => Pdq.SharePath(tag, p.Suffix));
+        // files the script itself creates (progress, logs): their paths are passed like the payloads' and removed at the end
+        foreach (var sfx in scratch ?? []) shared.TryAdd(sfx, Pdq.SharePath(tag, sfx));
         var remote = shared.ToDictionary(kv => kv.Key, kv => Pdq.RemotePath(kv.Value));
         var script = buildScript(remote, Pdq.RemotePath(names["run"]), Pdq.RemotePath(names["out"]), Pdq.RemotePath(names["tmp"]));
         var inner = $"powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File \"{Pdq.RemotePath(names["ps1"])}\" " +
@@ -313,6 +368,17 @@ public static partial class Chain
             var clock = backend.Clock;
             var deadline = clock.Elapsed + TimeSpan.FromSeconds(Math.Max(30, timeoutSeconds));
             var seenRun = false;
+            var nextProgress = TimeSpan.Zero;
+            void ReadProgress()
+            {
+                if (onProgress is null || progressSuffix is null || !shared.TryGetValue(progressSuffix, out var prg)) return;
+                try
+                {
+                    var data = sess.ReadFile(prg, Deploy.MaxResultBytes);
+                    if (data.Length > 0) onProgress(Encoding.UTF8.GetString(data));
+                }
+                catch (Exception exc) when (exc is not OutOfMemoryException) { Log.Logger.LogDebug(exc, "Chain: no progress yet"); }
+            }
             while (clock.Elapsed < deadline)
             {
                 if (!seenRun)
@@ -320,6 +386,11 @@ public static partial class Chain
                     try { seenRun = sess.FileExists(names["run"]); }
                     catch (Exception exc) when (exc is not OutOfMemoryException) { Log.Logger.LogDebug(exc, "Chain: ignored error"); }
                     if (seenRun) onStep("running", null);
+                }
+                if (seenRun && clock.Elapsed >= nextProgress)
+                {
+                    ReadProgress();
+                    nextProgress = clock.Elapsed + TimeSpan.FromSeconds(5);
                 }
                 try
                 {
@@ -333,6 +404,7 @@ public static partial class Chain
                 catch (Exception exc) when (exc is not OutOfMemoryException) { Log.Logger.LogDebug(exc, "Chain: no result yet"); }
                 clock.Sleep(TimeSpan.FromSeconds(1));
             }
+            ReadProgress();                                                  // the last lines (or what there is on a timeout)
             if (got is null) throw new DeployError($"the step did not finish within {timeoutSeconds}s");
             try
             {
@@ -357,6 +429,6 @@ public static partial class Chain
         static string S(JsonNode? n) => n is JsonValue v && v.GetValueKind() == JsonValueKind.String ? v.GetValue<string>() : "";
         var output = S(got["output"]).Trim();
         if (logText.Length > 0) output = output.Length > 0 ? output + "\n" + logText : logText;
-        return new RemoteRunResult(Collector.Int(got["exit"]), S(got["error"]).Trim(), output, Collector.Int(got["seconds"]));
+        return new RemoteRunResult(Collector.Int(got["exit"]), S(got["error"]).Trim(), output, Collector.Int(got["seconds"]), S(got["state"]).Trim());
     }
 }

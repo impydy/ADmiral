@@ -84,6 +84,7 @@ public sealed class OfflineTests : IDisposable
     public void ImportInbox()
     {
         using var store = InboxFixture.NewStore();
+        store.LogonRetentionDays = 3650;                                    // the fixed logon dates are older than 2 months
         var inbox = _tmp.File("inbox");
         Directory.CreateDirectory(inbox);
         var settings = new Settings { FileCollect = { Inbox = inbox } };

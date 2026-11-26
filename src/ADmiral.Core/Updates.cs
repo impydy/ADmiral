@@ -31,7 +31,11 @@ namespace ADmiral.Core;
 /// <summary>The merged MSRC reference: newest fixed revision per Windows build, and the months read.</summary>
 public sealed record UpdateReferenceData(
     [property: JsonPropertyName("builds")] Dictionary<string, UpdateRef> Builds,
-    [property: JsonPropertyName("months")] List<string> Months);
+    [property: JsonPropertyName("months")] List<string> Months)
+{
+    /// <summary>The KB number of the newest release per build ("10.0.26100" -&gt; "KB5043080"), where the data names it.</summary>
+    [JsonPropertyName("kbs")] public Dictionary<string, string> Kbs { get; init; } = [];
+}
 
 /// <summary>Security-update state of one computer: current | missing | pending | unknown.</summary>
 public sealed record SecurityState(
@@ -552,6 +556,44 @@ public static partial class Updates
         return best;
     }
 
+    /// <summary>One monthly CVRF document -&gt; {"10.0.22631": (newest fixed revision, its KB number or "")}.</summary>
+    public static Dictionary<string, (long Ubr, string Kb)> ParseReleaseKbs(JsonNode? doc)
+    {
+        var best = new Dictionary<string, (long Ubr, string Kb)>(StringComparer.Ordinal);
+        foreach (var vuln in Items(doc?["Vulnerability"]))
+            foreach (var rem in Items(vuln?["Remediations"]))
+            {
+                var m = BuildRe().Match(Str(rem?["FixedBuild"]));
+                if (!m.Success || !long.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var ubr)) continue;
+                var kb = WinUpdate.ValidKb(Str(rem?["Description"]?["Value"])) ?? "";
+                var key = m.Groups[1].Value;
+                if (!best.TryGetValue(key, out var cur) || ubr > cur.Ubr || (ubr == cur.Ubr && cur.Kb.Length == 0 && kb.Length > 0))
+                    best[key] = (ubr, kb);
+            }
+        return best;
+    }
+
+    /// <summary>A text fetcher <c>(url, form or null) -&gt; body</c> through the configured proxy: GET, or a POST of the
+    /// form fields (application/x-www-form-urlencoded). The body is at most <see cref="MaxJsonBytes"/>.</summary>
+    public static Func<string, IReadOnlyDictionary<string, string>?, string> MakeTextFetcher(ProxySettings p, int timeoutSeconds = 60,
+                                                                                         HttpClient? client = null, bool direct = false)
+    {
+        var http = client ?? Client(p, direct);
+        var timeout = TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds) + ConnectTimeout.TotalSeconds);
+        return (url, form) =>
+        {
+            Prepare(p, direct, url);
+            using var cts = new CancellationTokenSource(timeout);
+            using var req = Request(form is null ? HttpMethod.Get : HttpMethod.Post, url, "text/html, */*", null);
+            if (form is not null) req.Content = new FormUrlEncodedContent(form);
+            using var resp = http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token).GetAwaiter().GetResult();
+            resp.EnsureSuccessStatusCode();
+            using var ms = new MemoryStream();
+            CopyCappedAsync(resp, ms, MaxJsonBytes, null, cts.Token).GetAwaiter().GetResult();
+            return Encoding.UTF8.GetString(ms.ToArray());
+        };
+    }
+
     /// <summary>Download the newest <paramref name="months"/> security releases and merge them.</summary>
     public static UpdateReferenceData FetchReference(ProxySettings p, int months = 3, Func<string, JsonNode?>? get = null,
                                                      Action<int, int, string>? progress = null)
@@ -562,6 +604,7 @@ public static partial class Updates
         var wanted = listing.Take(Math.Max(1, months)).ToList();
         if (wanted.Count == 0) throw new InvalidDataException("The Microsoft security update list is empty");
         var builds = new Dictionary<string, UpdateRef>(StringComparer.Ordinal);
+        var kbs = new Dictionary<string, string>(StringComparer.Ordinal);
         for (var i = 0; i < wanted.Count; i++)
         {
             var upd = wanted[i];
@@ -571,13 +614,17 @@ public static partial class Updates
             var doc = get(cvrf);
             var released = Str(doc?["DocumentTracking"]?["InitialReleaseDate"]) is { Length: > 0 } r ? r : Str(upd["InitialReleaseDate"]);
             if (released.Length > 10) released = released[..10];
-            foreach (var (key, ubr) in ParseRelease(doc))
+            foreach (var (key, (ubr, kb)) in ParseReleaseKbs(doc))
                 if (!builds.TryGetValue(key, out var cur) || ubr > cur.Ubr)
+                {
                     builds[key] = new UpdateRef(ubr, month, released);
+                    if (kb.Length > 0) kbs[key] = kb;
+                    else kbs.Remove(key);
+                }
         }
         progress?.Invoke(wanted.Count, wanted.Count, "OK");
         if (builds.Count == 0) throw new InvalidDataException("No Windows build numbers found in the Microsoft security releases");
-        return new UpdateReferenceData(builds, [.. wanted.Select(u => Str(u["ID"]))]);
+        return new UpdateReferenceData(builds, [.. wanted.Select(u => Str(u["ID"]))]) { Kbs = kbs };
     }
 
     /// <summary>State of one computer: current | missing | pending (newer release within the grace period) | unknown.</summary>

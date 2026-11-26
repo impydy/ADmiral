@@ -22,6 +22,13 @@ public sealed class PackageFile
     [JsonPropertyName("sha256")] public string Sha256 { get; set; } = "";
     [JsonPropertyName("kind")] public string Kind { get; set; } = "installer";
     [JsonPropertyName("vendor_checked")] public bool VendorChecked { get; set; }
+    /// <summary>SHA-1 (hex) of the file: the Windows Update Catalog publishes this one (and the SHA-256) in base64.</summary>
+    [JsonPropertyName("sha1"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Sha1 { get; set; }
+    /// <summary>Where the checked hash came from: vendor | catalog (looked up in the Windows Update Catalog) | catalog-name
+    /// (the SHA-1 the catalog puts into the file name).</summary>
+    [JsonPropertyName("hash_source"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? HashSource { get; set; }
+    /// <summary>catalog: the title of the catalog entry the file was found in.</summary>
+    [JsonPropertyName("catalog_title"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? CatalogTitle { get; set; }
 
     public PackageFile Copy() => (PackageFile)MemberwiseClone();
 }
@@ -29,7 +36,7 @@ public sealed class PackageFile
 /// <summary>One step of a package's chain (see <see cref="Chain"/>). Which fields count depends on <see cref="Type"/>.</summary>
 public sealed class PackageStep
 {
-    /// <summary>install | copy | delete | scan | reboot | shutdown | wol | powershell | cmd</summary>
+    /// <summary>install | copy | delete | scan | reboot | shutdown | wol | powershell | cmd | wait | message</summary>
     [JsonPropertyName("type")] public string Type { get; set; } = "";
     /// <summary>install / copy: a file of this package (register path).</summary>
     [JsonPropertyName("file"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? File { get; set; }
@@ -39,7 +46,10 @@ public sealed class PackageStep
     [JsonPropertyName("path"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Path { get; set; }
     /// <summary>powershell / cmd: the script run as SYSTEM.</summary>
     [JsonPropertyName("script"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Script { get; set; }
-    /// <summary>reboot / shutdown: delay before it happens; wol: how long to wait for the computer to come up.</summary>
+    /// <summary>message: the text shown to the users logged on to the computer.</summary>
+    [JsonPropertyName("text"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Text { get; set; }
+    /// <summary>reboot / shutdown: delay before it happens; wol: how long to wait for the computer to come up;
+    /// wait: the pause; message: how long the message stays on the screen.</summary>
     [JsonPropertyName("seconds"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public int? Seconds { get; set; }
     /// <summary>reboot: wait until the computer is back before the next step.</summary>
     [JsonPropertyName("wait"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? Wait { get; set; }
@@ -50,6 +60,13 @@ public sealed class PackageStep
 public sealed class PackageEntry
 {
     [JsonPropertyName("id")] public string Id { get; set; } = "";
+    /// <summary>null: a library package (files); "chain": an installation chain (steps only, it uses the library's files);
+    /// "winupdate": a Windows update (.msu / .cab) for one Windows build.</summary>
+    [JsonPropertyName("kind"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Kind { get; set; }
+    /// <summary>winupdate: the Windows build it is for, e.g. 10.0.26100.</summary>
+    [JsonPropertyName("os_build"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? OsBuild { get; set; }
+    /// <summary>winupdate: the update's KB number, e.g. KB5043080.</summary>
+    [JsonPropertyName("kb"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Kb { get; set; }
     [JsonPropertyName("name")] public string Name { get; set; } = "";
     [JsonPropertyName("publisher")] public string Publisher { get; set; } = "";
     [JsonPropertyName("version")] public string Version { get; set; } = "";
@@ -86,6 +103,9 @@ public sealed record PackageVersionRow(
 /// <summary>A package as the UI lists it.</summary>
 public sealed record PackageRow(
     [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("kind")] string? Kind,
+    [property: JsonPropertyName("os_build")] string? OsBuild,
+    [property: JsonPropertyName("kb")] string? Kb,
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("publisher")] string Publisher,
     [property: JsonPropertyName("version")] string Version,
@@ -149,6 +169,41 @@ public sealed partial class PackageLibrary(string folder)
         using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
         return Convert.ToHexStringLower(SHA256.HashData(f));
     }
+
+    /// <summary>SHA-256 and SHA-1 (lower-case hex) of a file, read once.</summary>
+    public static (string Sha256, string Sha1) HashesFile(string path)
+    {
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
+        using var h256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var h1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        var buf = new byte[1024 * 1024];
+        int n;
+        while ((n = f.Read(buf)) > 0)
+        {
+            h256.AppendData(buf, 0, n);
+            h1.AppendData(buf, 0, n);
+        }
+        return (Convert.ToHexStringLower(h256.GetHashAndReset()), Convert.ToHexStringLower(h1.GetHashAndReset()));
+    }
+
+    /// <summary>A published hash in any of the forms vendors and the Windows Update Catalog use: SHA-256 or SHA-1, as hex
+    /// (64 / 40 characters) or base64 (44 / 28 characters). Returns (algorithm, lower-case hex) or null.</summary>
+    public static (string Alg, string Hex)? ParseDigest(string? value)
+    {
+        var v = (value ?? "").Trim();
+        if (v.Length == 64 && ShaRe().IsMatch(v.ToLowerInvariant())) return ("sha256", v.ToLowerInvariant());
+        if (v.Length == 40 && Sha1Re().IsMatch(v.ToLowerInvariant())) return ("sha1", v.ToLowerInvariant());
+        if (v.Length is 44 or 28)
+        {
+            var bytes = new byte[32];
+            if (Convert.TryFromBase64String(v, bytes, out var n) && n is 32 or 20)
+                return (n == 32 ? "sha256" : "sha1", Convert.ToHexStringLower(bytes.AsSpan(0, n)));
+        }
+        return null;
+    }
+
+    [GeneratedRegex(@"^[0-9a-f]{40}$")]
+    internal static partial Regex Sha1Re();
 
     /// <summary>A file/folder name made of safe characters; never "." or "..".</summary>
     internal static string Safe(string part)
@@ -289,9 +344,10 @@ public sealed partial class PackageLibrary(string folder)
     }
 
     /// <summary>A new package without files (its chain can then be put together and files added).</summary>
-    public PackageEntry Create(string pkgId, string name, string version = "", string publisher = "")
+    public PackageEntry Create(string pkgId, string name, string version = "", string publisher = "", string? kind = null)
     {
         var id = ValidId(pkgId);
+        if (kind is not (null or "chain")) throw new PackageError($"Not a package kind: '{kind}'");
         lock (Sync)
         {
             var data = Load();
@@ -300,6 +356,7 @@ public sealed partial class PackageLibrary(string folder)
             {
                 Id = id, Name = string.IsNullOrWhiteSpace(name) ? id : LooseValue.Cut(name.Trim(), 200),
                 Version = LooseValue.Cut((version ?? "").Trim(), 64), Publisher = LooseValue.Cut((publisher ?? "").Trim(), 200), Added = Now(),
+                Kind = kind,
             };
             data.Packages.Add(entry);
             Save(data);
@@ -314,7 +371,7 @@ public sealed partial class PackageLibrary(string folder)
         {
             var data = Load();
             var entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId} is not in the library.");
-            entry.Steps = Chain.ValidateSteps(entry, steps);
+            entry.Steps = Chain.ValidateSteps(entry, steps, data.Packages);
             Save(data);
             return entry;
         }
@@ -355,14 +412,30 @@ public sealed partial class PackageLibrary(string folder)
     /// a commit discards it.</summary>
     public PackageUpload Upload(string pkgId, string filename, string version = "", string title = "", string sha256 = "")
         => new(this, ValidId(pkgId), filename ?? "", LooseValue.Cut((version ?? "").Trim(), 60),
-            LooseValue.Cut((title ?? "").Trim(), 120), (sha256 ?? "").Trim().ToLowerInvariant());
+            LooseValue.Cut((title ?? "").Trim(), 120), (sha256 ?? "").Trim().ToLowerInvariant(), null);
 
-    /// <summary>Compare the SHA-256 published by the vendor with a stored file (hashed again now). A match marks the file
-    /// as vendor-verified; a mismatch throws and changes nothing.</summary>
-    public PackageEntry CheckVendorHash(string pkgId, string path, string sha256)
+    /// <summary>Store a Windows update (.msu / .cab) for <paramref name="osBuild"/>: the package is
+    /// <c>WU-&lt;build&gt;-&lt;KB&gt;</c>, its name the KB number and its version the build the update brings
+    /// (<see cref="WinUpdate"/>). <paramref name="digest"/> is the catalog's / vendor's hash in any form
+    /// <see cref="ParseDigest"/> takes (optional).</summary>
+    public PackageUpload UploadWinUpdate(string osBuild, string kb, string version, string filename, string digest = "")
     {
-        var sha = (sha256 ?? "").Trim().ToLowerInvariant();
-        if (!ShaRe().IsMatch(sha)) throw new PackageError("The SHA-256 must be 64 hexadecimal characters.");
+        var build = WinUpdate.ValidBuild(osBuild) ?? throw new PackageError($"Not a Windows build: '{osBuild}'");
+        var k = WinUpdate.ValidKb(kb) ?? throw new PackageError($"Not a KB number: '{kb}'");
+        var ver = WinUpdate.ValidVersion(version, build) ?? throw new PackageError($"Not a build version: '{version}'");
+        if (!WinUpdate.IsUpdateFile(filename ?? "")) throw new PackageError("A Windows update must be an .msu or .cab file.");
+        var d = (digest ?? "").Trim();
+        (string Alg, string Hex)? parsed = d.Length == 0 ? null : ParseDigest(d) ?? throw new PackageError("The hash must be a SHA-256 or SHA-1, as hex or base64.");
+        return new PackageUpload(this, WinUpdate.PackageId(build, k), filename ?? "", ver, k, parsed is { Alg: "sha256" } p ? p.Hex : "",
+            new WinUpdateMeta(build, k, parsed is { Alg: "sha1" } p1 ? p1.Hex : ""));
+    }
+
+    /// <summary>Compare a published hash (the vendor's SHA-256, or the Windows Update Catalog's SHA-1 / SHA-256, hex or
+    /// base64 - see <see cref="ParseDigest"/>) with a stored file (hashed again now). A match marks the file as checked; a
+    /// mismatch throws and changes nothing.</summary>
+    public PackageEntry CheckVendorHash(string pkgId, string path, string sha256, string source = "vendor", string? catalogTitle = null)
+    {
+        var (alg, want) = ParseDigest(sha256) ?? throw new PackageError("The hash must be a SHA-256 (or, for Windows updates, a SHA-1), as hex or base64.");
         lock (Sync)
         {
             var data = Load();
@@ -370,10 +443,15 @@ public sealed partial class PackageLibrary(string folder)
             var rec = entry.Files.FirstOrDefault(f => f.Path == path) ?? throw new PackageError($"{pkgId}: no such file in the package.");
             var f = File(rec.Path);
             if (!System.IO.File.Exists(f)) throw new PackageError($"{rec.Path} is missing from the library.");
-            var actual = Sha256File(f);
-            if (actual != sha) throw new PackageError($"SHA-256 mismatch for {rec.Path}: the vendor's value is {sha}, the file's is {actual}.");
-            rec.Sha256 = actual;
+            var (h256, h1) = HashesFile(f);
+            var actual = alg == "sha256" ? h256 : h1;
+            if (actual != want)
+                throw new PackageError($"{(alg == "sha256" ? "SHA-256" : "SHA-1")} mismatch for {rec.Path}: the published value is {want}, the file's is {actual}.");
+            if (h256 != rec.Sha256) throw new PackageError($"{rec.Path} changed since it was added (SHA-256 {h256}, registered {rec.Sha256}).");
+            rec.Sha1 = h1;
             rec.VendorChecked = true;
+            rec.HashSource = source is "vendor" or "catalog" or "catalog-name" ? source : "vendor";
+            if (catalogTitle is { Length: > 0 }) rec.CatalogTitle = LooseValue.Cut(catalogTitle, 300);
             entry.SourceHashChecked = entry.Files.All(x => x.VendorChecked);
             Save(data);
             return entry;
@@ -443,7 +521,7 @@ public sealed partial class PackageLibrary(string folder)
                 var added = f.Added ?? p.Downloaded ?? "";
                 versions[i] = (v.Version, v.Files + 1, v.Size + f.Size, string.CompareOrdinal(added, v.Added) > 0 ? added : v.Added);
             }
-            rows.Add(new PackageRow(p.Id, string.IsNullOrEmpty(p.Name) ? p.Id : p.Name, p.Publisher ?? "", p.Version ?? "",
+            rows.Add(new PackageRow(p.Id, p.Kind, p.OsBuild, p.Kb, string.IsNullOrEmpty(p.Name) ? p.Id : p.Name, p.Publisher ?? "", p.Version ?? "",
                 p.Added, p.Downloaded, p.Verified, p.VerifyOk ?? (files.Count > 0 ? true : null), p.SourceHashChecked,
                 files.Where(f => f.Kind != "manifest").Sum(f => f.Size),
                 versions.OrderByDescending(v => v.Added, StringComparer.Ordinal).Select(v => new PackageVersionRow(v.Version, v.Files, v.Size, v.Added)).ToList(),
@@ -453,11 +531,16 @@ public sealed partial class PackageLibrary(string folder)
     }
 }
 
+/// <summary>What a Windows update upload adds to its package (see <see cref="PackageLibrary.UploadWinUpdate"/>).</summary>
+public sealed record WinUpdateMeta(string OsBuild, string Kb, string Sha1);
+
 /// <summary>An upload in progress (see <see cref="PackageLibrary.Upload"/>).</summary>
 public sealed partial class PackageUpload : IDisposable
 {
     private readonly PackageLibrary _lib;
     private readonly string _pid, _version, _title, _expected;
+    private readonly WinUpdateMeta? _wu;
+    private readonly IncrementalHash _sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
     private readonly string _tmp;
     private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     private FileStream? _file;
@@ -469,7 +552,7 @@ public sealed partial class PackageUpload : IDisposable
     [GeneratedRegex("[\\\\/:*?\"<>|\\x00-\\x1f]")]
     private static partial Regex BadChars();
 
-    internal PackageUpload(PackageLibrary lib, string pid, string filename, string version, string title, string sha256)
+    internal PackageUpload(PackageLibrary lib, string pid, string filename, string version, string title, string sha256, WinUpdateMeta? wu)
     {
         var baseName = filename.Replace('\\', '/');
         baseName = baseName[(baseName.LastIndexOf('/') + 1)..];
@@ -479,7 +562,7 @@ public sealed partial class PackageUpload : IDisposable
             || stem.ToUpperInvariant() is "CON" or "PRN" or "AUX" or "NUL" || System.Text.RegularExpressions.Regex.IsMatch(stem, "^(?i:COM|LPT)[1-9]$"))
             throw new PackageError("Not a valid file name.");
         if (sha256.Length > 0 && !PackageLibrary.ShaRe().IsMatch(sha256)) throw new PackageError("The SHA-256 must be 64 hexadecimal characters.");
-        (_lib, _pid, Name, _version, _title, _expected) = (lib, pid, name, version, title, sha256);
+        (_lib, _pid, Name, _version, _title, _expected, _wu) = (lib, pid, name, version, title, sha256, wu);
         var dl = Path.Combine(lib.Folder, "_download");
         Directory.CreateDirectory(dl);
         _tmp = Path.Combine(dl, $"upload-{Guid.NewGuid():N}-{PackageLibrary.Safe(name)}");
@@ -492,6 +575,7 @@ public sealed partial class PackageUpload : IDisposable
         if (Size + chunk.Length > PackageLibrary.MaxUploadBytes) throw new PackageError("The file is too large.");
         _file.Write(chunk);
         _hash.AppendData(chunk);
+        _sha1.AppendData(chunk);
         Size += chunk.Length;
     }
 
@@ -508,8 +592,17 @@ public sealed partial class PackageUpload : IDisposable
         {
             if (Size == 0) throw new PackageError("The file is empty.");
             var actual = Convert.ToHexStringLower(_hash.GetHashAndReset());
+            var sha1 = Convert.ToHexStringLower(_sha1.GetHashAndReset());
             if (_expected.Length > 0 && actual != _expected)
                 throw new PackageError($"SHA-256 mismatch for {Name}: the vendor's value is {_expected}, the file's is {actual}. The file was not added.");
+            if (_wu is { Sha1.Length: > 0 } && sha1 != _wu.Sha1)
+                throw new PackageError($"SHA-1 mismatch for {Name}: the published value is {_wu.Sha1}, the file's is {sha1}. The file was not added.");
+            // the Windows Update Catalog names its files <name>_<SHA-1>.msu: a name like that must match the content
+            var nameSha1 = WinUpdate.NameSha1(Name);
+            if (nameSha1 is not null && nameSha1 != sha1)
+                throw new PackageError($"{Name}: the file name carries the Windows Update Catalog SHA-1 {nameSha1}, but the file's is {sha1}. " +
+                                       "The file is damaged or not the one published; it was not added.");
+            var source = _expected.Length > 0 || _wu is { Sha1.Length: > 0 } ? (_wu is null ? "vendor" : "catalog") : nameSha1 is not null ? "catalog-name" : null;
             lock (PackageLibrary.Sync)
             {
                 var data = _lib.Load();
@@ -520,6 +613,17 @@ public sealed partial class PackageUpload : IDisposable
                     data.Packages.Add(entry);
                 }
                 if (_title.Length > 0) entry.Name = _title;
+                if (_wu is not null)
+                {
+                    if (entry.Kind != "winupdate" && (entry.Files.Count > 0 || entry.Steps.Count > 0))
+                        throw new PackageError($"{entry.Id} is already in the library as another kind of package.");
+                    entry.Kind = "winupdate";
+                    entry.OsBuild = _wu.OsBuild;
+                    entry.Kb = _wu.Kb;
+                    entry.Publisher = "Microsoft";
+                }
+                else if (entry.Kind is "chain" or "winupdate")
+                    throw new PackageError($"{entry.Id} is not a file package: add its files {(entry.Kind == "chain" ? "to the library" : "as a Windows update")}.");
                 var version = _version.Length > 0 ? _version : entry.Version ?? "";
                 entry.Version = version;
                 var rel = $"{PackageLibrary.Safe(_pid)}/{PackageLibrary.Safe(version.Length > 0 ? version : "manual")}/{Name}";
@@ -530,7 +634,7 @@ public sealed partial class PackageUpload : IDisposable
                 entry.Files.Add(new PackageFile
                 {
                     Path = rel, Version = version, Added = PackageLibrary.Now(), Size = Size, Sha256 = actual, Kind = "installer",
-                    VendorChecked = _expected.Length > 0,
+                    VendorChecked = source is not null, Sha1 = sha1, HashSource = source,
                 });
                 entry.SourceHashChecked = entry.Files.All(f => f.VendorChecked);
                 entry.Downloaded = entry.Verified = PackageLibrary.Now();
@@ -561,6 +665,7 @@ public sealed partial class PackageUpload : IDisposable
         _file?.Dispose();
         _file = null;
         _hash.Dispose();
+        _sha1.Dispose();
         if (!_done)
         {
             _done = true;
