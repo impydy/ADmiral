@@ -17,6 +17,9 @@ public sealed class LoginImportResult
     [JsonPropertyName("failed")] public int Failed { get; set; }
     /// <summary>Logons of local (non-domain) accounts: their files are deleted, nothing is stored.</summary>
     [JsonPropertyName("local")] public int Local { get; set; }
+    /// <summary>Computers that still wrote a .tmp file: their scheduled task still carries the script of ADmiral 0.6.1
+    /// or older (it is replaced only when the computer restarts and runs the new startup script).</summary>
+    [JsonPropertyName("old_script"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? OldScript { get; set; }
     [JsonPropertyName("error"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Error { get; set; }
 }
 
@@ -202,6 +205,7 @@ if ($new.Count) {
         var per = new Dictionary<string, List<JsonNode?>>();
         var done = new List<string>();
         var local = new List<string>();
+        var oldScript = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in files)
         {
             var name = Path.GetFileName(path);
@@ -214,6 +218,7 @@ if ($new.Count) {
                 var why = WinSec.CheckFileOwner(path, computer, allowUsers: false, security,
                                                 known is null ? null : sids.GetValueOrDefault(known));
                 if (why is not null) throw new FormatException($"not trusted: {why}");
+                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) oldScript.Add(computer.ToUpperInvariant());
             }
             catch (Exception exc) when (exc is FormatException or InvalidDataException)
             {
@@ -268,6 +273,13 @@ if ($new.Count) {
             {
                 Log.Logger.LogWarning("Login file {Name} was read but could not be deleted: {Error}", Path.GetFileName(path), exc.Message);
             }
+        }
+        if (oldScript.Count > 0)
+        {
+            outp.OldScript = [.. oldScript];
+            const int Shown = 30;
+            store.Log("logins", I18n.T("log.logins_old", ("n", oldScript.Count),
+                ("names", string.Join(", ", oldScript.Take(Shown)) + (oldScript.Count > Shown ? $" (+{oldScript.Count - Shown})" : ""))));
         }
         if (outp.Imported > 0 || outp.Failed > 0)
             store.Log("logins", I18n.T("log.logins", ("imported", outp.Imported), ("found", outp.Found),

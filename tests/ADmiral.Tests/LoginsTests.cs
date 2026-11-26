@@ -107,6 +107,9 @@ public sealed class LoginsTests : IDisposable
         File.SetLastWriteTimeUtc(other, DateTime.UtcNow.AddHours(-3));
         var r = Logins.ImportFolder(store, Cfg(folder));
         Assert.Equal((1, 1, 0), (r.Found, r.Imported, r.Failed));
+        Assert.Equal(["PC1"], r.OldScript!);                                  // named: its task still runs the old script
+        Assert.Contains(store.Activity(), a => ((string?)a["detail"] ?? "").Contains("PC1", StringComparison.Ordinal)
+                                                && ((string?)a["detail"] ?? "").Contains(".tmp", StringComparison.Ordinal));
         Assert.False(File.Exists(old));
         Assert.True(File.Exists(young));                                       // may still be written: next time
         Assert.True(File.Exists(other));

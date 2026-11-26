@@ -12,6 +12,9 @@
 - **Szinkron tűzfalszabály:** ha csak az egyik irányban működik a szinkron, a Beállításokban egy kattintással létrehozhatod a szükséges tűzfalszabályt, vagy letöltheted a szkriptet.
 - **Felület:** az Áttekintés külön menüpont lett. A bal oldali sávból lekerült a Discord, a Jelentések és a Szkennerek.
 
+### Javítás
+- **Belépéskövetés:** ha egy gép még mindig `.tmp` fájlokat ír, a naplóban megjelenik a neve. Ez azt jelenti, hogy a gép ütemezett feladata még a régi szkriptet futtatja. A feladat csak újraindításkor frissül, vagy ha az új `ADmiral-Logins.ps1`-et egyszer rendszergazdaként lefuttatod a gépen.
+
 ### Biztonság
 - A Windows-frissítéseket csak érvényes Microsoft-aláírással telepíti.
 - A CSV exportokban a táblázatkezelő képletek nem futnak le.
@@ -35,6 +38,9 @@ Töltsd le az `ADmiral-Setup-0.7.0.exe` fájlt, és futtasd a régi verzió föl
 - **Vulnerabilities:** old CVEs, CVEs without a version and builds not running on your network are hidden by default.
 - **Sync firewall rule:** if sync works in one direction only, Settings can add the needed firewall rule with one click, or give you the script.
 - **Interface:** Overview has its own menu item. Discord, Reports and Scanners are gone from the left bar.
+
+### Fix
+- **Login tracking:** if a computer still writes `.tmp` files, the log names it. It means its scheduled task still runs the old script. The task is updated only at restart, or when you run the new `ADmiral-Logins.ps1` on the computer once as administrator.
 
 ### Security
 - Windows updates are installed only with a valid Microsoft signature.
