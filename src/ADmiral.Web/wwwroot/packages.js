@@ -294,8 +294,8 @@ function pkFilesRow(p) {
   const wu = p.kind === "winupdate";
   const rows = [...p.files].sort((a, b) => (b.added || "").localeCompare(a.added || "")).map((f) => {
     const src = f.vendor_checked
-      ? `<span class="st-ok" title="${esc(f.catalog_title || "")}">${esc(t(f.hash_source === "catalog" ? "pk.src.catalog" : f.hash_source === "catalog-name" ? "pk.src.name" : "pk.st.src"))}</span>`
-      : wu ? `<button class="btn" data-pkact="catalog" data-id="${esc(p.id)}" data-file="${esc(f.path)}" title="${esc(t("pk.wu.cat_tip"))}">${esc(t("pk.wu.cat_btn"))}</button>
+      ? `<span class="st-ok" title="${esc(f.catalog_title || "")}">${esc(t(f.hash_source === "catalog" ? "pk.src.catalog" : "pk.st.src"))}</span>`
+      : wu ? `${f.hash_source === "catalog-name" ? `<span class="faint">${esc(t("pk.src.name"))}</span> ` : ""}<button class="btn" data-pkact="catalog" data-id="${esc(p.id)}" data-file="${esc(f.path)}" title="${esc(t("pk.wu.cat_tip"))}">${esc(t("pk.wu.cat_btn"))}</button>
              <button class="btn" data-pkact="vendor" data-id="${esc(p.id)}" data-file="${esc(f.path)}">${esc(t("pk.wu.hash_btn"))}</button>`
         : `<button class="btn" data-pkact="vendor" data-id="${esc(p.id)}" data-file="${esc(f.path)}">${esc(t("pk.vendor.btn"))}</button>`;
     return `<tr><td>${esc(f.version || "–")}${!wu && f.version === p.version ? ` <span class="chip">${esc(t("pk.current"))}</span>` : ""}</td><td>${esc(f.path.split("/").pop())}</td><td class="num">${esc(pkSize(f.size))}</td><td>${esc(fmtDate(f.added))}</td>

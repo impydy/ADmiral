@@ -805,7 +805,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             throw new ArgumentException(T("err.catalog_fetch", ("err", Updates.ExplainError(exc))), exc);
         }
         if (!m.Found) throw new ArgumentException(T("err.catalog_none", ("kb", pkg.Kb), ("n", m.Searched)));
-        Pkg(() => lib.CheckVendorHash(pkgId, path, sha1, "catalog", m.Title));
+        Pkg(() => lib.CheckVendorHash(pkgId, path, sha256, "catalog", m.Title));
         Store.Log("packages", T("log.pkg_catalog", ("id", pkgId), ("file", path)));
         return new Row { ["ok"] = true, ["title"] = m.Title, ["file"] = m.FileName, ["url"] = m.Url };
     }
@@ -1341,6 +1341,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                                     break;
                                 }
                                 var seen = 0;
+                                var textLines = 0;                               // the file is written on the target: capped
                                 var logged = -100;                               // the log gets a line every 25% at most
                                 void OnProgress(string text)
                                 {
@@ -1358,7 +1359,8 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                                                 Ev($"Windows update: {pl.Time} installing {pc}%", guid);
                                             }
                                         }
-                                        else if (pl.Text.Length > 0) Ev($"Windows update: {pl.Time} {pl.Text}", guid);
+                                        else if (pl.Text.Length > 0 && textLines < MaxProgressLines)
+                                            Ev($"Windows update: {pl.Time} {Cap(pl.Text, 300)}" + (++textLines == MaxProgressLines ? " (further lines not logged)" : ""), guid);
                                     }
                                 }
                                 RemoteRunResult res;
@@ -1508,6 +1510,9 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     }
 
     private static string Cap(string s, int n) => s.Length > n ? s[..n] : s;
+
+    /// <summary>At most this many text lines of a target's Windows update progress file go into the deployment log.</summary>
+    private const int MaxProgressLines = 100;
 
     // ------------------------------------------------------------------ messages to the computers
     /// <summary>Replaces showing the message on a computer (tests): (host, text, seconds) -> result.</summary>

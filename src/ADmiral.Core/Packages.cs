@@ -441,6 +441,8 @@ public sealed partial class PackageLibrary(string folder)
             var data = Load();
             var entry = Find(data, pkgId ?? "") ?? throw new PackageError($"{pkgId}: no such file in the package.");
             var rec = entry.Files.FirstOrDefault(f => f.Path == path) ?? throw new PackageError($"{pkgId}: no such file in the package.");
+            // SHA-1 is accepted only where the publisher gives nothing better: the Windows Update Catalog's updates
+            if (alg == "sha1" && entry.Kind != "winupdate") throw new PackageError("The hash must be a SHA-256 (SHA-1 is accepted for Windows updates only).");
             var f = File(rec.Path);
             if (!System.IO.File.Exists(f)) throw new PackageError($"{rec.Path} is missing from the library.");
             var (h256, h1) = HashesFile(f);
@@ -450,7 +452,7 @@ public sealed partial class PackageLibrary(string folder)
             if (h256 != rec.Sha256) throw new PackageError($"{rec.Path} changed since it was added (SHA-256 {h256}, registered {rec.Sha256}).");
             rec.Sha1 = h1;
             rec.VendorChecked = true;
-            rec.HashSource = source is "vendor" or "catalog" or "catalog-name" ? source : "vendor";
+            rec.HashSource = source is "vendor" or "catalog" ? source : "vendor";
             if (catalogTitle is { Length: > 0 }) rec.CatalogTitle = LooseValue.Cut(catalogTitle, 300);
             entry.SourceHashChecked = entry.Files.All(x => x.VendorChecked);
             Save(data);
@@ -602,7 +604,10 @@ public sealed partial class PackageUpload : IDisposable
             if (nameSha1 is not null && nameSha1 != sha1)
                 throw new PackageError($"{Name}: the file name carries the Windows Update Catalog SHA-1 {nameSha1}, but the file's is {sha1}. " +
                                        "The file is damaged or not the one published; it was not added.");
+            // a SHA-1 in the file name only shows the file is intact: anyone can name a file after its own hash, so it does
+            // not make the file checked (the catalog lookup / a published hash does)
             var source = _expected.Length > 0 || _wu is { Sha1.Length: > 0 } ? (_wu is null ? "vendor" : "catalog") : nameSha1 is not null ? "catalog-name" : null;
+            var isChecked = source is "vendor" or "catalog";
             lock (PackageLibrary.Sync)
             {
                 var data = _lib.Load();
@@ -634,7 +639,7 @@ public sealed partial class PackageUpload : IDisposable
                 entry.Files.Add(new PackageFile
                 {
                     Path = rel, Version = version, Added = PackageLibrary.Now(), Size = Size, Sha256 = actual, Kind = "installer",
-                    VendorChecked = source is not null, Sha1 = sha1, HashSource = source,
+                    VendorChecked = isChecked, Sha1 = sha1, HashSource = source,
                 });
                 entry.SourceHashChecked = entry.Files.All(f => f.VendorChecked);
                 entry.Downloaded = entry.Verified = PackageLibrary.Now();

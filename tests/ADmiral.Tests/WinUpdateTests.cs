@@ -102,14 +102,25 @@ public sealed class WinUpdateTests : IDisposable
         var data = "real update bytes"u8.ToArray();
         var (s1, s256) = Hashes(data);
         var e = UpWu(l, $"windows11.0-kb5043080-x64_{s1}.msu", data);
-        Assert.True(e.Files[0].VendorChecked);
+        // the name proves the file is intact, not that Microsoft published it: anyone can name a file after its own SHA-1
+        Assert.False(e.Files[0].VendorChecked);
         Assert.Equal("catalog-name", e.Files[0].HashSource);
         // a damaged / swapped file under a catalog name is not added
         Assert.Throws<PackageError>(() => UpWu(l, $"windows11.0-kb5043080-x64_{s1}.cab", "tampered"u8.ToArray()));
         Assert.Throws<PackageError>(() => UpWu(l, "b.msu", data, digest: Convert.ToBase64String(SHA1.HashData("x"u8))));
         Assert.Throws<PackageError>(() => UpWu(l, "b.msu", data, digest: Convert.ToBase64String(SHA256.HashData("x"u8))));
         e = UpWu(l, "c.msu", data, digest: Convert.ToBase64String(SHA256.HashData(data)));
-        Assert.All(e.Files, f => Assert.True(f.VendorChecked));
+        Assert.All(e.Files.Where(f => f.HashSource != "catalog-name"), f => Assert.True(f.VendorChecked));
+        // SHA-1 is for Windows updates only: an application package needs its vendor's SHA-256
+        l.Create("Acme.App", "App");
+        using (var up = l.Upload("Acme.App", "setup.msi"))
+        {
+            up.Write(data);
+            up.Commit();
+        }
+        var path = l.Get("Acme.App")!.Files[0].Path;
+        Assert.Throws<PackageError>(() => l.CheckVendorHash("Acme.App", path, s1));
+        Assert.True(l.CheckVendorHash("Acme.App", path, s256).Files[0].VendorChecked);
         Assert.DoesNotContain(Directory.EnumerateFiles(l.Folder, "*", SearchOption.AllDirectories), p => p.Contains("upload-", StringComparison.Ordinal));
         Assert.NotEmpty(s256);
     }
@@ -173,6 +184,8 @@ public sealed class WinUpdateTests : IDisposable
         Assert.Equal(WinUpdate.CatalogBase + "/Search.aspx?q=KB5043080", calls[0].Url);
         Assert.Contains("\"updateID\":\"8cea1349-3ff8-4482-af64-9db80cb71ffb\"", calls[^1].Form);
         Assert.False(WinUpdate.CatalogLookup("KB5043080", new string('1', 40), new string('1', 64), Fetch).Found);
+        // where the catalog gives a SHA-256, it decides: a matching SHA-1 alone is not enough
+        Assert.False(WinUpdate.CatalogLookup("KB5043080", s1, new string('1', 64), Fetch).Found);
         Assert.ThrowsAny<ArgumentException>(() => WinUpdate.CatalogLookup("x; y", s1, s256, Fetch));
     }
 
@@ -235,12 +248,39 @@ public sealed class WinUpdateTests : IDisposable
         const string mocks = """
             function Get-ItemProperty { [pscustomobject]@{ CurrentBuildNumber = '26100'; UBR = 1742; DisplayVersion = '24H2' } }
             function Get-HotFix { [pscustomobject]@{ HotFixID = 'KB5043080'; InstalledOn = [datetime]'2026-11-12' } }
+            function Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' } } }
             """;
         var (r, prg) = RunInstall(mocks, "10.0.26100");
         Assert.Equal("current", (string)r["state"]!);
         Assert.Equal(0, (int)r["exit"]!);
         Assert.Contains("already installed (2026-11-12)", (string)r["output"]!);
         Assert.Contains("Windows build 10.0.26100.1742 (24H2)", prg);
+    }
+
+    [PwshFact]
+    public void UpdateNotSignedByMicrosoftIsRefused()
+    {
+        // DISM and expand.exe run as SYSTEM: a file without a valid Microsoft signature never reaches them
+        foreach (var sig in new[]
+                 {
+                     "[pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null }",
+                     "[pscustomobject]@{ Status = 'HashMismatch'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Windows, O=Microsoft Corporation, C=US' } }",
+                     "[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Evil, O=Not Microsoft Corporation, C=US' } }",
+                     "[pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=O=Microsoft Corporation Fake, O=Evil' } }",
+                 })
+        {
+            var mocks = $$"""
+                function Get-ItemProperty { [pscustomobject]@{ CurrentBuildNumber = '26100'; UBR = 1742; DisplayVersion = '24H2' } }
+                function Get-HotFix { throw 'must not be asked' }
+                function Start-Process { throw 'DISM must not run' }
+                function Get-AuthenticodeSignature { {{sig}} }
+                """;
+            var (r, prg) = RunInstall(mocks, "10.0.26100");
+            Assert.Equal("failed", (string)r["state"]!);
+            Assert.Contains("not signed by Microsoft", (string)r["error"]!);
+            Assert.DoesNotContain("must not", (string)r["error"]!);
+            Assert.Contains("FAILED", prg);
+        }
     }
 
     [PwshFact]

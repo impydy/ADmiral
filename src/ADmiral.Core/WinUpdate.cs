@@ -130,6 +130,11 @@ public static partial class WinUpdate
             "  $build = [string]$cv.CurrentBuildNumber",
             "  P ('Windows build 10.0.' + $build + '.' + $cv.UBR + ' (' + $cv.DisplayVersion + ')')",
             "  if ($want -and $build -ne $want) { $state = 'not_applicable'; $code = 2; throw ('the update is for Windows build ' + $want + ', this computer runs build ' + $build) }",
+            // only a file Microsoft signed goes to DISM / expand.exe (both run as SYSTEM): a forged or damaged file stops here
+            "  $sig = Get-AuthenticodeSignature -LiteralPath $pkg",
+            "  $signer = if ($sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }",
+            "  if ($sig.Status -ne 'Valid' -or $signer -notmatch '(^|,\\s*)O=Microsoft Corporation(,|$)') { $code = 1; throw ('the update file is not signed by Microsoft (signature: ' + $sig.Status + $(if ($signer) { ', ' + $signer } else { '' }) + ')') }",
+            "  P ('Signed by ' + $signer)",
             "  $hf = $null; try { $hf = Get-HotFix -Id $kb -ErrorAction SilentlyContinue } catch { }",
             "  if ($hf) {",
             "    $state = 'current'; $code = 0; $out = $kb + ' is already installed' + $(if ($hf.InstalledOn) { ' (' + $hf.InstalledOn.ToString('yyyy-MM-dd') + ')' } else { '' }); P $out",
@@ -257,7 +262,9 @@ public static partial class WinUpdate
             {
                 var s1 = PackageLibrary.ParseDigest(f.Sha1Base64);
                 var s2 = PackageLibrary.ParseDigest(f.Sha256Base64);
-                if ((s1 is { Alg: "sha1" } a && a.Hex == sha1Hex) || (s2 is { Alg: "sha256" } b && b.Hex == sha256Hex))
+                // the SHA-256 decides where the catalog gives one; the SHA-1 only for an entry without it
+                var match = s2 is { Alg: "sha256" } b ? b.Hex == sha256Hex : s1 is { Alg: "sha1" } a && a.Hex == sha1Hex;
+                if (match)
                     return new CatalogMatch(true, upd.Title.Length > 0 ? upd.Title : title, f.FileName, f.Url, entries.Count);
             }
         }

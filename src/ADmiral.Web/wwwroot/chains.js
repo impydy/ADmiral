@@ -136,7 +136,7 @@ function chStepRow(p, s, i, files) {
   if (s.file) {
     const f = files.find((x) => x.path === s.file);
     extra = f
-      ? ` <span class="faint">· ${esc(f.pkg.kind === "winupdate" ? `${f.pkg.name} ${f.pkg.os_build}` : f.pkg.name)} · ${esc(pkSize(f.size))}</span> ${f.vendor_checked ? `<span class="st-ok">${esc(t(f.hash_source === "catalog" || f.hash_source === "catalog-name" ? "pk.st.catalog" : "pk.st.src"))}</span>` : ""}`
+      ? ` <span class="faint">· ${esc(f.pkg.kind === "winupdate" ? `${f.pkg.name} ${f.pkg.os_build}` : f.pkg.name)} · ${esc(pkSize(f.size))}</span> ${f.vendor_checked ? `<span class="st-ok">${esc(t(f.hash_source === "catalog" ? "pk.st.catalog" : "pk.st.src"))}</span>` : ""}`
       : ` <span class="st-bad">${esc(t("ch.file_gone"))}</span>`;
   }
   return `<div class="ch-view"><span class="ch-num">${i + 1}.</span>${icon(CH_ICONS[s.type] || "info", 14)}<span>${esc(chStepText(s))}</span>${extra}</div>`;
