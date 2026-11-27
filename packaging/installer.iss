@@ -2,7 +2,7 @@
 ;
 ; Build after the self-contained folder build (see packaging\build.ps1):
 ;   dotnet publish src\ADmiral.Desktop -c Release -r win-x64 --self-contained -o dist\ADmiral
-;   ISCC packaging\installer.iss /DAppVersion=0.7.0 [/DSourceDir=<publish folder>]
+;   ISCC packaging\installer.iss /DAppVersion=0.7.1 [/DSourceDir=<publish folder>]
 ;
 ; The installer always installs for all users (administrator rights, one UAC prompt):
 ;   * program folder: Program Files\ADmiral (can be changed on the folder page),
@@ -26,10 +26,10 @@
 
 #define AppName "ADmiral"
 #ifndef AppVersion
-  #define AppVersion "0.7.0"
+  #define AppVersion "0.7.1"
 #endif
-; The version shown and used in the file name; a beta build passes e.g. /DVersionLabel=0.7.0-beta.7 with a numeric
-; /DAppVersion=0.7.0.7 (Windows' file version must be numbers only). Normal builds: the same as AppVersion.
+; The version shown and used in the file name; a beta build passes e.g. /DVersionLabel=0.7.1-beta.7 with a numeric
+; /DAppVersion=0.7.1.7 (Windows' file version must be numbers only). Normal builds: the same as AppVersion.
 #ifndef VersionLabel
   #define VersionLabel AppVersion
 #endif

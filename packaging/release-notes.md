@@ -1,53 +1,37 @@
-## ADmiral 0.7.0
+## ADmiral 0.7.1
 
 ### Újdonságok
-- **Csomagkönyvtár:** a telepítőket és frissítéseket egy helyen tárolod. Új csomagnál csak név és azonosító kell. A feltöltés állapotát az állapotsor mutatja.
-- **Windows-frissítések:** a lekérdezett gépek Windows buildjeihez `.msu`/`.cab` frissítést adhatsz hozzá. Ezek buildenként csoportosítva jelennek meg. Az ADmiral a Windows Update Catalogban ellenőrzi, hogy a fájl valóban a Microsofté. A telepítés távolról, DISM-mel fut, a haladás a naplóban követhető, és közben más munka is mehet.
-- **Csomagok (telepítési láncok):** lépések sorozata, amely gépenként sorban fut: telepítés, másolás, törlés, lekérdezés, újraindítás, leállítás, Wake on LAN, PowerShell, cmd, várakozás és üzenetküldés. Lenyitva látod a lépéseket.
-- **Üzenet küldése:** az Eszközök között. Üzenetet küldhetsz a bejelentkezett felhasználóknak, a címzetteket gépenként, gyűjteményenként vagy OU-nként választod ki.
-- **Gyűjtemények és jelentések:** egy gombbal hozhatsz létre dinamikus vagy statikus gyűjteményt. Az exportálás helyett jelentésszerkesztő van: oszlopok, szűrők, és a jelentésből statikus gyűjtemény is készülhet. Minden táblázat rendezhető.
-- **Leltár:** a leltár mostantól a helyi felhasználókat, a helyi csoportokat, a felhasználói profilokat és a monitorokat is mutatja. Megjelenik a BitLocker állapota is. A helyreállítási kulcs titkosítva tárolódik, és csak az AD-jelszó újbóli megadása után látható.
-- **Belépési előzmények:** a lekérdezéskor bejelentkezett felhasználó is bekerül (gépenként naponta egyszer). A megőrzési idő beállítható, alapból 2 hónap.
-- **Sérülékenységek:** a régi és verzió nélküli CVE-k, valamint a hálózaton nem futó buildek alapból rejtve vannak.
-- **Szinkron tűzfalszabály:** ha csak az egyik irányban működik a szinkron, a Beállításokban egy kattintással létrehozhatod a szükséges tűzfalszabályt, vagy letöltheted a szkriptet.
-- **Felület:** az Áttekintés külön menüpont lett. A bal oldali sávból lekerült a Discord, a Jelentések és a Szkennerek.
+- **Frissítés indításkor:** a program minden indításkor megnézi, van-e új verzió, és ha van, felugró ablakban mutatja a változásokat.
+- **Felület:** a bal oldali sáv ikonokra csukható, a cím mellett látszik a verziószám. A Beállítások csoportokba rendezve, egyszerre egy csoport látszik.
+- **Felhasználók:** a listából törölhetsz felhasználót. A helyi fiókok sehol nem jelennek meg és nem számítanak bele.
+- **Gépek:** a fa oszlopa a szövegekhez igazodik. Leállítás, újraindítás és Wake on LAN a gép menüjéből.
+- **Windows-frissítések:** a csomagnál megnézheted, mely lekérdezett gépekre illik.
 
 ### Javítás
-- **Belépéskövetés:** ha egy gép még mindig `.tmp` fájlokat ír, a naplóban megjelenik a neve. Ez azt jelenti, hogy a gép ütemezett feladata még a régi szkriptet futtatja. A feladat csak újraindításkor frissül, vagy ha az új `ADmiral-Logins.ps1`-et egyszer rendszergazdaként lefuttatod a gépen.
-
-### Biztonság
-- A Windows-frissítéseket csak érvényes Microsoft-aláírással telepíti.
-- A CSV exportokban a táblázatkezelő képletek nem futnak le.
-- Gyorsabb és biztonságosabb útvonal-ellenőrzés.
+- A Windows 11 és a Server 2025 frissítési állapota nem keveredik.
+- Egy még futó telepítést nem jelöl idő előtt sikertelennek.
+- Az elválasztó húzáskor nem ugrik.
 
 ### Frissítés
-Töltsd le az `ADmiral-Setup-0.7.0.exe` fájlt, és futtasd a régi verzió fölött. A beállítások és az adatok megmaradnak.
+Töltsd le az `ADmiral-Setup-0.7.1.exe` fájlt, és futtasd a régi verzió fölött. A beállítások és az adatok megmaradnak.
 
 ---
 
-## ADmiral 0.7.0
+## ADmiral 0.7.1
 
 ### New
-- **Package library:** installers and updates in one place. A new package only needs a name and an ID. The status bar shows the upload progress.
-- **Windows updates:** add `.msu`/`.cab` updates for the Windows builds found on your network, grouped by build. ADmiral checks in the Windows Update Catalog that the file really is Microsoft's. Installation runs remotely with DISM, its progress shows in the log, and other work can go on meanwhile.
-- **Packages (installation chains):** steps that run in order on each computer: install, copy, delete, scan, restart, shut down, Wake on LAN, PowerShell, cmd, wait and send message. Open a chain to see its steps.
-- **Send message:** under Tools. Send a message to the logged-on users; pick the targets by computer, collection or OU.
-- **Collections and reports:** one button creates a dynamic or static collection. Export is replaced by a report editor: columns, filters, and a static collection made from the report. Every table can be sorted.
-- **Inventory:** the inventory now also shows local users, local groups, user profiles and monitors, plus the BitLocker state. The recovery key is stored encrypted and shown only after you enter the AD password again.
-- **Logon history:** the user logged on during a scan is added too (once a day per computer). How long the history is kept can be set; the default is 2 months.
-- **Vulnerabilities:** old CVEs, CVEs without a version and builds not running on your network are hidden by default.
-- **Sync firewall rule:** if sync works in one direction only, Settings can add the needed firewall rule with one click, or give you the script.
-- **Interface:** Overview has its own menu item. Discord, Reports and Scanners are gone from the left bar.
+- **Update at start-up:** the program looks for a new version at every launch and shows what changed in a pop-up.
+- **Interface:** the left bar folds to its icons, and the version shows next to the title. Settings are grouped, one group at a time.
+- **Users:** users can be removed from the list. Local accounts are never shown or counted.
+- **Computers:** the tree column fits its text. Shut down, restart and Wake on LAN from the computer's menu.
+- **Windows updates:** see which scanned computers a package fits.
 
 ### Fix
-- **Login tracking:** if a computer still writes `.tmp` files, the log names it. It means its scheduled task still runs the old script. The task is updated only at restart, or when you run the new `ADmiral-Logins.ps1` on the computer once as administrator.
-
-### Security
-- Windows updates are installed only with a valid Microsoft signature.
-- Spreadsheet formulas in CSV exports no longer run.
-- Faster and safer path checking.
+- Windows 11 and Server 2025 update states are no longer mixed up.
+- A deployment still running is no longer marked failed too early.
+- The splitter no longer jumps when dragged.
 
 ### Updating
-Download `ADmiral-Setup-0.7.0.exe` and run it over the old version. Your settings and data are kept.
+Download `ADmiral-Setup-0.7.1.exe` and run it over the old version. Your settings and data are kept.
 
 Check `SHA256SUMS.txt` if you want to verify the download.
