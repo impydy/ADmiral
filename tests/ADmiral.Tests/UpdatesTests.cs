@@ -344,6 +344,90 @@ public class UpdatesTests
         Assert.Empty(Updates.ParseRelease(null));
     }
 
+    // One build number, several update lines (the shape of MSRC's 2026-Nov data for 10.0.26100): Windows 11 24H2 is at
+    // 26100.9974, Windows Server 2025 at 26100.33822, and hotpatch releases have their own revisions.
+    private static JsonNode FamilyCvrf() => JsonNode.Parse("""
+        {"DocumentTracking":{"InitialReleaseDate":"2026-11-10T08:00:00Z"},
+         "ProductTree":{"FullProductName":[
+           {"ProductID":"1","Value":"Windows 11 Version 24H2 for x64-based Systems"},
+           {"ProductID":"2","Value":"Windows 11 Version 24H2 for ARM64-based Systems"},
+           {"ProductID":"3","Value":"Windows Server 2025"},
+           {"ProductID":"4","Value":"Windows Server 2025 (Server Core installation)"},
+           {"ProductID":"6","Value":"Microsoft Office LTSC 2024"}],
+          "Branch":[{"Items":[{"Items":[{"ProductID":"5","Value":"Windows Server 2025 Datacenter: Azure Edition (Hotpatch)"}]}]}]},
+         "Vulnerability":[{"Remediations":[
+           {"Description":{"Value":"5127648"},"ProductID":["1","2"],"Type":2,"SubType":"Security Update","FixedBuild":"10.0.26100.9711"},
+           {"Description":{"Value":"5132061"},"ProductID":["2","1"],"Type":2,"SubType":"Security Update","FixedBuild":"10.0.26100.9974"},
+           {"Description":{"Value":"5132043"},"ProductID":["1"],"Type":2,"SubType":"Security Hotpatch Update","FixedBuild":"10.0.26100.9990"},
+           {"Description":{"Value":"5131080"},"ProductID":["3","4"],"Type":2,"SubType":"Security Update","FixedBuild":"10.0.26100.33822"},
+           {"Description":{"Value":"5131077"},"ProductID":["3"],"Type":2,"SubType":"Security Hotpatch Update","FixedBuild":"10.0.26100.33900"},
+           {"Description":{"Value":"5199999"},"ProductID":["5"],"Type":2,"SubType":"Security Update","FixedBuild":"10.0.26100.40000"},
+           {"Description":{"Value":"5199998"},"ProductID":["6"],"Type":2,"SubType":"Security Update","FixedBuild":"10.0.26100.50000"},
+           {"Description":{"Value":"5199997"},"ProductID":["1"],"Type":1,"FixedBuild":"10.0.26100.60000"},
+           {"Description":{"Value":"5199996"},"ProductID":["99"],"Type":2,"FixedBuild":"10.0.26100.70000"}]}]}
+        """)!;
+
+    [Fact]
+    public void ReferenceIsKeptPerFamilyWithoutHotpatchOrOtherProducts()
+    {
+        var r = Updates.ParseReleaseRefs(FamilyCvrf());
+        Assert.Equal(["10.0.26100", "10.0.26100/server"], r.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(new Updates.ReleaseRef(9974, "KB5132061", "Windows 11 Version 24H2 for x64-based Systems"), r["10.0.26100"]);
+        Assert.Equal(new Updates.ReleaseRef(33822, "KB5131080", "Windows Server 2025"), r["10.0.26100/server"]);
+        Assert.Equal(9974, Updates.ParseRelease(FamilyCvrf())["10.0.26100"]);
+
+        Assert.Equal("client", Updates.ProductFamily("Windows 10 Version 22H2 for 32-bit Systems"));
+        Assert.Equal("server", Updates.ProductFamily("Windows Server 2022, 23H2 Edition (Server Core installation)"));
+        Assert.Null(Updates.ProductFamily("Windows Server 2025 Datacenter: Azure Edition (Hotpatch)"));
+        Assert.Null(Updates.ProductFamily("Windows App Client for Windows Desktop"));
+        Assert.Null(Updates.ProductFamily(null));
+        Assert.Equal(("10.0.26100", "server"), Updates.SplitRefKey(Updates.RefKey("10.0.26100", "server")));
+        Assert.Equal(("10.0.26100", "client"), Updates.SplitRefKey("10.0.26100"));
+    }
+
+    [Fact]
+    public void ComputersAreComparedWithTheirOwnFamily()
+    {
+        var docs = new Dictionary<string, JsonNode?>
+        {
+            [$"{Updates.Msrc}/updates"] = JsonNode.Parse("""{"value":[{"ID":"2026-Nov","InitialReleaseDate":"2026-11-10T08:00:00Z","CvrfUrl":"u/nov"}]}"""),
+            ["u/nov"] = FamilyCvrf(),
+        };
+        var r = Updates.FetchReference(new ProxySettings(), 1, u => docs[u]);
+        Assert.Equal("KB5131080", r.Builds["10.0.26100/server"].Kb);
+        Assert.Equal("Windows 11 Version 24H2 for x64-based Systems", r.Builds["10.0.26100"].Product);
+        Assert.Equal("KB5132061", r.Kbs["10.0.26100"]);
+        JsonObject Inv(string caption, string build) => new() { ["os_caption"] = caption, ["os_version"] = "10.0.26100", ["os_build"] = build };
+        // the reported case: an LTSC 2024 client at 26100.9974 is current, not "missing 26100.33822"
+        var ltsc = Updates.GetSecurityState(Inv("Microsoft Windows 11 Enterprise LTSC", "26100.9974"), r.Builds);
+        Assert.Equal("current", ltsc.State);
+        Assert.Equal("10.0.26100.9974", ltsc.Latest);
+        Assert.Equal("missing", Updates.GetSecurityState(Inv("Microsoft Windows 11 Pro", "26100.9711"), r.Builds).State);
+        var srv = Updates.GetSecurityState(Inv("Microsoft Windows Server 2025 Standard", "26100.33650"), r.Builds);
+        Assert.Equal("missing", srv.State);
+        Assert.Equal("10.0.26100.33822", srv.Latest);
+        // a server on a build that has only a client line is not compared with the client's revision
+        var clientOnly = new Dictionary<string, UpdateRef> { ["10.0.26100"] = new(9974, "m", "2026-11-10") };
+        Assert.Equal("unknown", Updates.GetSecurityState(Inv("Microsoft Windows Server 2025 Standard", "26100.33650"), clientOnly).State);
+        Assert.Equal("current", Updates.GetSecurityState(new JsonObject { ["os_version"] = "10.0.26100", ["os_build"] = "26100.9974" }, clientOnly).State);
+    }
+
+    [Fact]
+    public void ReferenceKeepsKbAndProductInTheDatabase()
+    {
+        using var store = new Store(":memory:");
+        store.SaveUpdateReference(new Dictionary<string, UpdateRef>
+        {
+            ["10.0.26100"] = new(9974, "2026-Nov", "2026-11-10") { Kb = "KB5132061", Product = "Windows 11 Version 24H2 for x64-based Systems" },
+            ["10.0.26100/server"] = new(33822, "2026-Nov", "2026-11-10"),
+        }, new Dictionary<string, string>());
+        var b = store.UpdateReference().Builds;
+        Assert.Equal("KB5132061", b["10.0.26100"].Kb);
+        Assert.Equal("Windows 11 Version 24H2 for x64-based Systems", b["10.0.26100"].Product);
+        Assert.Null(b["10.0.26100/server"].Kb);
+        Assert.Equal(33822, b["10.0.26100/server"].Ubr);
+    }
+
     [Fact]
     public void SecurityStateSerialisesSnakeCase()
     {

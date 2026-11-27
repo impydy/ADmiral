@@ -20,7 +20,7 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
   }
   const errors = [];
   const requests = [];
-  p.on("pageerror", (e) => errors.push("pageerror: " + e.message));
+  p.on("pageerror", (e) => errors.push("pageerror: " + e.message + " " + (e.stack || "").slice(0, 600)));
   p.on("console", (m) => { if (m.type() === "error") errors.push("console: " + m.text()); });
   p.on("request", (r) => requests.push([r.method(), new URL(r.url()).pathname]));
   p.on("response", (r) => { if (r.status() >= 400) errors.push(`HTTP ${r.status()} ${r.request().method()} ${new URL(r.url()).pathname}`); });
@@ -79,6 +79,25 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.click("#grid tbody tr:nth-child(2) td:nth-child(2)", { button: "right" });
     await p.waitForSelector("#pop:not([hidden])");
     check((await p.textContent("#pop")).includes("Részletek"), "ctx menu items");
+    await p.keyboard.press("Escape");
+  });
+  await step("restart from the context menu", async () => {
+    await p.click("#grid tbody tr:nth-child(2) td:nth-child(2)", { button: "right" });
+    await p.hover("#pop .mi:has-text('Újraindítás / leállítás')");
+    await p.click("#pop .sub .mi:has-text('Újraindítás…')");
+    await p.waitForSelector(".dlg #pw-text");
+    check((await p.textContent(".dlg .preview")).length > 0, "power dialog lists the computer");
+    await p.fill(".dlg #pw-text", "Frissítés miatt újraindul");
+    await p.click(".dlg #pw-go");
+    await p.waitForFunction(() => [...document.querySelectorAll(".toast")].some((t) => /1 gép: sikeres/.test(t.textContent)), null, { timeout: 15000 });
+  });
+  await step("power menu in the computer window", async () => {
+    await p.keyboard.press("Enter");
+    await p.waitForSelector("#cwin:not([hidden]) .fval");
+    await p.click("[data-cw='power']");
+    await p.waitForSelector("#pop:not([hidden])");
+    check((await p.textContent("#pop")).includes("Wake on LAN"), "computer window power menu");
+    await p.keyboard.press("Escape");
     await p.keyboard.press("Escape");
   });
   await step("computer window: every category", async () => {
@@ -275,6 +294,27 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.click("#proxy-untrusted-pac");                     // turning it off needs no confirmation
     check(!(await p.locator(".cfm-layer").count()), "no dialog when switching off");
     check(!(await p.isChecked("#proxy-untrusted-pac")), "switch off");
+  });
+  await step("deploy dialog opens clean", async () => {
+    await p.click(".rail-it[data-sec='devices']");
+    await p.click(".tn[data-node='all']");
+    await p.click("#grid tbody tr:nth-child(1) td:nth-child(2)");   // a selection in the list must not carry over
+    const pk = { packages: [{ id: "Acme.Tool", name: "Acme", version: "1.0", kind: "app", steps: [],
+      files: [{ kind: "installer", path: "Acme.Tool/1.0/setup.exe", version: "1.0" }] }] };
+    await p.route("**/api/packages", (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify(pk) }));
+    for (let round = 0; round < 2; round++) {                        // and every opening starts clean again
+      await p.click(".rail-it[data-sec='deployments']");
+      await p.click("[data-dpact='new']");
+      await p.waitForSelector("#dp-file");
+      check((await p.inputValue("#dp-file")) === "", `round ${round}: a package is preselected`);
+      check(await p.isDisabled("#dp-go"), `round ${round}: start enabled without a package`);
+      check((await p.locator("#dp-list input:checked").count()) === 0, `round ${round}: targets carried over`);
+      await p.selectOption("#dp-file", "0");
+      check(!(await p.isDisabled("#dp-go")), `round ${round}: start disabled with a package`);
+      await p.click("#dp-list input >> nth=0");
+      await p.click(".dlg [data-dclose] >> nth=0");
+    }
+    await p.unroute("**/api/packages");
   });
   await step("F5 refresh keeps the page", async () => {
     await p.click(".rail-it[data-sec='devices']");

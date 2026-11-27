@@ -67,6 +67,8 @@ function chStepsDialog(id) {
     return missing + html || `<option value="">${esc(t(onlyInst ? "ch.no_installer" : "ch.no_file"))}</option>`;
   };
   const num = (i, k, v, min, max) => `<input type="number" min="${min}" max="${max}" style="width:90px" data-si="${i}" data-sk="${k}" value="${esc(v)}">`;
+  // reboot / shutdown: the optional message Windows shows before it goes down (empty: "ADmiral")
+  const pmsg = (i) => `<input data-si="${i}" data-sk="text" maxlength="512" value="${esc(steps[i].text ?? "")}" placeholder="${esc(t("ch.power_msg_ph"))}" style="flex:1;min-width:200px">`;
   const fields = (s, i) => {
     const inp = (k, ph, extra = "") => `<input data-si="${i}" data-sk="${k}" value="${esc(s[k] ?? "")}" placeholder="${esc(ph)}" ${extra}>`;
     switch (s.type) {
@@ -75,8 +77,8 @@ function chStepsDialog(id) {
       case "copy": return `<select data-si="${i}" data-sk="file">${fileOpts(s.file, false)}</select>${inp("path", t("ch.dest"), 'class="mono"')}`;
       case "delete": return inp("path", t("ch.del_path"), 'class="mono"');
       case "reboot": return `<label class="chk">${t("ch.delay")} ${num(i, "seconds", s.seconds ?? 30, 15, 3600)} s</label>
-        <label class="chk"><input type="checkbox" data-si="${i}" data-sk="wait" ${s.wait !== false ? "checked" : ""}> ${esc(t("ch.wait_back"))}</label>`;
-      case "shutdown": return `<label class="chk">${t("ch.delay")} ${num(i, "seconds", s.seconds ?? 30, 15, 3600)} s</label>`;
+        <label class="chk"><input type="checkbox" data-si="${i}" data-sk="wait" ${s.wait !== false ? "checked" : ""}> ${esc(t("ch.wait_back"))}</label>${pmsg(i)}`;
+      case "shutdown": return `<label class="chk">${t("ch.delay")} ${num(i, "seconds", s.seconds ?? 30, 15, 3600)} s</label>${pmsg(i)}`;
       case "wol": return `<label class="chk">${t("ch.wol_wait")} ${num(i, "seconds", s.seconds ?? 300, 0, 3600)} s</label>`;
       case "wait": return `<label class="chk">${t("ch.wait_for")} ${num(i, "seconds", s.seconds ?? 60, 1, 14400)} s</label>`;
       case "message": return `<textarea data-si="${i}" data-sk="text" rows="2" maxlength="500" placeholder="${esc(t("ch.msg_ph"))}">${esc(s.text || "")}</textarea>

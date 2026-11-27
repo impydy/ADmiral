@@ -127,7 +127,7 @@ public static class Cli
         AdmiralService app;
         try
         {
-            app = new AdmiralService(settings, syncAutostart: false);
+            app = new AdmiralService(settings, syncAutostart: false, closeInterrupted: false);
         }
         catch (ArgumentException exc)
         {

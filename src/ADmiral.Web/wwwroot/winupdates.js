@@ -40,19 +40,22 @@ function drawWinUpdates() {
   const missing = computers.filter((c) => c.state === "missing").length;
   const stat = status.error ? `<span class="st-bad">${esc(status.error)}</span>`
     : status.fetched_at ? esc(tText("s.upd_ok", { when: fmtDate(status.fetched_at), n: status.builds, months: (status.months || []).join(", ") })) : esc(t("wu.never"));
-  const used = new Set(computers.map((c) => c.build));
-  const emptyN = reference.filter((r) => !used.has(r.build)).length;
-  const refRows = reference.filter((r) => WU.showEmpty || used.has(r.build)).map((r) => {
-    const onBuild = computers.filter((c) => c.build === r.build);
+  // one reference row per build and family: Windows 11 24H2 and Windows Server 2025 share 10.0.26100, not their updates
+  const fam = (x) => x.family || "client";
+  const famKey = (x) => `${x.build}|${fam(x)}`;
+  const used = new Set(computers.map(famKey));
+  const emptyN = reference.filter((r) => !used.has(famKey(r))).length;
+  const refRows = reference.filter((r) => WU.showEmpty || used.has(famKey(r))).map((r) => {
+    const onBuild = computers.filter((c) => famKey(c) === famKey(r));
     const miss = onBuild.filter((c) => c.state === "missing").length;
-    return `<tr data-wubuild="${esc(r.build)}"${WU.build === r.build ? ' class="sel"' : ""}><td class="rn"></td><td>${icon("patch", 16)}${esc(r.build)}</td><td>${esc(r.build + "." + r.ubr)}</td><td>${esc(r.month || "")}</td><td>${esc(r.released || "")}</td><td class="num">${onBuild.length}</td><td class="num">${miss ? `<span class="st-bad">${miss}</span>` : "0"}</td></tr>`;
+    return `<tr data-wubuild="${esc(r.build)}"${WU.build === r.build ? ' class="sel"' : ""}><td class="rn"></td><td>${icon("patch", 16)}${esc(r.build)} <span class="faint">${esc(t("wu.fam." + fam(r)))}</span></td><td>${esc(r.build + "." + r.ubr)}</td><td>${esc(r.kb || "")}</td><td>${esc(r.product || "")}</td><td>${esc(r.month || "")}</td><td>${esc(r.released || "")}</td><td class="num">${onBuild.length}</td><td class="num">${miss ? `<span class="st-bad">${miss}</span>` : "0"}</td></tr>`;
   }).join("");
   const groups = wuGroups();
   WU.shown = groups;
   const gRows = groups.map((g, i) => `<tr data-wugroup="${i}"><td class="rn"></td><td>${icon("computer", 16)}${esc(g.installed)}</td><td>${esc(g.osName)}</td><td>${wuState(g)}</td><td class="num"><b>${g.computers.length}</b></td></tr>`).join("");
   box.innerHTML = `<div class="faint" style="margin:0 0 8px">${stat} · ${esc(tText("wu.summary", { known, total, missing }))}</div>
     <h3 class="wu-h">${esc(t("wu.ref_title"))}${emptyN ? ` <label class="chk wu-empty" style="display:inline-flex;font-weight:normal;font-size:12.5px;margin-left:12px"><input type="checkbox" id="wu-empty" ${WU.showEmpty ? "checked" : ""}> ${esc(tText("wu.show_empty", { n: emptyN }))}</label>` : ""}</h3>
-    ${refRows ? `<div class="grid-wrap wu-ref"><table class="grid"><thead><tr><th class="rn"></th>${["build", "latest", "month", "released", "devices", "missing"].map((c) => `<th>${esc(t("wu.col." + c))}</th>`).join("")}</tr></thead><tbody>${refRows}</tbody></table></div>`
+    ${refRows ? `<div class="grid-wrap wu-ref"><table class="grid"><thead><tr><th class="rn"></th>${["build", "latest", "kb", "product", "month", "released", "devices", "missing"].map((c) => `<th>${esc(t("wu.col." + c))}</th>`).join("")}</tr></thead><tbody>${refRows}</tbody></table></div>`
       : `<div class="empty">${esc(t(reference.length ? "wu.none_used" : "wu.no_ref"))}</div>`}
     <h3 class="wu-h">${esc(t("wu.inst_title"))}${WU.build ? ` <span class="faint">(${esc(WU.build)} <a href="#" data-wuclear>✕</a>)</span>` : ""}</h3>
     ${groups.length ? `<div class="grid-wrap wu-inst"><table class="grid"><thead><tr><th class="rn"></th>${["installed", "os", "state", "devices"].map((c) => `<th>${esc(t("wu.col." + c))}</th>`).join("")}</tr></thead><tbody>${gRows}</tbody></table></div>`

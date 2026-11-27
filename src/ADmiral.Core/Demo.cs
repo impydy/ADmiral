@@ -395,13 +395,18 @@ public static class Demo
     public static UpdateReferenceData Reference()
     {
         var rel = DateTimeOffset.UtcNow.AddDays(-20).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        var builds = new[] { "10.0.22631", "10.0.26100", "10.0.19045", "10.0.19044", "10.0.20348", "10.0.17763", "10.0.14393" }
-            .ToDictionary(k => k, _ => new UpdateRef(2800, "demo", rel));
         var kbs = new Dictionary<string, string>
         {
             ["10.0.26100"] = "KB5072033", ["10.0.22631"] = "KB5072035", ["10.0.19045"] = "KB5071546", ["10.0.19044"] = "KB5071546",
             ["10.0.20348"] = "KB5071547", ["10.0.17763"] = "KB5071544", ["10.0.14393"] = "KB5071543",
         };
+        // the server builds also have a server line (Windows Server 2025 / 2022 / 2019 / 2016)
+        foreach (var b in new[] { "10.0.26100", "10.0.20348", "10.0.17763", "10.0.14393" })
+            kbs[Updates.RefKey(b, Updates.FamilyServer)] = kbs[b];
+        var builds = kbs.Keys.ToDictionary(k => k, k => new UpdateRef(2800, "demo", rel)
+        {
+            Kb = kbs[k], Product = Updates.SplitRefKey(k).Family == Updates.FamilyServer ? "Windows Server (demo)" : "Windows (demo)",
+        });
         return new UpdateReferenceData(builds, ["demo"]) { Kbs = kbs };
     }
 

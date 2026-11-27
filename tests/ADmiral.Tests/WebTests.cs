@@ -301,6 +301,35 @@ public sealed class WebTests : IDisposable
     }
 
     [Fact]
+    public void Compatible_computers_api()
+    {
+        using var tmp = new CoreTemp();
+        App.FullScan();
+        App.Settings.Packages.Folder = tmp.File("pk");
+        var build = App.Computers().Select(c => (string?)(c["inventory"] as JsonObject)?["os_version"]).First(b => b is { Length: > 0 })!;
+        using (var up = App.UploadWinUpdate(build, "KB5999999", $"{WinUpdate.BuildNumber(build)}.4600", "windows11.0-kb5999999-x64.msu"))
+        {
+            up.Write(Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("update", 300))));
+            up.Commit();
+        }
+        var id = WinUpdate.PackageId(build, "KB5999999");
+        var r = W.GetJson($"/api/packages-compatible?id={Uri.EscapeDataString(id)}");
+        Assert.Equal(id, (string)r["id"]!);
+        Assert.NotEmpty(r["needs"]!.AsArray());
+        Assert.Null(r["needs"]![0]!["inventory"]);                      // names and builds only, not the inventories
+        Assert.Equal(400, W.Get("/api/packages-compatible?id=..%2Fx").Code());
+        Assert.InRange(W.Get("/api/packages-compatible").Code(), 400, 422);
+        Assert.Equal(404, W.Get("/api/packages-compatible?id=WU-1-KB1234567").Code());
+        using (var up = App.Library().Upload("Acme.Tool", "setup.msi", "1.0"))        // not a Windows update
+        {
+            up.Write(Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("installer", 300))));
+            up.Commit();
+        }
+        Assert.Equal(400, W.Get("/api/packages-compatible?id=Acme.Tool").Code());
+        Assert.InRange(W.Raw.GetAsync("/api/packages-compatible?id=Acme.Tool").GetAwaiter().GetResult().Code(), 401, 403);   // no token
+    }
+
+    [Fact]
     public void Upload_api()
     {
         using var tmp = new CoreTemp();
@@ -369,8 +398,16 @@ public sealed class WebTests : IDisposable
         Assert.Contains((string)d["status"]!, new[] { "done", "partial", "failed" });
         Assert.Equal("/S", (string?)d["args"]);
         Assert.Equal(3, (int)W.GetJson("/api/deployments")[0]!["total"]!);
-        // a tampered installer is refused before anything is sent
+        // a tampered installer: accepted at once, the job refuses it before anything is sent
         File.WriteAllBytes(Path.Combine(tmp.Path, "pk", (string)exe["path"]!), Encoding.ASCII.GetBytes("evil"));
+        using (var bad = W.Post("/api/deployments", new { package_id = "Acme.Tool", file = (string)exe["path"]!, ids = names }))
+        {
+            Assert.Equal(202, bad.Code());
+            var bb = WebFixture.Json(bad);
+            W.WaitJob(bb["job"]!);
+            Assert.Equal("failed", (string?)W.GetJson($"/api/deployments/{(long)bb["id"]!}")["status"]);
+        }
+        File.Delete(Path.Combine(tmp.Path, "pk", (string)exe["path"]!));          // missing: refused at once
         Assert.Equal(400, W.Post("/api/deployments", new { package_id = "Acme.Tool", file = (string)exe["path"]!, ids = names }).Code());
         Assert.Equal(404, W.Get("/api/deployments/999").Code());
     }

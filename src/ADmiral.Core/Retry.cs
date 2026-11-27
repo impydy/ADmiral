@@ -108,7 +108,7 @@ public static class Retry
             settings.DbPath = Path.Combine(home, settings.DbPath);
         var secrets = new SecretStore(Path.Combine(home, "secrets.json"));
         secrets.Apply(settings);
-        return new AdmiralService(settings, secrets: secrets, syncAutostart: false);
+        return new AdmiralService(settings, secrets: secrets, syncAutostart: false, closeInterrupted: false);
     }
 
     /// <summary>Host the synchronisation with the other ADmiral instances inside the service: the automatic sync (and,

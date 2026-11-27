@@ -4,7 +4,8 @@
 // Microsoft publishes every monthly security release in the MSRC Security Update Guide API
 // (https://api.msrc.microsoft.com/cvrf/v3.0). Each fix lists the Windows build that contains it (FixedBuild,
 // e.g. 10.0.22631.4460). ADmiral downloads the last few releases, keeps the newest fixed build per Windows build
-// number and compares it with the build each computer reported in its inventory. Nothing is sent about the
+// number and product family (client / server: one build number can be two update lines, see ParseReleaseRefs) and
+// compares it with the build each computer reported in its inventory. Nothing is sent about the
 // computers: the download is a plain public GET and the comparison happens locally.
 //
 // Differences to the Python version:
@@ -28,7 +29,8 @@ using Microsoft.Extensions.Logging;
 
 namespace ADmiral.Core;
 
-/// <summary>The merged MSRC reference: newest fixed revision per Windows build, and the months read.</summary>
+/// <summary>The merged MSRC reference: newest fixed revision per Windows build and family (keys as
+/// <see cref="Updates.RefKey"/>: "10.0.26100", "10.0.26100/server"), and the months read.</summary>
 public sealed record UpdateReferenceData(
     [property: JsonPropertyName("builds")] Dictionary<string, UpdateRef> Builds,
     [property: JsonPropertyName("months")] List<string> Months)
@@ -541,37 +543,121 @@ public static partial class Updates
 
     private static IEnumerable<JsonNode?> Items(JsonNode? n) => n as JsonArray ?? [];
 
-    /// <summary>One monthly CVRF document -&gt; {"10.0.22631": newest fixed revision, ...}.</summary>
-    public static Dictionary<string, long> ParseRelease(JsonNode? doc)
+    // ------------------------------------------------------------------ product families
+    // One Windows build number is shared by several products: 10.0.26100 is Windows 11 24H2 (and LTSC 2024) and
+    // Windows Server 2025, whose cumulative updates have very different revisions (26100.9974 vs 26100.33822). The
+    // reference is therefore kept per build *and* family; a computer is only compared with its own family's line.
+    // Hotpatch releases (SubType "Security Hotpatch Update", or a product named "... (Hotpatch)") are a separate line
+    // and never count: a computer on the normal monthly line would otherwise look out of date or up to date wrongly.
+
+    public const string FamilyClient = "client";
+    public const string FamilyServer = "server";
+    /// <summary>The suffix of a server build's reference key: "10.0.26100/server" (a client build's key is the build alone).</summary>
+    public const string ServerSuffix = "/" + FamilyServer;
+
+    /// <summary>The reference key of <paramref name="build"/> ("10.0.26100") for <paramref name="family"/>.</summary>
+    public static string RefKey(string build, string family) => family == FamilyServer ? build + ServerSuffix : build;
+
+    /// <summary>The build and family of a reference key: ("10.0.26100", "server") of "10.0.26100/server".</summary>
+    public static (string Build, string Family) SplitRefKey(string key) =>
+        key.EndsWith(ServerSuffix, StringComparison.Ordinal) ? (key[..^ServerSuffix.Length], FamilyServer) : (key, FamilyClient);
+
+    [GeneratedRegex(@"^Windows (?:10|11)\b", RegexOptions.IgnoreCase)]
+    private static partial Regex ClientProductRe();
+
+    /// <summary>The family of an MSRC product name: client (Windows 10 / 11), server (Windows Server), or null for
+    /// anything else (Office, a hotpatch product ...).</summary>
+    public static string? ProductFamily(string? name)
     {
-        var best = new Dictionary<string, long>(StringComparer.Ordinal);
+        var n = (name ?? "").Trim();
+        if (n.Length == 0 || n.Contains("hotpatch", StringComparison.OrdinalIgnoreCase)) return null;
+        if (n.StartsWith("Windows Server", StringComparison.OrdinalIgnoreCase)) return FamilyServer;
+        return ClientProductRe().IsMatch(n) ? FamilyClient : null;
+    }
+
+    /// <summary>The family of a computer from its inventory: server when the OS caption says so, else client.</summary>
+    public static string ComputerFamily(JsonObject? inv) => OsNameFamily(Str(inv?["os_caption"]));
+
+    /// <summary>The family of an operating system name (the inventory caption or AD's operatingSystem): server when it
+    /// says so, else client.</summary>
+    public static string OsNameFamily(string? os) =>
+        (os ?? "").Contains("Server", StringComparison.OrdinalIgnoreCase) ? FamilyServer : FamilyClient;
+
+    /// <summary>ProductID -&gt; name, from the document's ProductTree (FullProductName and the nested Branch items).</summary>
+    private static Dictionary<string, string> ProductNames(JsonNode? doc)
+    {
+        var names = new Dictionary<string, string>(StringComparer.Ordinal);
+        void Add(JsonNode? p)
+        {
+            var id = Str(p?["ProductID"]);
+            var name = Str(p?["Value"]);
+            if (id.Length > 0 && name.Length > 0) names.TryAdd(id, name);
+        }
+        var tree = doc?["ProductTree"];
+        foreach (var p in Items(tree?["FullProductName"])) Add(p);
+        var stack = new Stack<(JsonNode? Node, int Depth)>();
+        foreach (var b in Items(tree?["Branch"])) stack.Push((b, 0));
+        while (stack.Count > 0)
+        {
+            var (n, depth) = stack.Pop();
+            if (n is not JsonObject || depth > 16) continue;
+            foreach (var it in Items(n["Items"]))
+            {
+                Add(it);
+                if (it?["Items"] is JsonArray) stack.Push((it, depth + 1));
+            }
+        }
+        return names;
+    }
+
+    /// <summary>One reference entry read from a release: the newest fixed revision, its KB ("" when not named) and the
+    /// product it was read from ("" without a ProductTree).</summary>
+    public sealed record ReleaseRef(long Ubr, string Kb, string Product);
+
+    /// <summary>One monthly CVRF document -&gt; {"10.0.26100": client entry, "10.0.26100/server": server entry, ...}.
+    /// Only Windows client / server products count, hotpatch remediations are skipped. A document without a
+    /// ProductTree (hand-made data) counts every fixed build as client.</summary>
+    public static Dictionary<string, ReleaseRef> ParseReleaseRefs(JsonNode? doc)
+    {
+        var best = new Dictionary<string, ReleaseRef>(StringComparer.Ordinal);
+        var names = ProductNames(doc);
         foreach (var vuln in Items(doc?["Vulnerability"]))
             foreach (var rem in Items(vuln?["Remediations"]))
             {
+                if (Str(rem?["SubType"]).Contains("hotpatch", StringComparison.OrdinalIgnoreCase)) continue;
+                if (rem?["Type"] is JsonValue tv && tv.GetValueKind() == JsonValueKind.Number && Str(tv) != "2") continue;   // 2 = vendor fix
                 var m = BuildRe().Match(Str(rem?["FixedBuild"]));
                 if (!m.Success || !long.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var ubr)) continue;
-                var key = m.Groups[1].Value;
-                if (!best.TryGetValue(key, out var cur) || ubr > cur) best[key] = ubr;
+                var kb = WinUpdate.ValidKb(Str(rem?["Description"]?["Value"])) ?? "";
+                var build = m.Groups[1].Value;
+                // family -> a product name of it (x64 preferred: it is what the computers mostly run)
+                var families = new Dictionary<string, string>(StringComparer.Ordinal);
+                if (names.Count == 0) families[FamilyClient] = "";
+                else
+                    foreach (var pid in Items(rem?["ProductID"]))
+                    {
+                        if (!names.TryGetValue(Str(pid), out var name) || ProductFamily(name) is not { } fam) continue;
+                        if (!families.TryGetValue(fam, out var had)
+                            || (!had.Contains("x64", StringComparison.OrdinalIgnoreCase) && name.Contains("x64", StringComparison.OrdinalIgnoreCase)))
+                            families[fam] = name;
+                    }
+                foreach (var (fam, product) in families)
+                {
+                    var key = RefKey(build, fam);
+                    if (!best.TryGetValue(key, out var cur) || ubr > cur.Ubr || (ubr == cur.Ubr && cur.Kb.Length == 0 && kb.Length > 0))
+                        best[key] = new ReleaseRef(ubr, kb, product);
+                }
             }
         return best;
     }
 
+    /// <summary>One monthly CVRF document -&gt; {"10.0.22631": newest fixed revision, ...} (keys as <see cref="RefKey"/>).</summary>
+    public static Dictionary<string, long> ParseRelease(JsonNode? doc) =>
+        ParseReleaseRefs(doc).ToDictionary(kv => kv.Key, kv => kv.Value.Ubr, StringComparer.Ordinal);
+
     /// <summary>One monthly CVRF document -&gt; {"10.0.22631": (newest fixed revision, its KB number or "")}.</summary>
-    public static Dictionary<string, (long Ubr, string Kb)> ParseReleaseKbs(JsonNode? doc)
-    {
-        var best = new Dictionary<string, (long Ubr, string Kb)>(StringComparer.Ordinal);
-        foreach (var vuln in Items(doc?["Vulnerability"]))
-            foreach (var rem in Items(vuln?["Remediations"]))
-            {
-                var m = BuildRe().Match(Str(rem?["FixedBuild"]));
-                if (!m.Success || !long.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var ubr)) continue;
-                var kb = WinUpdate.ValidKb(Str(rem?["Description"]?["Value"])) ?? "";
-                var key = m.Groups[1].Value;
-                if (!best.TryGetValue(key, out var cur) || ubr > cur.Ubr || (ubr == cur.Ubr && cur.Kb.Length == 0 && kb.Length > 0))
-                    best[key] = (ubr, kb);
-            }
-        return best;
-    }
+    public static Dictionary<string, (long Ubr, string Kb)> ParseReleaseKbs(JsonNode? doc) =>
+        ParseReleaseRefs(doc).ToDictionary(kv => kv.Key, kv => (kv.Value.Ubr, kv.Value.Kb), StringComparer.Ordinal);
 
     /// <summary>A text fetcher <c>(url, form or null) -&gt; body</c> through the configured proxy: GET, or a POST of the
     /// form fields (application/x-www-form-urlencoded). The body is at most <see cref="MaxJsonBytes"/>.</summary>
@@ -614,11 +700,14 @@ public static partial class Updates
             var doc = get(cvrf);
             var released = Str(doc?["DocumentTracking"]?["InitialReleaseDate"]) is { Length: > 0 } r ? r : Str(upd["InitialReleaseDate"]);
             if (released.Length > 10) released = released[..10];
-            foreach (var (key, (ubr, kb)) in ParseReleaseKbs(doc))
-                if (!builds.TryGetValue(key, out var cur) || ubr > cur.Ubr)
+            foreach (var (key, rr) in ParseReleaseRefs(doc))
+                if (!builds.TryGetValue(key, out var cur) || rr.Ubr > cur.Ubr)
                 {
-                    builds[key] = new UpdateRef(ubr, month, released);
-                    if (kb.Length > 0) kbs[key] = kb;
+                    builds[key] = new UpdateRef(rr.Ubr, month, released)
+                    {
+                        Kb = rr.Kb.Length > 0 ? rr.Kb : null, Product = rr.Product.Length > 0 ? rr.Product : null,
+                    };
+                    if (rr.Kb.Length > 0) kbs[key] = rr.Kb;
                     else kbs.Remove(key);
                 }
         }
@@ -634,7 +723,8 @@ public static partial class Updates
         if (inv is null) return SecurityState.Unknown;
         var ver = Str(inv["os_version"]);
         var parts = Str(inv["os_build"]).Split('.');
-        if (!builds.TryGetValue(ver, out var reference)) return SecurityState.Unknown;
+        // only the computer's own family: a Windows 11 is never compared with Windows Server's line of the same build
+        if (!builds.TryGetValue(RefKey(ver, ComputerFamily(inv)), out var reference)) return SecurityState.Unknown;
         if (parts.Length < 2 || !long.TryParse(parts[1].Trim(), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var ubr))
             return SecurityState.Unknown;
         var state = "current";

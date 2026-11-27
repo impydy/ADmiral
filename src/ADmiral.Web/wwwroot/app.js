@@ -719,6 +719,8 @@ function computerMenu(ctx) {
     { label: t("m.scan_ping"), icon: "ping", action: () => scanSelection("scan"), disabled: !hasSel && ctx },
     { label: t("m.scan_inv"), icon: "details", action: () => scanSelection("collect"), disabled: !hasSel && ctx },
     "-",
+    { label: t("m.power"), icon: "refresh", disabled: !hasSel, sub: hasSel ? powerMenuItems([...S.sel]) : [] },
+    "-",
     { label: t("m.add_tag"), icon: "tag", action: () => tagDialog(true), disabled: !hasSel },
     { label: t("m.remove_tag"), action: () => tagDialog(false), disabled: !hasSel },
     { label: t("m.add_to_coll"), icon: "coll_stat", action: addToCollectionDialog, disabled: !hasSel },
@@ -732,6 +734,46 @@ function computerMenu(ctx) {
     "-",
     { label: t("m.copy_names"), icon: "copy", key: "Ctrl+C", action: ACTIONS.copy, disabled: !hasSel },
   ];
+}
+
+/* restart / shut down / wake on LAN: the right-click menu's and the computer window's entries */
+function powerMenuItems(guids) {
+  return [
+    { label: t("m.power_reboot"), icon: "refresh", action: () => powerDialog(guids, "reboot") },
+    { label: t("m.power_shutdown"), icon: "block", action: () => powerDialog(guids, "shutdown") },
+    { label: t("m.power_wol"), icon: "ping", action: () => powerDialog(guids, "wol") },
+  ];
+}
+
+/* Confirm and start a power action: the computers as the server resolves them, the delay and the message shown
+   before Windows goes down (restart / shutdown), then the "power" job. */
+async function powerDialog(guids, action) {
+  if (!guids.length) return toast(t("need_selection"), true);
+  const pv = await guard(() => api("POST", "/api/deployments/preview", { ids: guids, fleet_ids: [] }));
+  if (!pv) return;
+  if (!pv.ids.length) return toast(pv.refused.length ? tText("dp.skipped", { names: pv.refused.join(", ") }) : t("dp.pick_computers"), true);
+  const MAX = 40;
+  const names = pv.names.slice(0, MAX).join(", ") + (pv.names.length > MAX ? " " + tText("dp.more", { n: pv.names.length - MAX }) : "");
+  const wol = action === "wol";
+  const box = dialog(t("pw.title." + action), `<div>${esc(tText("pw.confirm." + action, { n: pv.ids.length }))}</div>
+    <div class="preview" style="max-height:140px;overflow:auto">${esc(names)}</div>
+    ${pv.refused.length ? `<div class="faint">${esc(tText("dp.skipped", { names: pv.refused.join(", ") }))}</div>` : ""}
+    ${wol ? `<div class="faint">${esc(t("pw.wol_hint"))}</div>`
+    : `<label class="chk">${esc(t("ch.delay"))} <input id="pw-secs" type="number" min="15" max="3600" value="60" style="width:90px"> s</label>
+    <label class="fld"><span>${esc(t("pw.text"))}</span><input id="pw-text" type="text" maxlength="512" placeholder="${esc(t("ch.power_msg_ph"))}"></label>`}`,
+    `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" id="pw-go">${esc(t("pw.go." + action))}</button>`);
+  $("#pw-go", box).onclick = () => guard(async () => {
+    const body = { ids: pv.ids, action };
+    if (!wol) {
+      body.seconds = Math.min(3600, Math.max(15, Number($("#pw-secs", box).value) || 60));
+      const text = $("#pw-text", box).value.trim();
+      if (text) body.text = text;
+    }
+    const job = await api("POST", "/api/power", body);
+    closeDialog();
+    toast(t("job.power") + "…");
+    await pollJob(job.id);
+  });
 }
 
 function menuHTML(items) {
@@ -1057,7 +1099,7 @@ function renderCwToolbar() {
   const b = (id, ic, label) => `<button class="tb" data-cw="${id}">${icon(ic, 30)}<span>${esc(t(label))}</span></button>`;
   $("#cwin-toolbar").innerHTML = b("scan", "scan", "cw.scan") + b("ping", "ping", "m.scan_ping") + (isDesktop() ? b("ra", "ra", "cw.ra") + b("events", "log", "cw.events") + b("mmc", "admin", "cw.mmc") : "") + `<span class="tb-sep"></span>`
     + b("prev", "prev", "cw.prev") + b("next", "next", "cw.next") + `<span class="tb-sep"></span>`
-    + b("allow", "block", "cw.toggle_disallow") + b("copy", "copy", "tb.copy") + b("print", "printer", "cw.print") + `<span class="tb-sep"></span>` + b("close", "back", "cw.close");
+    + b("power", "refresh", "m.power") + b("allow", "block", "cw.toggle_disallow") + b("copy", "copy", "tb.copy") + b("print", "printer", "cw.print") + `<span class="tb-sep"></span>` + b("close", "back", "cw.close");
 }
 
 function renderComputer() {
@@ -1298,6 +1340,8 @@ function bindComputerWindow() {
     const b = e.target.closest("[data-cw]");
     if (b && !b.disabled) {
       const c = S.cw?.data;
+      // until the computer's data has loaded, only the window's own navigation works
+      if (!c && !["close", "prev", "next"].includes(b.dataset.cw)) return;
       ({
         close: closeComputer, prev: () => cwStep(-1), next: () => cwStep(1),
         scan: () => startJob("full", { ids: [c.guid] }), ping: () => startJob("scan", { ids: [c.guid] }),
@@ -1309,11 +1353,12 @@ function bindComputerWindow() {
         mmc: () => guard(() => window.pywebview.api.computer_management(c.dns_hostname || c.name)),
         copy: async () => { await copyText(c.dns_hostname || c.name); toast(tText("copied", { n: 1 })); },
         print: printComputer,
+        power: () => { e.stopPropagation(); const r = b.getBoundingClientRect(); showMenu(powerMenuItems([c.guid]), r.left, r.bottom, b); },
       })[b.dataset.cw]?.();
       return;
     }
     const cat = e.target.closest("[data-cat]");
-    if (cat) { S.cw.cat = cat.dataset.cat; S.cw.filter = ""; renderComputer(); }
+    if (cat && S.cw) { S.cw.cat = cat.dataset.cat; S.cw.filter = ""; if (S.cw.data) renderComputer(); }
   });
 }
 

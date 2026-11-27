@@ -145,6 +145,8 @@ function net { @('Alias name     Administrators', 'Comment        Administrators
         d.Add("winupdate");
         d.Add("winupdate_cab");
         d.Add("message");
+        d.Add("power");
+        d.Add("power_text");
         return d;
     }
 
@@ -159,6 +161,8 @@ function net { @('Alias name     Administrators', 'Comment        Administrators
             "KB5043080", "10.0.26100", new Dictionary<string, string> { [WinUpdate.ProgressSuffix] = @"C:\r\p.txt", ["-dism.txt"] = @"C:\r\d.txt", ["-dism.log"] = @"C:\r\d.log" },
             "r", "o", "t"),
         "message" => Chain.MessageScript(@"C:\r\admiral-0123456789ab-user.txt", 60, "r", "o", "t"),
+        "power" => Chain.PowerScript(true, 30, "r", "o", "t"),
+        "power_text" => Chain.PowerScript(false, 30, "r", "o", "t", @"C:\r\admiral-0123456789ab-user.txt"),
         _ => Collector.Script(name),
     };
 

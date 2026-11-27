@@ -197,14 +197,19 @@ function pkWuBuilds() {
   for (const c of wu.computers || []) {
     if (!c.build) continue;
     let b = by.get(c.build);
-    if (!b) by.set(c.build, (b = { build: c.build, n: 0, os: {} }));
+    if (!b) by.set(c.build, (b = { build: c.build, n: 0, os: {}, fam: {} }));
     b.n++;
     if (c.os) b.os[c.os] = (b.os[c.os] || 0) + 1;
+    const f = c.family || "client";
+    b.fam[f] = (b.fam[f] || 0) + 1;
   }
-  const ref = new Map((wu.reference || []).map((r) => [r.build, r]));
+  // the reference of the family most computers on the build belong to (10.0.26100: Windows 11 24H2 or Server 2025)
+  const ref = new Map((wu.reference || []).map((r) => [`${r.build}|${r.family || "client"}`, r]));
+  const top = (o) => Object.entries(o).sort((x, y) => y[1] - x[1])[0]?.[0] || "";
   return [...by.values()].map((b) => {
-    const r = ref.get(b.build);
-    return { ...b, os: Object.entries(b.os).sort((x, y) => y[1] - x[1])[0]?.[0] || "", latest: r ? `${b.build.replace(/^10\.0\./, "")}.${r.ubr}` : "", kb: r?.kb || "", month: r?.month || "" };
+    const family = top(b.fam) || "client";
+    const r = ref.get(`${b.build}|${family}`);
+    return { ...b, os: top(b.os), family, latest: r ? `${b.build.replace(/^10\.0\./, "")}.${r.ubr}` : "", kb: r?.kb || "", month: r?.month || "" };
   }).sort((a, b) => b.build.localeCompare(a.build, undefined, { numeric: true }));
 }
 const pkWuReady = () => !!(PK.wu?.status?.fetched_at && pkWuBuilds().length);
@@ -312,7 +317,8 @@ function pkRow(p) {
   const ver = `${esc(p.version)}${!wu && p.versions.length > 1 ? ` <span class="faint">${esc(tText("pk.n_versions", { n: p.versions.length }))}</span>` : ""}`;
   return `<tr data-pk="${esc(p.id)}"><td class="rn"></td><td>${icon(wu ? "patch" : "package", 16)}${esc(p.name)}</td><td class="mono">${esc(p.id)}</td><td>${esc(p.publisher)}</td><td>${ver}</td>
     <td class="num">${p.files.length ? esc(pkSize(p.size)) : ""}</td><td>${esc(fmtDate(p.downloaded))}</td><td>${pkState(p)}</td>
-    <td class="nowrap">${wu ? "" : `<button class="btn" data-pkact="addfile" data-id="${esc(p.id)}">${esc(t("pk.addfile_row"))}</button> `}
+    <td class="nowrap">${wu ? `<button class="btn" data-pkact="compat" data-id="${esc(p.id)}"${p.files.length ? "" : " disabled"} title="${esc(t("pk.wu.compat_tip"))}">${esc(t("pk.wu.compat_btn"))}</button> `
+                           : `<button class="btn" data-pkact="addfile" data-id="${esc(p.id)}">${esc(t("pk.addfile_row"))}</button> `}
     <button class="btn" data-pkact="verify" data-id="${esc(p.id)}"${p.files.length ? "" : " disabled"}>${esc(t("pk.verify"))}</button>
     <button class="btn" data-pkact="remove" data-id="${esc(p.id)}">${esc(t("pk.remove"))}</button></td></tr>${files}`;
 }
@@ -353,6 +359,29 @@ async function pkLoad() {
   if (S.section === "chains" && typeof drawChains === "function") drawChains();
 }
 
+/* Which collected computers a Windows update fits (from their inventories, nothing is contacted): needs it / already
+   installed / not compatible / no inventory. "Install on these" opens the new deployment with the ones that need it. */
+async function pkCompatDialog(id) {
+  const r = await guard(() => api("GET", `/api/packages-compatible?id=${encodeURIComponent(id)}`));
+  if (!r) return;
+  const why = (x) => t("pk.wu.cw." + x.reason);
+  const section = (key, list, cls) => `<h4 class="wu-h" style="margin:10px 0 4px"><span class="${cls}">${esc(tText("pk.wu.cg." + key, { n: list.length }))}</span></h4>`
+    + (list.length ? `<div class="grid-wrap" style="max-height:28vh;overflow:auto"><table class="grid"><thead><tr><th class="rn"></th><th>${esc(t("wu.col.computer"))}</th><th>${esc(t("wu.col.installed"))}</th><th>${esc(t("pk.wu.c_reason"))}</th></tr></thead><tbody>
+      ${list.map((c) => `<tr><td class="rn"></td><td>${icon("computer", 16)}${esc(c.name)}</td><td>${esc(c.installed)}</td><td class="faint">${esc(why(c))}</td></tr>`).join("")}</tbody></table></div>` : "");
+  const fam = r.family ? t("wu.fam." + r.family) : t("pk.wu.fam_unknown");
+  const box = dialog(tText("pk.wu.compat_title", { kb: r.kb || r.id }),
+    `<div class="faint">${esc(tText("pk.wu.compat_info", { build: pkBuildNum(r.os_build), version: r.version || "?", family: fam, arch: r.arch || "?" }))}</div>
+     ${r.family ? "" : `<div class="st-warn" style="margin-top:4px">${esc(t("pk.wu.fam_warn"))}</div>`}
+     ${section("needs", r.needs, "st-warn")}${section("installed", r.installed, "st-ok")}${section("incompatible", r.incompatible, "faint")}${section("unknown", r.unknown, "faint")}`,
+    `<button class="btn" data-dclose>${esc(t("d.close"))}</button><button class="btn primary" id="pkc-go"${r.needs.length && r.file ? "" : " disabled"}>${esc(tText("pk.wu.compat_go", { n: r.needs.length }))}</button>`);
+  $$("[data-dclose]", box).forEach((b) => (b.onclick = closeDialog));
+  $("#pkc-go", box).onclick = () => {
+    closeDialog();
+    // the deployment dialog asks for the confirmation as always; it only starts with these computers ticked
+    dpNewDialog({ pid: r.id, path: r.file, ids: r.needs.map((c) => c.guid) });
+  };
+}
+
 /* The chains (Packages page) that use a file of this package: removing it would break them. */
 function pkUsedBy(p) {
   const paths = new Set(p.files.map((f) => f.path));
@@ -383,6 +412,7 @@ function renderPackagesPage(el) {
       const id = b.dataset.id, p = PK.data?.packages.find((x) => x.id === id);
       if (b.dataset.pkact === "addfile") return pkPick(id);
       if (b.dataset.pkact === "catalog") return pkCatalog(id, b.dataset.file);
+      if (b.dataset.pkact === "compat") return pkCompatDialog(id);
       if (b.dataset.pkact === "vendor") {
         const file = b.dataset.file;
         return guard(async () => {

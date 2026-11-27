@@ -31,6 +31,10 @@ public static partial class Chain
     public const int MaxWait = 4 * 3600;
     public const int DefaultWait = 60;
     public const int MaxMessageChars = 500;
+    /// <summary>reboot / shutdown: the longest message shutdown.exe /c takes.</summary>
+    public const int MaxPowerMessageChars = 512;
+    /// <summary>reboot / shutdown: the message shown when the step has none.</summary>
+    public const string DefaultPowerMessage = "ADmiral";
     public const int DefaultMessageSeconds = 300;
 
     // C:\folder\file.ext - absolute, local drive, no wildcard / stream / control characters. Each segment is exactly
@@ -74,14 +78,25 @@ public static partial class Chain
     /// <summary>The message text: one paragraph of at most <see cref="MaxMessageChars"/>; line breaks become spaces,
     /// control characters and double quotes (they would break msg.exe's command line) are replaced, and it never starts
     /// with '/' or '-' (msg.exe would take it for one of its options, e.g. /SERVER:).</summary>
-    public static string ValidMessage(string? text)
+    public static string ValidMessage(string? text) => CleanMessage(text, MaxMessageChars)
+        ?? throw new ArgumentException(I18n.T("err.chain_message", ("n", MaxMessageChars)));
+
+    /// <summary>The optional message of a reboot / shutdown step (shutdown.exe /c): the rules of <see cref="ValidMessage"/>,
+    /// at most <see cref="MaxPowerMessageChars"/>; null when it is empty (the step shows <see cref="DefaultPowerMessage"/>).</summary>
+    public static string? ValidPowerMessage(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        return CleanMessage(text, MaxPowerMessageChars)
+               ?? throw new ArgumentException(I18n.T("err.chain_message", ("n", MaxPowerMessageChars)));
+    }
+
+    private static string? CleanMessage(string? text, int max)
     {
         var sb = new StringBuilder();
         foreach (var ch in (text ?? "").Replace("\r\n", "\n"))
             sb.Append(ch is '\n' or '\t' ? ' ' : ch == '"' ? '\'' : char.IsControl(ch) || ch is '\u2028' or '\u2029' ? ' ' : ch);
         var t = string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries)).TrimEnd('\\', ' ').TrimStart('/', '-', ' ');
-        if (t.Length == 0 || t.Length > MaxMessageChars) throw new ArgumentException(I18n.T("err.chain_message", ("n", MaxMessageChars)));
-        return t;
+        return t.Length == 0 || t.Length > max ? null : t;
     }
 
     /// <summary>The cleaned chain of <paramref name="entry"/>: every step checked, unknown fields dropped. Files must belong
@@ -149,6 +164,7 @@ public static partial class Chain
             case "shutdown":
                 c.Seconds = Math.Clamp(s.Seconds ?? DefaultPowerDelay, MinPowerDelay, 3600);
                 if (type == "reboot") c.Wait = s.Wait != false;
+                c.Text = ValidPowerMessage(s.Text);
                 break;
             case "wol":
                 c.Seconds = Math.Clamp(s.Seconds ?? DefaultWolWait, 0, 3600);
@@ -173,12 +189,14 @@ public static partial class Chain
         "message" => $"message to the logged-on users ({s.Seconds}s): {FirstLine(s.Text)}",
         "copy" => $"copy {System.IO.Path.GetFileName(s.File)} -> {s.Path}",
         "delete" => $"delete {s.Path}",
-        "reboot" => $"reboot in {s.Seconds}s" + (s.Wait == true ? " and wait" : ""),
-        "shutdown" => $"shutdown in {s.Seconds}s",
+        "reboot" => $"reboot in {s.Seconds}s" + (s.Wait == true ? " and wait" : "") + PowerText(s.Text),
+        "shutdown" => $"shutdown in {s.Seconds}s" + PowerText(s.Text),
         "wol" => $"wake on LAN (wait {s.Seconds}s)",
         "powershell" or "cmd" => $"{s.Type}: {FirstLine(s.Script)}",
         _ => s.Type,
     } + (s.ContinueOnError == true ? " [continue on error]" : "");
+
+    private static string PowerText(string? text) => string.IsNullOrEmpty(text) ? "" : $", message: {FirstLine(text)}";
 
     private static string FirstLine(string? text)
     {
@@ -279,9 +297,20 @@ public static partial class Chain
     /// <summary>The message as the file sent along (UTF-8, no BOM).</summary>
     public static byte[] MessageFileBytes(string text) => new UTF8Encoding(false).GetBytes(text);
 
-    /// <summary>shutdown.exe /r or /s after <paramref name="seconds"/> (planned, with a message), forced.</summary>
-    public static string PowerScript(bool reboot, int seconds, string run, string out_, string tmp) => Frame(string.Join("\n",
-        $"  $out = (& shutdown.exe {(reboot ? "/r" : "/s")} /f /t {Math.Clamp(seconds, MinPowerDelay, 3600).ToString(CultureInfo.InvariantCulture)} /d p:4:1 /c 'ADmiral' 2>&1 | Out-String)",
+    /// <summary>shutdown.exe /r or /s after <paramref name="seconds"/> (planned, forced) with the message of
+    /// <paramref name="textFile"/> (UTF-8, sent along) or <see cref="DefaultPowerMessage"/>. The text is never part of the
+    /// script: it is read into a variable and handed to shutdown.exe as one argument; what could break the argument
+    /// (control characters, double quotes, a trailing backslash) is removed again on the computer.</summary>
+    public static string PowerScript(bool reboot, int seconds, string run, string out_, string tmp, string? textFile = null) => Frame(string.Join("\n",
+        textFile is null
+            ? $"  $m = {Deploy.Q(DefaultPowerMessage)}"
+            : $"  $m = [IO.File]::ReadAllText({Deploy.Q(textFile)}, [Text.Encoding]::UTF8)",
+        "  $m = ($m -replace '[\\x00-\\x1f\\x7f\"\\u2028\\u2029]', ' ')",
+        // cap first, then trim: a cut must not leave a trailing backslash (it would escape the closing quote)
+        $"  if ($m.Length -gt {MaxPowerMessageChars}) {{ $m = $m.Substring(0, {MaxPowerMessageChars}) }}",
+        "  $m = ($m -replace '^[\\s/-]+', '') -replace '[\\s\\\\]+$', ''",
+        $"  if ($m.Length -eq 0) {{ $m = {Deploy.Q(DefaultPowerMessage)} }}",
+        $"  $out = (& shutdown.exe {(reboot ? "/r" : "/s")} /f /t {Math.Clamp(seconds, MinPowerDelay, 3600).ToString(CultureInfo.InvariantCulture)} /d p:4:1 /c $m 2>&1 | Out-String)",
         "  $code = $LASTEXITCODE"), run, out_, tmp);
 
     /// <summary>The user's cmd script as a file: no echo, UTF-8 code page, CRLF line ends.</summary>

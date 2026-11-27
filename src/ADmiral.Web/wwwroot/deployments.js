@@ -4,7 +4,7 @@
 "use strict";
 
 const DP = { list: [], sel: null, detail: null, timer: null };
-const DP_STEPS = ["queued", "connecting", "copying", "starting", "installing", "cleanup", "done"];
+const DP_STEPS = ["queued", "verifying", "connecting", "copying", "starting", "installing", "cleanup", "done"];
 const DP_PRESETS = { msi: ["/qn /norestart", "/quiet /norestart"], exe: ["/S", "/silent", "/verysilent /norestart", "/quiet /norestart", "--silent", ""] };
 const dpExt = (p) => (p.toLowerCase().match(/\.(msi|exe)$/) || [])[1];
 
@@ -24,8 +24,8 @@ function dpCode(x) {
 // one step of a chain as text (the deploy dialog)
 function chStepText(s) {
   const f = (s.file || "").split("/").pop();
-  const d = { install: `${f} ${s.args || ""}`, copy: `${f} → ${s.path}`, delete: s.path, reboot: tText(s.wait ? "ch.reboot_wait" : "ch.in_s", { s: s.seconds }),
-    shutdown: tText("ch.in_s", { s: s.seconds }), wol: tText("ch.wol_text", { s: s.seconds }), powershell: (s.script || "").split("\n")[0], cmd: (s.script || "").split("\n")[0],
+  const d = { install: `${f} ${s.args || ""}`, copy: `${f} → ${s.path}`, delete: s.path, reboot: tText(s.wait ? "ch.reboot_wait" : "ch.in_s", { s: s.seconds }) + (s.text ? ` „${s.text}”` : ""),
+    shutdown: tText("ch.in_s", { s: s.seconds }) + (s.text ? ` „${s.text}”` : ""), wol: tText("ch.wol_text", { s: s.seconds }), powershell: (s.script || "").split("\n")[0], cmd: (s.script || "").split("\n")[0],
     wait: tText("ch.wait_text", { s: s.seconds }), message: `„${s.text || ""}” (${tText("ch.msg_text", { s: s.seconds })})` }[s.type] || "";
   return `${t("ch.type." + s.type)}${d ? ": " + d.trim() : ""}${s.continue_on_error ? " (" + t("ch.continue") + ")" : ""}`;
 }
@@ -37,7 +37,7 @@ function dpTargetState(x) {
     return `<span class="st-run">${esc(tText("ch.running", { i, n, type: t("ch.type." + type) }))}</span>${bar}`;
   }
   if (x.step !== "done") {
-    const pct = x.step === "copying" && x.percent != null ? ` ${x.percent}%` : "";
+    const pct = (x.step === "copying" || x.step === "verifying") && x.percent != null ? ` ${x.percent}%` : "";
     const i = DP_STEPS.indexOf(x.step);
     const bar = `<span class="meter"><span style="width:${Math.round((i / (DP_STEPS.length - 1)) * 100)}%"></span></span>`;
     return `<span class="st-run">${esc(t("dp.step." + x.step))}${pct}</span>${bar}`;
@@ -46,6 +46,7 @@ function dpTargetState(x) {
   if (x.outcome === "reboot") return `<span class="st-warn">${esc(t("dp.out.reboot"))}${dpCode(x)}</span>`;
   if (x.outcome === "unreachable") return `<span class="faint">${esc(t("dp.out.unreachable"))}</span>`;
   if (x.outcome === "current") return `<span class="faint">${esc(t("dp.out.current"))}</span>`;
+  if (String(x.error || "").startsWith("INTEGRITY:")) return `<span class="st-bad">${icon("block", 14)} ${esc(t("dp.out.integrity"))}</span>`;
   return `<span class="st-bad">${esc(t("dp.out.failed"))}${dpCode(x)}</span>`;
 }
 
@@ -233,6 +234,16 @@ function dpConfirmText(pkg, pv) {
 }
 
 /* pre: {pid, chain} or {pid, path} - the option chosen when the dialog opens (from the Packages page). */
+// a toast that stays (with a pulsing text) until the returned function is called
+function dpBusy(msg) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.setAttribute("role", "status");
+  el.innerHTML = `<span class="st-run">${esc(msg)}</span>`;
+  $("#toasts").appendChild(el);
+  return () => el.remove();
+}
+
 async function dpNewDialog(pre) {
   const pk = await guard(() => api("GET", "/api/packages"));
   if (!pk) return;
@@ -247,14 +258,16 @@ async function dpNewDialog(pre) {
   for (const p of pk.packages.filter((x) => x.kind === "winupdate").sort((a, b) => (b.os_build || "").localeCompare(a.os_build || "", undefined, { numeric: true })))
     for (const f of p.files) if (/\.(msu|cab)$/i.test(f.path)) options.push({ pid: p.id, path: f.path, wu: true, label: `${t("pk.wu.section")}: ${p.name} — ${p.os_build} (${p.version})` });
   if (!options.length) return toast(t("dp.no_installers"), true);
-  const preIdx = pre ? Math.max(0, options.findIndex((o) => o.pid === pre.pid && (pre.chain ? o.chain : o.path === pre.path))) : 0;
+  // nothing is chosen in advance: no package (unless the caller names one) and no computer (unless the caller lists them)
+  const preIdx = pre && pre.pid ? options.findIndex((o) => o.pid === pre.pid && (pre.chain ? o.chain : o.path === pre.path)) : -1;
   const comps = [...S.computers].sort((a, b) => a.name.localeCompare(b.name));
-  const sel = new Set(S.sel);
+  const known = new Set(comps.map((c) => c.guid));
+  const sel = new Set(pre && Array.isArray(pre.ids) ? pre.ids.filter((g) => known.has(g)) : []);
   const colSel = new Set();                                   // chosen collections: all their computers are targets
   const covered = () => new Set(S.fleets.filter((f) => colSel.has(f.id)).flatMap((f) => f.guids || []));
   const effective = () => new Set([...sel, ...covered()]);
   const box = dialog(t("dp.new"), `
-    <label class="fld"><span>${esc(t("dp.installer"))}</span><select id="dp-file">${options.map((o, i) => `<option value="${i}"${i === preIdx ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select></label>
+    <label class="fld"><span>${esc(t("dp.installer"))}</span><select id="dp-file"><option value=""${preIdx < 0 ? " selected" : ""} disabled>${esc(t("dp.pick_package_ph"))}</option>${options.map((o, i) => `<option value="${i}"${i === preIdx ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select></label>
     <div id="dp-argbox"><label class="fld"><span>${esc(t("dp.args"))}</span><input id="dp-args" class="field-in mono" type="text"></label>
     <div id="dp-presets" class="faint"></div>
     <div class="faint">${esc(t("dp.args_hint"))}</div></div>
@@ -265,9 +278,15 @@ async function dpNewDialog(pre) {
     <div id="dp-list" style="flex:none;max-height:230px;overflow:auto;border:1px solid var(--border-soft)"></div>
     ${dpInvCheck("dp-inv")}`,
     `<button class="btn" data-dclose>${t("d.cancel")}</button><button class="btn primary" id="dp-go">${esc(t("dp.start"))}</button>`);
-  const cur = () => options[Number($("#dp-file", box).value)];
+  const cur = () => { const v = $("#dp-file", box).value; return v === "" ? null : options[Number(v)] || null; };
   const presets = () => {
     const o = cur();
+    $("#dp-go", box).disabled = !o;
+    if (!o) {
+      $("#dp-argbox", box).hidden = true;
+      $("#dp-chain", box).hidden = true;
+      return;
+    }
     $("#dp-argbox", box).hidden = !!o.chain || !!o.wu;
     $("#dp-chain", box).hidden = !o.chain && !o.wu;
     if (o.wu) {
@@ -299,8 +318,16 @@ async function dpNewDialog(pre) {
   $("#dp-all", box).onclick = () => { box._shown.forEach((c) => sel.add(c.guid)); drawList(); };
   $("#dp-none", box).onclick = () => { box._shown.forEach((c) => sel.delete(c.guid)); drawList(); };
   presets(); drawList();
-  $("#dp-go", box).onclick = () => guard(async () => {
+  let busy = false;                                           // one start per dialog: no double submit
+  $("#dp-go", box).onclick = async () => {
+    if (busy) return;
+    busy = true;
+    $("#dp-go", box).disabled = true;
+    try { await dpStart(); } finally { busy = false; if (!$("#dlg").hidden) $("#dp-go", box).disabled = !cur(); }
+  };
+  const dpStart = () => guard(async () => {
     const o = cur();
+    if (!o) return toast(t("dp.pick_package"), true);
     if (!effective().size) return toast(t("dp.pick_computers"), true);
     // the targets as the server sees them now (collection members fresh, not this page's cache), with what a sync
     // peer changed: exactly the computers listed here are deployed to
@@ -309,9 +336,14 @@ async function dpNewDialog(pre) {
     if (!(await confirmDialog(dpConfirmText(o.label, pv), { title: t("dp.new") }))) return;
     const all = new Set(pv.ids);
     const args = $("#dp-args", box).value, inv = $("#dp-inv", box).checked;
-    if (inv) { closeDialog(); await dpRefreshInventory([...all]); }
-    const r = await api("POST", "/api/deployments", o.chain ? { package_id: o.pid, chain: true, ids: [...all] } : { package_id: o.pid, file: o.path, args: o.wu ? "" : args, ids: [...all] });
-    if (!inv) closeDialog();
+    closeDialog();                                            // confirmed: the work goes on in the background
+    const done = dpBusy(t("dp.preparing"));
+    let r;
+    try {
+      if (inv) await dpRefreshInventory([...all]);
+      r = await api("POST", "/api/deployments", o.chain ? { package_id: o.pid, chain: true, ids: [...all] } : { package_id: o.pid, file: o.path, args: o.wu ? "" : args, ids: [...all] });
+    } finally { done(); }
+    toast(t("dp.started"));
     DP.sel = r.id;
     if (S.section !== "deployments") setSection("deployments");
     await dpRefresh();
@@ -347,7 +379,7 @@ function renderDeploymentsPage(el) {
         <div class="dp-pop" id="dp-exp-menu" hidden><button data-dpexp="csv">CSV</button><button data-dpexp="xlsx">XLSX</button></div></span>
     </div>
     <div class="grid-wrap" id="dpgrid" style="max-height:32%"></div><div id="dpdetail" style="flex:1;overflow:auto;display:flex;flex-direction:column"></div>`;
-  $('[data-dpact="new"]', el).onclick = dpNewDialog;
+  $('[data-dpact="new"]', el).onclick = () => dpNewDialog();
   const redraw = () => { drawDpCards(); drawDeployments(); };
   $("#dp-status").onchange = (e) => { DP.status = e.target.value; redraw(); };
   const setRange = (from, to) => { DP.from = from; DP.to = to; $("#dp-from").value = from; $("#dp-to").value = to; redraw(); };

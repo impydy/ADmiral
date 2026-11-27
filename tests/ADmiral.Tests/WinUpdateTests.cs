@@ -365,6 +365,78 @@ public sealed class WinUpdateTests : IDisposable
     }
 
     [Fact]
+    public void ArchitectureOfFilesAndComputers()
+    {
+        Assert.Equal("x64", AdmiralService.UpdateFileArch("WU/26100.1/windows11.0-kb5043080-x64_953449672073f8fb99badb4cc6d5d7849b9c83e8.msu"));
+        Assert.Equal("arm64", AdmiralService.UpdateFileArch("windows11.0-kb5043080-arm64_aa.msu"));
+        Assert.Equal("x86", AdmiralService.UpdateFileArch("windows10.0-kb5043080-x86.cab"));
+        Assert.Null(AdmiralService.UpdateFileArch("update.msu"));
+        Assert.Equal("x64", AdmiralService.ComputerArch(new JsonObject { ["os_architecture"] = "64 bites" }));
+        Assert.Equal("arm64", AdmiralService.ComputerArch(new JsonObject { ["os_architecture"] = "ARM 64-bit Processor" }));
+        Assert.Equal("x86", AdmiralService.ComputerArch(new JsonObject { ["os_architecture"] = "32-bit" }));
+        Assert.Null(AdmiralService.ComputerArch(new JsonObject()));
+    }
+
+    [Fact]
+    public void CompatibleComputersOfAWindowsUpdate()
+    {
+        App.FullScan();
+        App.RefreshUpdates();
+        App.Settings.Packages.Folder = _f.Temp.File("pkcompat");
+        var comps = App.Computers();
+        JsonObject? Inv(Row c) => c["inventory"] as JsonObject;
+        // a build that client computers run
+        var build = comps.Select(c => Inv(c)).Where(i => i is not null && Updates.ComputerFamily(i) == Updates.FamilyClient)
+            .Select(i => (string?)i!["os_version"]).First(b => b is { Length: > 0 })!;
+        using (var up = App.UploadWinUpdate(build, "KB5999999", $"{WinUpdate.BuildNumber(build)}.4600", "windows11.0-kb5999999-x64.msu"))
+        {
+            up.Write(Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("update", 300))));
+            up.Commit();
+        }
+        var id = WinUpdate.PackageId(build, "KB5999999");
+        var r = App.WinUpdateCompatible(id);
+        Assert.Null(r["family"]);                                   // no catalog title, KB not in the reference: not known
+        Assert.Equal("x64", r["arch"]);
+        var needs = (List<Row>)r["needs"]!;
+        var onBuild = comps.Where(c => (string?)Inv(c)?["os_version"] == build).Select(c => (string)c["guid"]!).ToHashSet();
+        Assert.NotEmpty(needs);
+        Assert.All(needs, n => Assert.Contains((string)n["guid"]!, onBuild));           // the demo revisions are all below 4600
+        Assert.Equal(onBuild.Count, needs.Count);
+        Assert.All((List<Row>)r["incompatible"]!, n => Assert.DoesNotContain((string)n["guid"]!, onBuild));
+        Assert.Equal(comps.Count, needs.Count + ((List<Row>)r["installed"]!).Count + ((List<Row>)r["incompatible"]!).Count + ((List<Row>)r["unknown"]!).Count);
+
+        // checked in the (demo) catalog, whose title says Windows 11: only client computers of the build fit
+        var file = App.Library().Get(id)!.Files[0].Path;
+        Assert.Equal(true, App.PackageCatalogCheck(id, file)["ok"]);
+        var r2 = App.WinUpdateCompatible(id);
+        Assert.Equal(Updates.FamilyClient, r2["family"]);
+        Assert.All((List<Row>)r2["needs"]!, n => Assert.Equal(Updates.FamilyClient, Updates.ComputerFamily(Inv(App.Computer((string)n["guid"]!)))));
+        Assert.Equal(file, r2["file"]);
+
+        // a version below every revision: everything on the build has it already
+        using (var up = App.UploadWinUpdate(build, "KB5999998", $"{WinUpdate.BuildNumber(build)}.10", "windows11.0-kb5999998-x64.msu"))
+        {
+            up.Write(Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("older", 300))));
+            up.Commit();
+        }
+        var r3 = App.WinUpdateCompatible(WinUpdate.PackageId(build, "KB5999998"));
+        Assert.Empty((List<Row>)r3["needs"]!);
+        Assert.All((List<Row>)r3["installed"]!, n => Assert.Equal("newer", n["reason"]));
+
+        // what a computer reports about itself must agree with its AD object: a client that claims to be a server
+        // (or the other way round) is listed for a check, not silently left out
+        var liar = (string)needs[0]["guid"]!;
+        App.Store.Execute("UPDATE computers SET os = ? WHERE guid = ?", "Windows Server 2025 Standard", liar);
+        var r4 = App.WinUpdateCompatible(id);
+        Assert.Contains((List<Row>)r4["unknown"]!, n => (string)n["guid"]! == liar && (string)n["reason"]! == "family_conflict");
+        Assert.DoesNotContain((List<Row>)r4["needs"]!, n => (string)n["guid"]! == liar);
+        Assert.Equal(Updates.FamilyServer, Updates.OsNameFamily("Windows Server 2022 Datacenter"));
+        Assert.Equal(Updates.FamilyClient, Updates.OsNameFamily("Windows 11 Enterprise LTSC"));
+
+        Assert.Throws<NotFound>(() => App.WinUpdateCompatible("WU-1-KB1234567"));
+    }
+
+    [Fact]
     public void WindowsUpdateDeploymentInDemo()
     {
         App.FullScan();

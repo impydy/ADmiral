@@ -170,6 +170,23 @@ public sealed partial class PackageLibrary(string folder)
         return Convert.ToHexStringLower(SHA256.HashData(f));
     }
 
+    /// <summary>SHA-256 (lower-case hex) of a file, reporting the bytes read so far after every block.</summary>
+    public static string Sha256File(string path, Action<long> progress)
+    {
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
+        using var h = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buf = new byte[1024 * 1024];
+        long read = 0;
+        int n;
+        while ((n = f.Read(buf, 0, buf.Length)) > 0)
+        {
+            h.AppendData(buf, 0, n);
+            read += n;
+            progress(read);
+        }
+        return Convert.ToHexStringLower(h.GetHashAndReset());
+    }
+
     /// <summary>SHA-256 and SHA-1 (lower-case hex) of a file, read once.</summary>
     public static (string Sha256, string Sha1) HashesFile(string path)
     {

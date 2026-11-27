@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using ADmiral.Core;
 using Microsoft.Data.Sqlite;
+using Row = System.Collections.Generic.Dictionary<string, object?>;
 
 namespace ADmiral.Tests;
 
@@ -44,6 +45,56 @@ public class DbTests
     };
 
     [Fact]
+    public void InterruptedDeploymentsAreOnlyThoseWhoseProcessIsGone()
+    {
+        using var s = new Store(":memory:");
+        var me = s.CreateDeployment("A", "A", "1", "a.exe", "exe", "", [("g1", "PC1")]);
+        Assert.Equal(DeploymentOwner.Current.Pid, (long)s.Deployment(me)!["owner_pid"]!);
+        Assert.Equal(OwnerState.Alive, DeploymentOwner.Probe(DeploymentOwner.Current.Host, DeploymentOwner.Current.Pid, DeploymentOwner.Current.Started));
+        Assert.Equal(OwnerState.Gone, DeploymentOwner.Probe(DeploymentOwner.Current.Host, DeploymentOwner.Current.Pid, "2001-01-01T00:00:00.0000000Z"));  // PID reused
+        Assert.Equal(OwnerState.Unknown, DeploymentOwner.Probe("ANOTHER-HOST-X", DeploymentOwner.Current.Pid, DeploymentOwner.Current.Started));
+        Assert.Equal(OwnerState.Unknown, DeploymentOwner.Probe(null, null, null));            // a deployment of an older version
+
+        // the owner is alive (e.g. the program, while the retry service starts): never closed, however old the heartbeat
+        var later = DateTimeOffset.UtcNow.AddHours(5);
+        Assert.Equal(0, s.FailInterruptedDeployments(later));
+        Assert.Equal("running", s.Deployment(me)!["status"]);
+
+        // the owner cannot be checked (another computer): the heartbeat decides
+        s.Owner = new DeploymentOwner("x", "ANOTHER-HOST-X", 4242, "2026-01-01T00:00:00.0000000Z");
+        var other = s.CreateDeployment("B", "B", "1", "b.exe", "exe", "", [("g1", "PC1")]);
+        Assert.Equal(0, s.FailInterruptedDeployments(DateTimeOffset.UtcNow.AddMinutes(5)));
+        s.TouchDeployment(other);
+        Assert.Equal(0, s.FailInterruptedDeployments(DateTimeOffset.UtcNow.AddMinutes(9)));
+        Assert.Equal(1, s.FailInterruptedDeployments(DateTimeOffset.UtcNow.AddMinutes(11)));
+        var d = s.Deployment(other)!;
+        Assert.Equal("failed", d["status"]);
+        Assert.Contains("Interrupted", (string)((List<Row>)d["targets"]!)[0]["error"]!);
+        Assert.Contains(s.DeploymentEvents(other), e => ((string)e["message"]!).StartsWith("Closed as interrupted", StringComparison.Ordinal));
+        Assert.Equal("running", s.Deployment(me)!["status"]);
+
+        // closed on a stale heartbeat alone: a repeat may run only while no heartbeat comes (the owner may still work)
+        Assert.Null(s.RetryBlockedByOwner(other, DateTimeOffset.UtcNow.AddMinutes(11), (_, _, _) => OwnerState.Unknown));
+        s.TouchDeployment(other);                                               // the owner is alive after all
+        Assert.NotNull(s.RetryBlockedByOwner(other, DateTimeOffset.UtcNow.AddMinutes(1), (_, _, _) => OwnerState.Unknown));
+        Assert.NotNull(s.RetryBlockedByOwner(other, DateTimeOffset.UtcNow.AddHours(1), (_, _, _) => OwnerState.Alive));
+        Assert.Null(s.RetryBlockedByOwner(other, DateTimeOffset.UtcNow.AddMinutes(1), (_, _, _) => OwnerState.Gone));
+        Assert.Null(s.RetryBlockedByOwner(other, DateTimeOffset.UtcNow.AddMinutes(12), (_, _, _) => OwnerState.Unknown));
+        Assert.Null(s.RetryBlockedByOwner(me));                                 // not closed that way at all
+
+        // results that arrive after a close are not taken silently: the log says so
+        s.UpdateTarget(other, "g1", new Dictionary<string, object?> { ["outcome"] = "ok", ["step"] = "done" });
+        Assert.Equal("done", s.FinishDeployment(other));
+        Assert.Contains(s.DeploymentEvents(other), e => ((string)e["message"]!).Contains("had already been closed", StringComparison.Ordinal));
+
+        // the computers waiting while the files are checked
+        s.SetWaitingTargets(me, "verifying", 40);
+        Assert.Equal(("verifying", 40L), ((string)((List<Row>)s.Deployment(me)!["targets"]!)[0]["step"]!, (long?)((List<Row>)s.Deployment(me)!["targets"]!)[0]["percent"]));
+        s.SetWaitingTargets(me, "queued", null);
+        Assert.Equal("queued", ((List<Row>)s.Deployment(me)!["targets"]!)[0]["step"]);
+    }
+
+    [Fact]
     public void MigratesV0Database()
     {
         using var tmp = new CoreTemp();
@@ -63,7 +114,7 @@ public class DbTests
         }
         using (var store = new Store(path))
         {
-            Assert.Equal(12, store.SchemaVersion);
+            Assert.Equal(Db.Migrations.Count, store.SchemaVersion);
             var c = store.Computer("g1")!;
             Assert.Equal("2024-01-01T00:00:00+00:00", c["added"]);
             Assert.Equal(true, c["allow_scan"]);
@@ -71,7 +122,7 @@ public class DbTests
             Assert.Equal("X", (string?)((JsonObject)c["inventory"]!)["model"]);
         }
         using var again = new Store(path);
-        Assert.Equal(12, again.SchemaVersion);                   // idempotent
+        Assert.Equal(Db.Migrations.Count, again.SchemaVersion);                  // idempotent
     }
 
     [Fact]
@@ -361,7 +412,9 @@ public class DbTests
         Assert.Equal(["copied", "started"], s.DeploymentEvents(dep).Select(e => (string)e["message"]!));
         var list = s.Deployments();
         Assert.Equal((3, 1, 1, 1, 10L), ((int)list[0]["total"]!, (int)list[0]["queued"]!, (int)list[0]["running"]!, (int)list[0]["ok"]!, (long?)list[0]["avg_seconds"]));
-        Assert.Equal(1, s.FailInterruptedDeployments());          // the program stopped: the rest failed
+        Assert.Equal(0, s.FailInterruptedDeployments());          // this process runs it: left alone
+        Assert.Equal("running", s.Deployment(dep)!["status"]);
+        Assert.Equal(1, s.FailInterruptedDeployments(probe: (_, _, _) => OwnerState.Gone));   // the program stopped: the rest failed
         Assert.Equal("partial", s.Deployment(dep)!["status"]);
 
         var dep2 = s.CreateDeployment("X", "X app", "1", "x.exe", "exe", "", [("g-lt1", "LT-001")]);

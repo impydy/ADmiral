@@ -68,8 +68,24 @@ public sealed class ServiceFeatureTests : IDisposable
         Assert.Equal(0, row["queued"]);
         Assert.Equal(0, row["running"]);
         Assert.Equal(3, (int)row["ok"]! + (int)row["reboot"]! + (int)row["failed"]!);
-        // a tampered installer is refused before anything is sent
+        Assert.Contains("matches its registered SHA-256", App.DeploymentLog(dep));
+        // a tampered installer: the deployment starts at once, its job refuses it before anything is sent
         File.WriteAllText(Path.Combine(_f.Temp.File("pk"), exe.Path), "evil");
+        var bad = App.StartDeployment("Acme.Tool", exe.Path, "", names);
+        Assert.Equal("error", _f.WaitJob(((JobInfo)bad["job"]!).Id).Status);
+        var bd = App.Store.Deployment((long)bad["id"]!)!;
+        Assert.Equal("failed", bd["status"]);
+        Assert.All((List<Row>)bd["targets"]!, t =>
+        {
+            Assert.Equal("failed", t["outcome"]);
+            Assert.Contains(exe.Path, (string)t["error"]!);
+            Assert.StartsWith(AdmiralService.IntegrityPrefix, (string)t["error"]!);   // told apart from an ordinary failure
+            Assert.Null(t["started"]);                                  // no computer was touched
+        });
+        Assert.Contains(App.Store.Activity(), a => (string?)a["action"] == "security");
+        Assert.DoesNotContain("Step: ", App.DeploymentLog((long)bad["id"]!));
+        // a missing installer is refused at once
+        File.Delete(Path.Combine(_f.Temp.File("pk"), exe.Path));
         var ex = Assert.ThrowsAny<ArgumentException>(() => App.StartDeployment("Acme.Tool", exe.Path, "", names));
         Assert.Contains(exe.Path, ex.Message);
         Assert.Throws<NotFound>(() => App.DeploymentLog(999));
@@ -155,12 +171,25 @@ public sealed class ServiceFeatureTests : IDisposable
     public void InterruptedDeploymentIsClosedAtStart()
     {
         var store = new Store(":memory:");
+        var live = store.CreateDeployment("A.B", "AB", "", "f.exe", "exe", "/S", [("g1", "PC1")]);       // run by this process
+        store.Owner = new DeploymentOwner("gone", "ANOTHER-HOST-X", 4242, "2026-01-01T00:00:00.0000000Z");
         var dep = store.CreateDeployment("A.B", "AB", "", "f.exe", "exe", "/S", [("g1", "PC1")]);
+        store.Execute("UPDATE deployment SET heartbeat='2026-01-01T00:00:00+00:00' WHERE id=?", dep);   // silent since long
         Assert.Equal("running", store.Deployment(dep)!["status"]);
+        // a short-lived instance (the retry service, the command line) closes nothing
+        using (var oneShot = new AdmiralService(new Settings { Mode = "demo", DbPath = ":memory:" }, store, new DemoDirectory(),
+                                                applyProcessSettings: false, closeInterrupted: false))
+            Assert.Equal("running", oneShot.Store.Deployment(dep)!["status"]);
+        store = new Store(":memory:");
+        live = store.CreateDeployment("A.B", "AB", "", "f.exe", "exe", "/S", [("g1", "PC1")]);
+        store.Owner = new DeploymentOwner("gone", "ANOTHER-HOST-X", 4242, "2026-01-01T00:00:00.0000000Z");
+        dep = store.CreateDeployment("A.B", "AB", "", "f.exe", "exe", "/S", [("g1", "PC1")]);
+        store.Execute("UPDATE deployment SET heartbeat='2026-01-01T00:00:00+00:00' WHERE id=?", dep);
         using var app = new AdmiralService(new Settings { Mode = "demo", DbPath = ":memory:" }, store, new DemoDirectory(), applyProcessSettings: false);
         var d = app.Store.Deployment(dep)!;
         Assert.Equal("failed", d["status"]);
         Assert.Equal("failed", ((List<Row>)d["targets"]!)[0]["outcome"]);
+        Assert.Equal("running", app.Store.Deployment(live)!["status"]);        // the live one is left alone
     }
 
     [Fact]

@@ -202,6 +202,25 @@ public static class Db
             PRIMARY KEY (guid, drive, protector_id)
         );
         """,
+        // 13: which ADmiral process runs a deployment (host, PID, process start time, a random id) and when it last said
+        // it is alive: another instance starting up only closes a "running" deployment whose process is gone
+        """
+        ALTER TABLE deployment ADD COLUMN owner_id TEXT;
+        ALTER TABLE deployment ADD COLUMN owner_host TEXT;
+        ALTER TABLE deployment ADD COLUMN owner_pid INTEGER;
+        ALTER TABLE deployment ADD COLUMN owner_started TEXT;
+        ALTER TABLE deployment ADD COLUMN heartbeat TEXT;
+        ALTER TABLE deployment ADD COLUMN closed_unverified INTEGER;
+        """,
+        // 14: the security-update reference is kept per build and family (client / server: "10.0.26100/server"),
+        // with the KB and the MSRC product it came from. The old rows mixed Windows 11 and Server 2025 (one build
+        // number, two update lines), so they are dropped and downloaded again at the next refresh.
+        """
+        ALTER TABLE update_ref ADD COLUMN kb TEXT;
+        ALTER TABLE update_ref ADD COLUMN product TEXT;
+        DELETE FROM update_ref;
+        DELETE FROM update_meta WHERE k IN ('fetched_at', 'attempted_at', 'kbs', 'months');
+        """,
     ];
 
     /// <summary>The computer fields that come from Active Directory (replaced by every AD sync).</summary>
@@ -278,11 +297,69 @@ public sealed record CveRecord(
     [property: JsonPropertyName("summary")] string? Summary,
     [property: JsonPropertyName("matches")] List<string?[]> Matches);
 
-/// <summary>Newest fixed revision of one Windows build in Microsoft's security releases.</summary>
+/// <summary>Newest fixed revision of one Windows build (and family) in Microsoft's security releases, with the KB and
+/// the MSRC product it was read from (null when the data does not name them).</summary>
 public sealed record UpdateRef(
     [property: JsonPropertyName("ubr")] long Ubr,
     [property: JsonPropertyName("month")] string? Month,
-    [property: JsonPropertyName("released")] string? Released);
+    [property: JsonPropertyName("released")] string? Released)
+{
+    [JsonPropertyName("kb"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Kb { get; init; }
+    [JsonPropertyName("product"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Product { get; init; }
+}
+
+/// <summary>What the start-up check knows about the process that owns a running deployment.</summary>
+public enum OwnerState { Alive, Gone, Unknown }
+
+/// <summary>The ADmiral process that runs a deployment: computer, PID, the process's start time (a reused PID belongs to a
+/// process started later) and a random id of this process.</summary>
+public sealed record DeploymentOwner(string Id, string Host, long Pid, string Started)
+{
+    public static readonly DeploymentOwner Current = Make();
+
+    private static DeploymentOwner Make()
+    {
+        string started;
+        try
+        {
+            using var me = System.Diagnostics.Process.GetCurrentProcess();
+            started = me.StartTime.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+        }
+        catch (Exception exc) when (exc is InvalidOperationException or NotSupportedException or System.ComponentModel.Win32Exception)
+        {
+            started = "";
+        }
+        return new DeploymentOwner(Guid.NewGuid().ToString("N"), Environment.MachineName, Environment.ProcessId, started);
+    }
+
+    /// <summary>Is the process <paramref name="pid"/> started at <paramref name="started"/> on <paramref name="host"/> still
+    /// running? Unknown when it cannot be told from here (another computer, no owner recorded, the start time is not
+    /// readable for this account).</summary>
+    public static OwnerState Probe(string? host, long? pid, string? started)
+    {
+        if (pid is not { } p || p <= 0 || p > int.MaxValue || string.IsNullOrEmpty(host)
+            || !string.Equals(host, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            return OwnerState.Unknown;
+        System.Diagnostics.Process proc;
+        try { proc = System.Diagnostics.Process.GetProcessById((int)p); }
+        catch (ArgumentException) { return OwnerState.Gone; }                   // no such process
+        catch (InvalidOperationException) { return OwnerState.Gone; }
+        using (proc)
+        {
+            try
+            {
+                if (proc.HasExited) return OwnerState.Gone;
+                if (!DateTime.TryParse(started, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var want)) return OwnerState.Unknown;
+                var diff = (proc.StartTime.ToUniversalTime() - want.ToUniversalTime()).Duration();
+                return diff < TimeSpan.FromSeconds(2) ? OwnerState.Alive : OwnerState.Gone;    // otherwise: the PID was reused
+            }
+            catch (Exception exc) when (exc is InvalidOperationException or NotSupportedException or System.ComponentModel.Win32Exception)
+            {
+                return OwnerState.Unknown;                                           // e.g. another account's process
+            }
+        }
+    }
+}
 
 /// <summary>The inventory database. Thread-safe: one connection, every access under one (re-entrant) lock.
 /// Rows are returned as <c>Dictionary&lt;string, object?&gt;</c> keyed by column name (the JSON the UI gets);
@@ -748,6 +825,12 @@ public sealed class Store : IDisposable
                   + "WHERE i.kind = 'logons' AND c.hidden = 0")
             .Select(r => ((string)r["guid"]!, ParseObject(r["data"])))];
 
+    /// <summary>The visible computers whose collected hotfix list names <paramref name="kb"/> ("KB5043080").</summary>
+    public HashSet<string> ComputersWithHotfix(string kb) =>
+        [.. Query("SELECT DISTINCT i.guid FROM computer_items i JOIN computers c ON c.guid = i.guid "
+                  + "WHERE i.kind = 'hotfixes' AND c.hidden = 0 AND upper(json_extract(i.data, '$.id')) = upper(?)", kb)
+            .Select(r => (string)r["guid"]!)];
+
     // ------------------------------------------------------------------ software + CVE data
     /// <summary>(computer guid, name, version, publisher) of every installed program on the visible computers.</summary>
     public List<(string Guid, string Name, string Version, string Publisher)> AppRows() =>
@@ -788,7 +871,10 @@ public sealed class Store : IDisposable
     public (Dictionary<string, UpdateRef> Builds, Dictionary<string, string> Meta) UpdateReference()
     {
         var builds = Query("SELECT * FROM update_ref").ToDictionary(
-            r => (string)r["key"]!, r => new UpdateRef((long)r["ubr"]!, r["month"] as string, r["released"] as string));
+            r => (string)r["key"]!, r => new UpdateRef((long)r["ubr"]!, r["month"] as string, r["released"] as string)
+            {
+                Kb = r["kb"] as string, Product = r["product"] as string,
+            });
         var meta = Query("SELECT k, v FROM update_meta").ToDictionary(r => (string)r["k"]!, r => r["v"] as string ?? "");
         return (builds, meta);
     }
@@ -797,7 +883,8 @@ public sealed class Store : IDisposable
     {
         Execute("DELETE FROM update_ref");
         foreach (var (k, v) in builds)
-            Execute("INSERT INTO update_ref (key, ubr, month, released) VALUES (?, ?, ?, ?)", k, v.Ubr, v.Month, v.Released);
+            Execute("INSERT INTO update_ref (key, ubr, month, released, kb, product) VALUES (?, ?, ?, ?, ?, ?)",
+                    k, v.Ubr, v.Month, v.Released, v.Kb, v.Product);
         SetUpdateMeta(meta);
     });
 
@@ -1009,11 +1096,17 @@ public sealed class Store : IDisposable
     });
 
     // ------------------------------------------------------------------ deployments
+    /// <summary>The process recorded as the owner of the deployments this store creates (tests replace it).</summary>
+    internal DeploymentOwner Owner { get; set; } = DeploymentOwner.Current;
+
     public long CreateDeployment(string packageId, string? packageName, string? version, string file, string kind, string args,
                                  IEnumerable<(string Guid, string Name)> targets) => InTx(() =>
     {
-        Execute("INSERT INTO deployment (created, package_id, package_name, version, file, kind, args) VALUES (?,?,?,?,?,?,?)",
-                Db.UtcNow(), packageId, string.IsNullOrEmpty(packageName) ? packageId : packageName, version ?? "", file, kind, args);
+        var now = Db.UtcNow();
+        Execute("INSERT INTO deployment (created, package_id, package_name, version, file, kind, args, owner_id, owner_host, owner_pid, "
+                + "owner_started, heartbeat) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                now, packageId, string.IsNullOrEmpty(packageName) ? packageId : packageName, version ?? "", file, kind, args,
+                Owner.Id, Owner.Host, Owner.Pid, Owner.Started, now);
         var dep = LastId();
         foreach (var (g, n) in targets)
             Execute("INSERT INTO deployment_target (deployment_id, guid, name) VALUES (?,?,?)", dep, g, n);
@@ -1038,9 +1131,22 @@ public sealed class Store : IDisposable
     public List<Row> DeploymentEvents(long dep) =>
         Query("SELECT ts, name, message FROM deployment_event WHERE deployment_id=? ORDER BY id", dep);
 
+    /// <summary>The computers of <paramref name="dep"/> that have not started yet (queued / verifying): this step and percent.</summary>
+    public void SetWaitingTargets(long dep, string step, int? percent) => InTx(() =>
+        Execute("UPDATE deployment_target SET step=?, percent=? WHERE deployment_id=? AND step IN ('queued', 'verifying')", step, percent, dep));
+
+    /// <summary>The running process says it still works on <paramref name="dep"/> (see <see cref="FailInterruptedDeployments"/>).</summary>
+    /// The heartbeat is written even after another instance closed the deployment as interrupted: a heartbeat that keeps
+    /// coming shows the owner is alive (see <see cref="RetryBlockedByOwner"/>).
+    public void TouchDeployment(long dep) => InTx(() =>
+        Execute("UPDATE deployment SET heartbeat=? WHERE id=?", Db.UtcNow(), dep));
+
     /// <summary>Close a deployment; its status from the outcomes: done / partial / failed / skipped.</summary>
     public string FinishDeployment(long dep) => InTx(() =>
     {
+        if (Query("SELECT status FROM deployment WHERE id=?", dep) is [{ } was] && was["status"] as string is { } st && st != "running")
+            Execute("INSERT INTO deployment_event (deployment_id, ts, name, message) VALUES (?,?,?,?)", dep, Db.UtcNow(), "",
+                    $"NOTE: the deployment had already been closed ({st}); the status is computed again from the results that came in since");
         var outs = Query("SELECT outcome FROM deployment_target WHERE deployment_id=?", dep).Select(r => r["outcome"] as string).ToList();
         var real = outs.Where(o => o is not ("unreachable" or "current")).ToList();     // these two do not count either way
         var bad = real.Count(o => o is not ("ok" or "reboot"));
@@ -1049,20 +1155,65 @@ public sealed class Store : IDisposable
         return status;
     });
 
-    /// <summary>At start-up: a deployment still marked running was cut off by the program stopping; close it.</summary>
-    public int FailInterruptedDeployments()
+    /// <summary>A "running" deployment whose owner has not said it is alive for this long is taken as interrupted when the
+    /// owner cannot be checked directly (another computer, a process this account may not inspect, an older version).</summary>
+    public static readonly TimeSpan DeploymentStaleAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>At start-up: close the deployments still marked running whose process is gone (it stopped during the run).
+    /// A deployment another live ADmiral process (the program, while the retry service or the command line starts) is
+    /// running is left alone. The owner is checked by PID and process start time on this computer (a reused PID is
+    /// another process); when that is not possible, by its heartbeat (<see cref="DeploymentStaleAfter"/>).
+    /// <paramref name="probe"/> replaces the process check (tests).</summary>
+    public int FailInterruptedDeployments(DateTimeOffset? now = null, Func<string?, long?, string?, OwnerState>? probe = null)
     {
+        var at = now ?? DateTimeOffset.UtcNow;
+        probe ??= DeploymentOwner.Probe;
+        var closed = new List<(long Id, string Why)>();
         var ids = InTx(() =>
         {
-            var list = Query("SELECT id FROM deployment WHERE status='running'").Select(r => (long)r["id"]!).ToList();
-            foreach (var dep in list)
+            foreach (var r in Query("SELECT id, created, owner_host, owner_pid, owner_started, heartbeat FROM deployment WHERE status='running'"))
+            {
+                var dep = (long)r["id"]!;
+                var state = probe(r["owner_host"] as string, r["owner_pid"] as long?, r["owner_started"] as string);
+                var last = Db.ParseIso(r["heartbeat"] as string) ?? Db.ParseIso(r["created"] as string);
+                var stale = last is null || at - last.Value > DeploymentStaleAfter;
+                string? why = state switch
+                {
+                    OwnerState.Gone => $"the process that ran it ({r["owner_host"]}, PID {r["owner_pid"]}) is no longer running",
+                    OwnerState.Unknown when stale => $"no sign of life from the process that ran it since {r["heartbeat"] ?? r["created"]}",
+                    _ => null,
+                };
+                if (why is null) continue;
+                // closed on a stale heartbeat alone (the owner could not be checked): a repeat waits until it is clear
+                // the owner is really gone, or the same package could be sent while it is still installing
+                if (state == OwnerState.Unknown) Execute("UPDATE deployment SET closed_unverified=1 WHERE id=?", dep);
                 Execute("UPDATE deployment_target SET step='done', outcome='failed', finished=?, "
                         + "error='Interrupted: the program stopped during the deployment' WHERE deployment_id=? AND step!='done'",
                         Db.UtcNow(), dep);
-            return list;
+                closed.Add((dep, why));
+            }
+            return closed;
         });
-        foreach (var dep in ids) FinishDeployment(dep);
+        foreach (var (dep, why) in ids)
+        {
+            AddDeploymentEvent(dep, $"Closed as interrupted at start-up: {why}");
+            FinishDeployment(dep);
+        }
         return ids.Count;
+    }
+
+    /// <summary>Why a repeat of <paramref name="dep"/> must wait (null = it may run): the deployment was closed as
+    /// interrupted on a stale heartbeat alone, and its owner is not known to be gone - it is alive on this computer, or
+    /// its heartbeat came again within <see cref="DeploymentStaleAfter"/>.</summary>
+    public string? RetryBlockedByOwner(long dep, DateTimeOffset? now = null, Func<string?, long?, string?, OwnerState>? probe = null)
+    {
+        if (Query("SELECT closed_unverified, owner_host, owner_pid, owner_started, heartbeat, created FROM deployment WHERE id=?", dep)
+            is not [{ } r] || r["closed_unverified"] is not (long and 1)) return null;
+        var state = (probe ?? DeploymentOwner.Probe)(r["owner_host"] as string, r["owner_pid"] as long?, r["owner_started"] as string);
+        if (state == OwnerState.Gone) return null;
+        if (state == OwnerState.Alive) return $"{r["owner_host"]} (PID {r["owner_pid"]})";
+        var last = Db.ParseIso(r["heartbeat"] as string) ?? Db.ParseIso(r["created"] as string);
+        return last is { } l && (now ?? DateTimeOffset.UtcNow) - l <= DeploymentStaleAfter ? $"{r["owner_host"] ?? "?"} (PID {r["owner_pid"]})" : null;
     }
 
     /// <summary>Deployments (newest first) with per-state counts of their computers and the average run time.</summary>

@@ -1,6 +1,7 @@
 #pragma warning disable CA1873 // log arguments are cheap here (strings already at hand)
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
@@ -140,9 +141,11 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     /// <param name="syncAutostart">apply the sync settings at once (the schedule; the listener is the web host's)</param>
     /// <param name="syncHandler">HTTP handler of the sync client (tests)</param>
     /// <param name="applyProcessSettings">set the process-wide language and debug log from the settings (tests: false)</param>
+    /// <param name="closeInterrupted">close the deployments whose process stopped during the run (the program and the web
+    /// host; false for the short-lived instances of the retry service and the command line)</param>
     public AdmiralService(Settings settings, Store? store = null, IDirectory? directory = null, string? configPath = null,
                           SecretStore? secrets = null, bool syncAutostart = true, HttpMessageHandler? syncHandler = null,
-                          bool applyProcessSettings = true)
+                          bool applyProcessSettings = true, bool closeInterrupted = true)
     {
         Settings = settings;
         _applyProcessSettings = applyProcessSettings;
@@ -152,7 +155,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Directory = directory ?? MakeDirectory(settings);
         ConfigPath = configPath;
         Secrets = secrets ?? new SecretStore(null);
-        Store.FailInterruptedDeployments();
+        if (closeInterrupted) Store.FailInterruptedDeployments();
         ApplyProcessSettings(settings);
         RegisterSecrets(settings);
         Sync = new SyncManager(this, syncHandler, transaction: body => Store.InTransaction(body));
@@ -881,8 +884,8 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         try { cleanArgs = Deploy.ValidArgs(args); }
         catch (DeployError exc) { throw new ArgumentException(exc.Message, exc); }
         var local = Pkg(() => lib.File(rec.Path));
-        if (!File.Exists(local) || !string.Equals(PackageLibrary.Sha256File(local), rec.Sha256, StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));        // integrity before anything is sent
+        // a missing file is refused at once; its content is checked in the job (a big file takes long to read)
+        if (!File.Exists(local)) throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
         var guids = Store.ResolveNames(names);
         var comps = Computers().ToDictionary(c => (string)c["guid"]!);
         var unconfirmed = SyncUnconfirmed();
@@ -895,7 +898,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         void Ev(string msg) => Store.AddDeploymentEvent(dep, msg);
         Ev($"Deployment #{dep} started" + (retryOf is { } r ? $" (repeat of #{r}, failed computers only)" : ""));
         Ev($"Package: {(pkg.Name.Length > 0 ? pkg.Name : pkg.Id)} ({pkg.Id}) version {(pkg.Version.Length > 0 ? pkg.Version : "-")}");
-        Ev($"Installer: {rec.Path} ({kind}), {rec.Size} bytes, SHA-256 {rec.Sha256} (re-checked before sending)");
+        Ev($"Installer: {rec.Path} ({kind}), {rec.Size} bytes, SHA-256 {rec.Sha256} (checked again before sending)");
         if (rec.VendorChecked) Ev("The SHA-256 was compared with the vendor's published value");
         Ev($"Switches: {(cleanArgs.Length > 0 ? cleanArgs : "(none)")}; timeout {timeout} s");
         Ev($"Targets ({targets.Count}): " + string.Join(", ", targets.Select(t => t.Item2)));
@@ -904,7 +907,8 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         JobInfo job;
         try
         {
-            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, () => RunDeployment(dep, local, rec.Path, rec.Sha256, kind, cleanArgs, timeout, p)));
+            job = Jobs.Start("deploy", "deploy", p => RunDeploymentSafe(dep, () => RunDeployment(dep, local, rec.Path, rec.Sha256, kind, cleanArgs, timeout, p),
+                                                                     [new VerifyFile(rec.Path, local, rec.Sha256)], p));
         }
         catch (Exception)
         {
@@ -922,6 +926,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
     {
         var d = Store.Deployment(depId) ?? throw new NotFound($"Deployment {depId} not found");
         if ((string?)d["status"] == "running") throw new ArgumentException(T("err.dep_running"));
+        if (Store.RetryBlockedByOwner(depId) is { } owner) throw new ArgumentException(T("err.dep_owner_alive", ("owner", owner)));
         var bad = ((List<Row>)d["targets"]!).Where(t => t["outcome"] as string is "failed" or "unreachable").Select(t => (string)t["guid"]!).ToList();
         if (bad.Count == 0) throw new ArgumentException(T("err.dep_no_failed"));
         if ((string?)d["kind"] == "chain")
@@ -1087,6 +1092,92 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         return StartChainRun(lib, data, pkg, steps, names, timeoutSeconds, retryOf, single: file);
     }
 
+    /// <summary>The family (client / server) a Windows update package is for: from the Windows Update Catalog title of
+    /// its file when it was checked there, else from the security-update reference that names its KB; null when
+    /// neither tells.</summary>
+    public string? WinUpdateFamily(PackageEntry pkg)
+    {
+        foreach (var f in pkg.Files)
+            if (f.CatalogTitle is { Length: > 0 } title)
+            {
+                if (title.Contains("Server", StringComparison.OrdinalIgnoreCase)) return Updates.FamilyServer;
+                if (title.Contains("Windows 10", StringComparison.OrdinalIgnoreCase) || title.Contains("Windows 11", StringComparison.OrdinalIgnoreCase))
+                    return Updates.FamilyClient;
+            }
+        if (pkg.Kb is not { Length: > 0 } kb || pkg.OsBuild is not { Length: > 0 } build) return null;
+        var fams = Store.UpdateReference().Builds
+            .Where(kv => string.Equals(kv.Value.Kb, kb, StringComparison.OrdinalIgnoreCase) && Updates.SplitRefKey(kv.Key).Build == build)
+            .Select(kv => Updates.SplitRefKey(kv.Key).Family).Distinct().ToList();
+        return fams.Count == 1 ? fams[0] : null;
+    }
+
+    /// <summary>The processor architecture of an update file from its catalog name ("windows11.0-kb5043080-x64_...msu"):
+    /// x64 | arm64 | x86, or null.</summary>
+    public static string? UpdateFileArch(string? path)
+    {
+        var n = Path.GetFileName(path ?? "").ToLowerInvariant();
+        return n.Contains("-arm64") ? "arm64" : n.Contains("-x64") ? "x64" : n.Contains("-x86") ? "x86" : null;
+    }
+
+    /// <summary>The processor architecture of a computer from its inventory (Win32_OperatingSystem.OSArchitecture,
+    /// which is localised: "64-bit", "64 bites", "ARM 64-bit Processor"): x64 | arm64 | x86, or null.</summary>
+    public static string? ComputerArch(JsonObject? inv)
+    {
+        var a = Str(inv?["os_architecture"]);
+        return a.Contains("ARM", StringComparison.OrdinalIgnoreCase) ? "arm64" : a.Contains("64", StringComparison.Ordinal) ? "x64"
+             : a.Contains("32", StringComparison.Ordinal) ? "x86" : null;
+    }
+
+    /// <summary>Which collected computers a Windows update package of the library fits, from their inventories only
+    /// (nothing is contacted): {id, kb, os_build, version, family, arch, file, needs: [...], installed: [...],
+    /// incompatible: [...], unknown: [...]}, each entry {guid, name, installed, reason}. "needs": the same build, family
+    /// and architecture, an older revision and the KB not in its hotfix list; "installed": the KB is listed or the
+    /// revision is the package's or newer; "unknown": no inventory yet.</summary>
+    public Row WinUpdateCompatible(string packageId)
+    {
+        var data = Pkg(Library().Load);
+        var pkg = data.Packages.FirstOrDefault(p => string.Equals(p.Id, packageId, StringComparison.OrdinalIgnoreCase))
+                  ?? throw new NotFound($"{packageId} is not in the library.");
+        if (pkg.Kind != "winupdate" || pkg.OsBuild is not { Length: > 0 } build) throw new ArgumentException(T("err.dep_file"));
+        var file = pkg.Files.FirstOrDefault(f => WinUpdate.IsUpdateFile(f.Path));
+        var arch = UpdateFileArch(file?.Path);
+        var family = WinUpdateFamily(pkg);
+        var verParts = (pkg.Version ?? "").Split('.');
+        long? want = verParts.Length == 2 && verParts[0] == WinUpdate.BuildNumber(build)
+                     && long.TryParse(verParts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var w) ? w : null;
+        var withKb = pkg.Kb is { Length: > 0 } kb ? Store.ComputersWithHotfix(kb) : [];
+        List<Row> needs = [], installed = [], incompatible = [], unknown = [];
+        foreach (var c in Computers().OrderBy(c => Str(c["name"]), StringComparer.OrdinalIgnoreCase))
+        {
+            var guid = (string)c["guid"]!;
+            var inv = c["inventory"] as JsonObject;
+            var ver = Str(inv?["os_version"]);
+            var parts = Str(inv?["os_build"]).Split('.');
+            long? ubr = parts.Length > 1 && long.TryParse(parts[1].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var u) ? u : null;
+            Row Entry(string reason) => new()
+            {
+                ["guid"] = guid, ["name"] = c["name"], ["installed"] = ver.Length > 0 && ubr is { } x ? $"{ver}.{x}" : "", ["reason"] = reason,
+            };
+            if (inv is null || ver.Length == 0) { unknown.Add(Entry("no_inventory")); continue; }
+            if (ver != build) { incompatible.Add(Entry("build")); continue; }
+            // the inventory is what the computer says about itself: the family it reports must agree with its AD
+            // object's operating system, or the computer is listed for a check instead of being silently left out
+            var invFamily = Updates.ComputerFamily(inv);
+            if (Str(c["os"]) is { Length: > 0 } adOs && Updates.OsNameFamily(adOs) != invFamily) { unknown.Add(Entry("family_conflict")); continue; }
+            if (family is { } fam && invFamily != fam) { incompatible.Add(Entry("family")); continue; }
+            if (arch is { } ar && ComputerArch(inv) is { } ca && ca != ar) { incompatible.Add(Entry("arch")); continue; }
+            // "installed" needs the build revision to show it: a KB in the hotfix list alone is not enough
+            if (want is { } wv && ubr is { } cu && cu >= wv) { installed.Add(Entry(withKb.Contains(guid) ? "kb" : "newer")); continue; }
+            if (want is null && withKb.Contains(guid)) { installed.Add(Entry("kb")); continue; }
+            needs.Add(Entry(withKb.Contains(guid) ? "kb_older" : ubr is null ? "no_revision" : "older"));
+        }
+        return new Row
+        {
+            ["id"] = pkg.Id, ["kb"] = pkg.Kb, ["os_build"] = build, ["version"] = pkg.Version, ["family"] = family, ["arch"] = arch,
+            ["file"] = file?.Path, ["needs"] = needs, ["installed"] = installed, ["incompatible"] = incompatible, ["unknown"] = unknown,
+        };
+    }
+
     /// <summary>A file a chain sends: the local copy, its registered SHA-256 and - for a Windows update - its KB / build.</summary>
     private sealed record ChainFile(string Local, string Sha, string? Kb, string? OsBuild);
 
@@ -1094,15 +1185,14 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                               int? timeoutSeconds, long? retryOf, string? single)
     {
         var timeout = timeoutSeconds is > 0 ? timeoutSeconds.Value : Settings.Deploy.TimeoutMinutes * 60;
-        // every file the chain sends: present and unchanged before anything starts
+        // every file the chain sends: present now; unchanged is checked in the job, before anything is sent
         var files = new Dictionary<string, ChainFile>();
         foreach (var s in steps.Where(s => s.File is not null))
         {
             var rec = Chain.FindFile(pkg, data.Packages, s.File)!;
             var owner = data.Packages.FirstOrDefault(p => p.Files.Contains(rec)) ?? pkg;
             var local = Pkg(() => lib.File(rec.Path));
-            if (!File.Exists(local) || !string.Equals(PackageLibrary.Sha256File(local), rec.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
+            if (!File.Exists(local)) throw new ArgumentException(T("err.dep_hash", ("file", rec.Path)));
             files[rec.Path] = new ChainFile(local, rec.Sha256, owner.Kind == "winupdate" ? owner.Kb : null, owner.Kind == "winupdate" ? owner.OsBuild : null);
         }
         var guids = Store.ResolveNames(names);
@@ -1123,7 +1213,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Ev($"Package: {(pkg.Name.Length > 0 ? pkg.Name : pkg.Id)} ({pkg.Id}) version {(pkg.Version.Length > 0 ? pkg.Version : "-")}"
            + (pkg.Kind == "winupdate" ? $", Windows build {pkg.OsBuild}" : ""));
         for (var i = 0; i < steps.Count; i++) Ev($"Step {i + 1}: {Chain.Describe(steps[i])}");
-        foreach (var (path, f) in files) Ev($"File: {path}, SHA-256 {f.Sha} (re-checked before sending)" + (f.Kb is not null ? $", {f.Kb} for {f.OsBuild}" : ""));
+        foreach (var (path, f) in files) Ev($"File: {path}, SHA-256 {f.Sha} (checked again before sending)" + (f.Kb is not null ? $", {f.Kb} for {f.OsBuild}" : ""));
         Ev($"Timeout per step: {timeout} s" + (wu ? $" (a Windows update step: at least {WinUpdate.MinTimeoutSeconds} s)" : ""));
         if (single is null) Ev(ChainFingerprintPrefix + ChainFingerprint(steps));
         Ev($"Targets ({targets.Count}): " + string.Join(", ", targets.Select(t => t.Item2)));
@@ -1133,7 +1223,8 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         try
         {
             // a Windows update runs long: its own job kind, so it does not block the other deployments
-            job = Jobs.Start(wu ? "wuinstall" : "deploy", wu ? "wuinstall" : "deploy", p => RunDeploymentSafe(dep, () => RunChain(dep, steps, files, timeout, p)));
+            job = Jobs.Start(wu ? "wuinstall" : "deploy", wu ? "wuinstall" : "deploy", p => RunDeploymentSafe(dep, () => RunChain(dep, steps, files, timeout, p),
+                [.. files.Select(kv => new VerifyFile(kv.Key, kv.Value.Local, kv.Value.Sha))], p));
         }
         catch (Exception)
         {
@@ -1190,6 +1281,14 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         foreach (var a in addresses)
             foreach (var port in new[] { 9, 7 })
                 for (var k = 0; k < 3; k++) udp.Send(packet, packet.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Parse(a), port));
+    }
+
+    /// <summary>shutdown.exe /r or /s on <paramref name="host"/>; the message (if any) travels as a file, never in the script.</summary>
+    private RemoteRunResult RunPower(string host, SmbCreds creds, bool reboot, int seconds, string? text, Action<string, int?> onStep, int timeout)
+    {
+        IReadOnlyList<Chain.Payload> payloads = string.IsNullOrEmpty(text) ? [] : [new Chain.Payload("-user.txt", Bytes: Chain.MessageFileBytes(text))];
+        return Chain.RunRemote(host, creds, Settings.Collect, payloads,
+            (p, run, o, tmp) => Chain.PowerScript(reboot, seconds, run, o, tmp, p.GetValueOrDefault("-user.txt")), onStep, timeout);
     }
 
     private Row RunChain(long dep, List<PackageStep> steps, Dictionary<string, ChainFile> files, int timeout, Progress progress)
@@ -1291,8 +1390,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
                     return Chain.RunRemote(host, creds!, col, [new Chain.Payload("-user.txt", Bytes: Chain.MessageFileBytes(s.Text!))],
                         (p, run, o, tmp) => Chain.MessageScript(p["-user.txt"], s.Seconds ?? Chain.DefaultMessageSeconds, run, o, tmp), onStep, timeout);
                 default:                                                         // reboot / shutdown
-                    return Chain.RunRemote(host, creds!, col, [],
-                        (_, run, o, tmp) => Chain.PowerScript(s.Type == "reboot", s.Seconds ?? Chain.DefaultPowerDelay, run, o, tmp), onStep, timeout);
+                    return RunPower(host, creds!, s.Type == "reboot", s.Seconds ?? Chain.DefaultPowerDelay, s.Text, onStep, timeout);
             }
         }
 
@@ -1591,6 +1689,180 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         };
     }
 
+    // ------------------------------------------------------------------ power: restart / shut down / wake on LAN
+    public static readonly IReadOnlyList<string> PowerActions = ["reboot", "shutdown", "wol"];
+
+    /// <summary>Replaces the remote shutdown.exe run (tests): (host, action, seconds, text or null) -> result.</summary>
+    internal Func<string, string, int, string?, RemoteRunResult>? PowerSender { get; set; }
+
+    /// <summary>The names this computer goes by, short and fully qualified (tests can replace them): the program never
+    /// shuts down its own computer.</summary>
+    internal IReadOnlyList<string> LocalNames { get => _localNames ??= LocalComputerNames(); set => _localNames = value; }
+    private IReadOnlyList<string>? _localNames;                          // looked up on first use (a DNS query)
+
+    /// <summary>Resolves a target's host name to its addresses right before the power action (tests: a fake; null
+    /// with a fake sender / in demo mode = no resolution).</summary>
+    internal Func<string, IReadOnlyList<IPAddress>>? HostResolver { get; set; }
+
+    /// <summary>The addresses of this computer (tests can replace them); loopback always counts as this computer.</summary>
+    internal IReadOnlyList<IPAddress> LocalAddresses { get => _localAddresses ??= LocalComputerAddresses(); set => _localAddresses = value; }
+    private IReadOnlyList<IPAddress>? _localAddresses;
+
+    private static List<string> LocalComputerNames()
+    {
+        var names = new List<string> { Environment.MachineName };
+        try
+        {
+            var hn = System.Net.Dns.GetHostName();
+            names.Add(hn);
+            names.Add(System.Net.Dns.GetHostEntry(hn).HostName);
+        }
+        catch (System.Net.Sockets.SocketException) { }
+        try
+        {
+            var domain = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().DomainName;
+            if (domain.Length > 0) names.Add($"{Environment.MachineName}.{domain}");
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException) { }
+        var all = names.Where(n => n.Length > 0).SelectMany(n => new[] { n, n.Split('.')[0] });
+        return [.. all.Select(n => n.TrimEnd('.')).Distinct(StringComparer.OrdinalIgnoreCase)];
+    }
+
+    private static List<IPAddress> LocalComputerAddresses()
+    {
+        try
+        {
+            return [.. System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                .SelectMany(n => n.GetIPProperties().UnicastAddresses).Select(a => a.Address)];
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException) { return []; }
+    }
+
+    private bool IsThisComputer(Row c)
+    {
+        var dns = (c["dns_hostname"] as string ?? "").TrimEnd('.');
+        var names = new[] { Str(c["name"]), dns, dns.Split('.')[0] }.Where(n => n.Length > 0);
+        return names.Any(n => LocalNames.Contains(n, StringComparer.OrdinalIgnoreCase));
+    }
+
+    /// <summary>True when <paramref name="host"/> resolves to this computer (loopback or one of its own addresses): an
+    /// alias, a CNAME or a stale DNS record must not let a restart / shutdown reach the computer ADmiral runs on.</summary>
+    internal bool ResolvesToThisComputer(string host)
+    {
+        IReadOnlyList<IPAddress> addrs;
+        try
+        {
+            if (HostResolver is { } r) addrs = r(host);
+            else if (PowerSender is not null || IsDemo) return false;
+            else addrs = System.Net.Dns.GetHostAddresses(host);
+        }
+        catch (System.Net.Sockets.SocketException) { return false; }          // not resolvable: the connection fails anyway
+        static IPAddress Norm(IPAddress a) => a.IsIPv4MappedToIPv6 ? a.MapToIPv4() : a;
+        var local = LocalAddresses.Select(Norm).ToHashSet();
+        return addrs.Select(Norm).Any(a => IPAddress.IsLoopback(a) || local.Contains(a));
+    }
+
+    /// <summary>Restart / shut down (shutdown.exe as SYSTEM, after <paramref name="seconds"/>, with the message) or wake
+    /// (magic packet to the inventory's MAC address) the computers <paramref name="names"/> plus the members of
+    /// <paramref name="fleetIds"/> - the targets a deployment would reach. This computer is never restarted or shut down.
+    /// Runs as the "power" job; its result is {action, total, ok, on, failed, unreachable, results: [{name, outcome, detail}]}.</summary>
+    public JobInfo SendPower(IReadOnlyList<string> names, IReadOnlyList<long> fleetIds, string action, int? seconds = null, string? text = null)
+    {
+        if (!PowerActions.Contains(action)) throw new ArgumentException(T("err.power_action"));
+        var wol = action == "wol";
+        var msg = wol ? null : Chain.ValidPowerMessage(text);
+        var secs = wol ? 0 : Math.Clamp(seconds ?? Chain.DefaultPowerDelay, Chain.MinPowerDelay, 3600);
+        var pv = DeploymentPreview(names ?? [], fleetIds ?? []);
+        var ids = (List<string>)pv["ids"]!;
+        if (ids.Count == 0) throw new ArgumentException(T("err.dep_no_targets"));
+        var comps = Computers().ToDictionary(c => (string)c["guid"]!);
+        // allow_scan only governs scanning: restart / shutdown / wake on LAN do not look at it
+        var targets = ids.Where(comps.ContainsKey).Select(g => comps[g]).ToList();
+        if (!wol && targets.FirstOrDefault(IsThisComputer) is { } self)
+            throw new ArgumentException(T("err.power_self", ("name", Str(self["name"]))));
+        return Jobs.Start("power", "power", progress => RunPowerJob(targets, action, secs, msg, progress));
+    }
+
+    private Row RunPowerJob(List<Row> targets, string action, int seconds, string? text, Progress progress)
+    {
+        var wol = action == "wol";
+        SmbCreds? creds = null;
+        if (!wol && !IsDemo && PowerSender is null)
+        {
+            creds = Pdq.CredsFromLdap(Settings.Ldap, Kerberos.RealmFromBaseDn(Settings.Ldap.BaseDn));
+            if (!creds.HasExplicitCredential) throw new ArgumentException(T("err.pdq_creds"));
+        }
+        var results = new List<Row>();
+        var gate = new Lock();
+        var done = 0;
+        Parallel.ForEach(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(8, targets.Count)) }, c =>
+        {
+            var name = Str(c["name"]);
+            var host = c["dns_hostname"] is string { Length: > 0 } dns ? dns : name;
+            string outcome, detail;
+            try
+            {
+                if (wol)
+                {
+                    if (Reachable(host)) (outcome, detail) = ("on", "the computer is already on");
+                    else
+                    {
+                        var mac = (c["inventory"] as JsonObject)?["mac_address"] is JsonValue mv && mv.TryGetValue<string>(out var ms) ? ms : null;
+                        var packet = Chain.MagicPacket(mac);
+                        if (packet is null) (outcome, detail) = ("failed", "no MAC address known (collect the inventory once while it is on)");
+                        else
+                        {
+                            var addrs = Chain.WolAddresses(c["ip"] as string);
+                            SendWol(host, packet, addrs);
+                            (outcome, detail) = ("ok", $"magic packet sent to {mac} via {string.Join(", ", addrs)}");
+                        }
+                    }
+                }
+                else if (ResolvesToThisComputer(host))
+                    (outcome, detail) = ("failed", T("err.power_self", ("name", name)));
+                else
+                {
+                    RemoteRunResult r;
+                    if (PowerSender is { } fake) r = fake(host, action, seconds, text);
+                    else if (IsDemo)
+                    {
+                        if (DemoDelayScale > 0) Thread.Sleep(TimeSpan.FromSeconds(0.4 * DemoDelayScale));
+                        if (c["online"] is not true) throw new Unreachable("demo: the computer is offline");
+                        r = new RemoteRunResult(0, "", "", 0);
+                    }
+                    else r = RunPower(host, creds!, action == "reboot", seconds, text, (_, _) => { }, 120);
+                    detail = (r.Error.Length > 0 ? r.Error : r.Output).Trim();
+                    outcome = r.Error.Length > 0 || r.ExitCode is not 0 ? "failed" : "ok";
+                    if (outcome == "ok" && detail.Length == 0) detail = $"{(action == "reboot" ? "restart" : "shutdown")} in {seconds}s";
+                }
+            }
+            catch (Unreachable exc) { (outcome, detail) = ("unreachable", exc.Message); }
+            catch (Exception exc) when (exc is DeployError or ArgumentException or CollectError or IOException or InvalidOperationException
+                                            or System.Net.Sockets.SocketException or UnauthorizedAccessException)
+            {
+                (outcome, detail) = ("failed", $"{exc.GetType().Name}: {exc.Message}");
+            }
+            lock (gate)
+            {
+                results.Add(new Row { ["name"] = name, ["outcome"] = outcome, ["detail"] = Cap(detail, 300) });
+                progress.Report(++done, targets.Count, name);
+            }
+        });
+        results.Sort((a, b) => string.Compare((string)a["name"]!, (string)b["name"]!, StringComparison.OrdinalIgnoreCase));
+        int N(string o) => results.Count(r => (string)r["outcome"]! == o);
+        var bad = results.Where(r => r["outcome"] as string is "failed" or "unreachable").Select(r => $"{r["name"]} ({r["outcome"]})").ToList();
+        var all = string.Join(", ", results.Select(r => (string)r["name"]!));
+        Store.Log("power", T("log.power", ("action", T("power." + action)), ("n", targets.Count), ("ok", N("ok")), ("bad", bad.Count),
+                             ("names", Cap(all, 600)))
+                           + (text is { Length: > 0 } ? $": \u201c{Cap(text, 120)}\u201d" : "")
+                           + (bad.Count > 0 ? " \u2013 " + Cap(string.Join(", ", bad), 600) : ""));
+        return new Row
+        {
+            ["action"] = action, ["total"] = targets.Count, ["ok"] = N("ok"), ["on"] = N("on"), ["failed"] = N("failed"),
+            ["unreachable"] = N("unreachable"), ["results"] = results,
+        };
+    }
+
     // ------------------------------------------------------------------ firewall rule for the sync listener
     /// <summary>The rule script for this instance's sync settings: {filename, content, port, network}.</summary>
     public Row FirewallScript()
@@ -1650,18 +1922,99 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         return (int)Math.Max(n, 1);
     }
 
-    /// <summary>Like <see cref="RunDeployment"/>, but a failure before / outside the per-computer work (directory lookup,
-    /// missing credentials, ...) must not leave the computers 'queued' forever: they are marked failed with the reason.</summary>
-    private object? RunDeploymentSafe(long dep, Func<object?> run)
+    /// <summary>How often a running deployment writes its heartbeat (well below <see cref="Store.DeploymentStaleAfter"/>).</summary>
+    internal static readonly TimeSpan DeploymentHeartbeat = TimeSpan.FromMinutes(1);
+
+    /// <summary>Files from this size on get their checking progress in the deployment log (every 10 %).</summary>
+    internal const long VerifyLogBytes = 64L * 1024 * 1024;
+
+    /// <summary>A file a deployment sends: its library path, the local copy and the registered SHA-256.</summary>
+    private sealed record VerifyFile(string Path, string Local, string Sha);
+
+    /// <summary>Check every file against its registered SHA-256 before anything is sent; the computers show "verifying"
+    /// meanwhile. A missing or changed file fails the deployment (nothing was sent).</summary>
+    private void VerifyFiles(long dep, IReadOnlyList<VerifyFile> files, Progress progress)
     {
+        long Size(string p) { try { return new FileInfo(p).Length; } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return 0; } }
+        var total = files.Sum(f => File.Exists(f.Local) ? Size(f.Local) : 0);
+        Store.AddDeploymentEvent(dep, $"Checking {files.Count} file(s), {total} bytes, against the register before sending");
+        Store.SetWaitingTargets(dep, "verifying", 0);
+        long done = 0;
+        var lastPct = -1;
+        foreach (var f in files)
+        {
+            if (!File.Exists(f.Local))
+            {
+                Log.Logger.LogError("Deployment {Id}: {File} is missing from the library; aborted", dep, f.Path);
+                throw new PackageIntegrityException(f.Path, T("err.dep_hash", ("file", f.Path)));
+            }
+            var size = Size(f.Local);
+            var before = done;
+            var lastTenth = 0;
+            var hex = PackageLibrary.Sha256File(f.Local, read =>
+            {
+                var pct = total > 0 ? (int)Math.Min(100, (before + read) * 100 / total) : 100;
+                if (pct != lastPct)
+                {
+                    lastPct = pct;
+                    progress.Report(pct, 100, $"verifying {System.IO.Path.GetFileName(f.Path)}");
+                    if (pct % 5 == 0) Store.SetWaitingTargets(dep, "verifying", pct);
+                }
+                if (size >= VerifyLogBytes && size > 0 && (int)(read * 10 / size) is var tenth and > 0 and < 10 && tenth > lastTenth)
+                {
+                    lastTenth = tenth;
+                    Store.AddDeploymentEvent(dep, $"Checking {f.Path}: {tenth * 10}%");
+                }
+            });
+            if (!string.Equals(hex, f.Sha, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Logger.LogError("Deployment {Id}: {File} does not match its registered SHA-256; aborted", dep, f.Path);
+                throw new PackageIntegrityException(f.Path, T("err.dep_hash", ("file", f.Path)));
+            }
+            done += size;
+            Store.AddDeploymentEvent(dep, $"Checked: {f.Path} matches its registered SHA-256");
+        }
+        Store.SetWaitingTargets(dep, "queued", null);
+    }
+
+    /// <summary>Like <see cref="RunDeployment"/>, but a failure before / outside the per-computer work (directory lookup,
+    /// missing credentials, ...) must not leave the computers 'queued' forever: they are marked failed with the reason.
+    /// <para>While it runs, the deployment's heartbeat is refreshed (another ADmiral instance starting up then leaves it
+    /// alone), and first every file it sends (<paramref name="verify"/>) is checked against the register - here, in the
+    /// job, so a big file does not hold up the request that started the deployment. The copy checks the bytes it sends
+    /// once more (<see cref="Deploy"/> / <see cref="Chain"/>), so a file changed after this check is not run either.</para></summary>
+    /// <summary>The error prefix of a computer whose deployment stopped because a library file failed its SHA-256 check.</summary>
+    public const string IntegrityPrefix = "INTEGRITY:";
+
+    /// <summary>A library file is missing or does not match its registered SHA-256 (possibly tampered with).</summary>
+    internal sealed class PackageIntegrityException(string file, string message) : ArgumentException(message)
+    {
+        public string File { get; } = file;
+    }
+
+    private object? RunDeploymentSafe(long dep, Func<object?> run, IReadOnlyList<VerifyFile>? verify = null, Progress? progress = null)
+    {
+        using var beat = new Timer(_ =>
+        {
+            try { Store.TouchDeployment(dep); }
+            catch (Exception exc) when (exc is not OutOfMemoryException)
+            {
+                Log.Logger.LogDebug(exc, "Deployment {Id}: the heartbeat could not be written", dep);
+            }
+        }, null, DeploymentHeartbeat, DeploymentHeartbeat);
         try
         {
-            return RunDeploymentHook is { } hook ? hook(dep) : run();
+            if (RunDeploymentHook is { } hook) return hook(dep);
+            if (verify is { Count: > 0 }) VerifyFiles(dep, verify, progress ?? Progress.None);
+            return run();
         }
         catch (Exception exc)
         {
-            var reason = $"{exc.GetType().Name}: {exc.Message}";
+            // a library file that no longer matches its register is told apart from an ordinary failure: it may have
+            // been tampered with, so it is marked as such on every computer and written to the activity log
+            var reason = exc is PackageIntegrityException pie ? $"{IntegrityPrefix} {pie.Message}" : $"{exc.GetType().Name}: {exc.Message}";
             if (reason.Length > 500) reason = reason[..500];
+            if (exc is PackageIntegrityException bad) Store.Log("security", T("log.dep_integrity", ("id", dep), ("file", bad.File)));
             if (exc is ArgumentException) Log.Logger.LogWarning("Deployment {Id} aborted: {Reason}", dep, reason);
             else Log.Logger.LogWarning(exc, "Deployment {Id} aborted: {Reason}", dep, reason);
             if (Store.Deployment(dep)?["targets"] is List<Row> targets)
@@ -2199,16 +2552,25 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         return new Row { ["builds"] = reference.Builds.Count, ["months"] = reference.Months };
     }
 
-    /// <summary>The Windows updates page: {status, reference: [{build, ubr, month, released}], computers: [...]}.</summary>
+    /// <summary>The Windows updates page: {status, reference: [{key, build, family, ubr, month, released, kb, product}],
+    /// computers: [{..., build, family, ...}]}.</summary>
     public Row WinUpdates()
     {
         var (builds, meta) = Store.UpdateReference();
         Dictionary<string, string> kbs;
         try { kbs = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(meta.GetValueOrDefault("kbs") is { Length: > 0 } k ? k : "{}") ?? []; }
         catch (System.Text.Json.JsonException) { kbs = []; }
+        // one row per build and family (Windows 11 24H2 and Windows Server 2025 share 10.0.26100 but not their updates)
         var reference = builds.OrderByDescending(kv => kv.Key, StringComparer.Ordinal)
-            .Select(kv => new Row { ["build"] = kv.Key, ["ubr"] = kv.Value.Ubr, ["month"] = kv.Value.Month, ["released"] = kv.Value.Released,
-                                    ["kb"] = kbs.GetValueOrDefault(kv.Key) }).ToList();
+            .Select(kv =>
+            {
+                var (build, family) = Updates.SplitRefKey(kv.Key);
+                return new Row
+                {
+                    ["key"] = kv.Key, ["build"] = build, ["family"] = family, ["ubr"] = kv.Value.Ubr, ["month"] = kv.Value.Month,
+                    ["released"] = kv.Value.Released, ["kb"] = kv.Value.Kb ?? kbs.GetValueOrDefault(kv.Key), ["product"] = kv.Value.Product,
+                };
+            }).ToList();
         var comps = new List<Row>();
         foreach (var c in Computers())
         {
@@ -2220,7 +2582,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             comps.Add(new Row
             {
                 ["guid"] = c["guid"], ["name"] = c["name"], ["os"] = c["os"] as string ?? "", ["ou"] = c["ou"] as string ?? "",
-                ["build"] = ver, ["installed"] = installed, ["state"] = sec.State, ["latest"] = sec.Latest ?? "",
+                ["build"] = ver, ["family"] = Updates.ComputerFamily(inv), ["installed"] = installed, ["state"] = sec.State, ["latest"] = sec.Latest ?? "",
                 ["collected_at"] = c.GetValueOrDefault("collected_at"),
             });
         }

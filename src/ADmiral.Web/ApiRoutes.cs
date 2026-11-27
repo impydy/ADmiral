@@ -16,7 +16,7 @@ namespace ADmiral.Web;
 public static partial class WebApp
 {
     private static readonly string[] JobKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "scan", "collect", "full"];
-    private static readonly string[] NonScanKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "deploy", "wuinstall", "message"];
+    private static readonly string[] NonScanKinds = ["ad-sync", "ad-users", "sync", "updates", "vulns", "deploy", "wuinstall", "message", "power"];
     private static readonly string[] ServiceActions = ["install", "enable", "disable", "delete"];
     private static readonly string[] FleetKinds = ["static", "dynamic"];
     private static readonly string[] PrinterFields =
@@ -243,6 +243,9 @@ public static partial class WebApp
 
         // ----------------------------------------------------------------- packages
         app.MapGet("/api/packages", () => J(a.PackagesStatus()));
+        // read-only: which collected computers a Windows update package fits (from the inventories, nothing is contacted)
+        app.MapGet("/api/packages-compatible", (HttpContext ctx) =>
+            J(a.WinUpdateCompatible(PackageLibrary.ValidId(QueryStr(ctx, "id")))));
         app.MapPost("/api/packages-upload", async (HttpContext ctx) =>
         {
             // raw file body (no multipart): add a file to a manual package (created if new)
@@ -430,6 +433,15 @@ public static partial class WebApp
             // a message to the users of computers: {ids, fleet_ids, text, seconds}
             var b = await JsonBody.ReadAsync(ctx);
             return J(a.SendMessage(b.StrListOr("ids"), b.OptLongList("fleet_ids") ?? [], b.Str("text"), (int?)b.OptLong("seconds")), 202);
+        });
+        app.MapPost("/api/power", async (HttpContext ctx) =>
+        {
+            // restart / shut down / wake the computers: {ids, fleet_ids, action: reboot|shutdown|wol, seconds, text}
+            var b = await JsonBody.ReadAsync(ctx);
+            var action = b.Literal("action", AdmiralService.PowerActions);
+            int? seconds = b.OptLong("seconds") is { } sv ? (int)Math.Clamp(sv, 0, 3600) : null;
+            return J(a.SendPower(b.StrListOr("ids"), b.OptLongList("fleet_ids") ?? [], action, seconds,
+                                 b.OptStr("text")), 202);
         });
         app.MapGet("/api/retry-service", () => J(a.RetryServiceAction()));
         app.MapPost("/api/retry-service", async (HttpContext ctx) =>
