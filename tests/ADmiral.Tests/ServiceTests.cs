@@ -545,6 +545,84 @@ public sealed class ServiceTests : IDisposable
     }
 
     [Fact]
+    public void LocalAccountsAreNeverUsers()
+    {
+        App.Store.LogonRetentionDays = 3650;
+        var comps = App.Computers();
+        string ga = (string)comps[0]["guid"]!, na = (string)comps[0]["name"]!, nb = (string)comps[1]["name"]!;
+        static JsonObject Ev(string user, string dom, string t) =>
+            new() { ["time"] = t, ["user"] = user, ["domain"] = dom, ["type"] = 2, ["ip"] = "" };
+        App.Store.RecordInventory(ga, Collector.Normalize(new JsonObject
+        {
+            ["logons"] = new JsonArray(Ev("kovacs.anna", "CONTOSO", "2026-01-02T08:00:00+00:00"),
+                                       Ev("Administrator", na.ToLowerInvariant(), "2026-01-02T09:00:00+00:00"),   // its own name
+                                       Ev("helyi", "OLD-PC-NAME", "2026-01-02T10:00:00+00:00"),                // COMPUTERNAME (from its local accounts)
+                                       Ev("admin", nb, "2026-01-02T11:00:00+00:00"),                           // another computer's local account
+                                       Ev("x@outlook.com", "MicrosoftAccount", "2026-01-02T12:00:00+00:00")),
+            ["user_accounts"] = new JsonArray(new JsonObject { ["name"] = "helyi", ["domain"] = "OLD-PC-NAME", ["type"] = "local" }),
+        }));
+        Assert.Equal(["kovacs.anna"], App.Users().Select(r => (string)r["name"]!));
+        Assert.Equal(["kovacs.anna"], App.Store.Items(ga)["logons"].Select(e => (string?)e["user"]));
+        Assert.Single(App.Store.Items(ga)["user_accounts"]);              // the computer's own account list keeps them
+        Assert.DoesNotContain(App.Users(), r => r.ContainsKey("local"));
+    }
+
+    [Fact]
+    public void LocalLogonsStoredByAnOlderVersionArePurged()
+    {
+        var comps = App.Computers();
+        string ga = (string)comps[0]["guid"]!, na = (string)comps[0]["name"]!;
+        var now = Db.FormatUtc(DateTimeOffset.UtcNow.AddDays(-1));
+        App.Store.Execute("INSERT INTO computer_items (guid, kind, pos, data) VALUES (?, 'logons', 100, ?)", ga,
+                          new JsonObject { ["time"] = now, ["user"] = "Administrator", ["domain"] = na, ["type"] = 2, ["ip"] = "" }.ToJsonString());
+        App.Store.Execute("INSERT INTO computer_items (guid, kind, pos, data) VALUES (?, 'logons', 101, ?)", ga,
+                          new JsonObject { ["time"] = now, ["user"] = "anna", ["domain"] = "CONTOSO", ["type"] = 2, ["ip"] = "" }.ToJsonString());
+        Assert.DoesNotContain(App.Store.LogonRows(), r => (string?)r.Event["user"] == "Administrator");   // never read
+        Assert.Equal(1, App.Store.PurgeLocalLogons());
+        Assert.Equal(["anna"], App.Store.Items(ga)["logons"].Select(e => (string?)e["user"]));
+        Assert.Equal(0, App.Store.PurgeLocalLogons());
+    }
+
+    [Fact]
+    public void RemovedUsersLeaveTheListUntilTheyLogOnAgain()
+    {
+        App.Store.LogonRetentionDays = 3650;
+        var ga = (string)App.Computers()[0]["guid"]!;
+        static JsonObject Ev(string user, DateTimeOffset t) =>
+            new() { ["time"] = Db.FormatUtc(t), ["user"] = user, ["domain"] = "CONTOSO", ["type"] = 2, ["ip"] = "" };
+        var old = DateTimeOffset.UtcNow.AddDays(-3);
+        var inv = new JsonObject { ["logons"] = new JsonArray(Ev("kovacs.anna", old), Ev("nagy.bela", old)) };
+        App.Store.RecordInventory(ga, Collector.Normalize((JsonObject)inv.DeepClone()));
+        Assert.Equal(2, App.Users().Count);
+
+        Assert.Equal(1, App.RemoveUsers(["CONTOSO\\Kovacs.Anna", "nobody\\x"]));     // case-insensitive; unknown ignored
+        Assert.Equal(["nagy.bela"], App.Users().Select(r => (string)r["name"]!));
+        Assert.Equal(["nagy.bela"], App.Store.Items(ga)["logons"].Select(e => (string?)e["user"]));
+        Assert.Contains(App.Store.Query("SELECT action FROM activity ORDER BY rowid DESC LIMIT 1"),
+                        r => (string?)r["action"] == "remove-users");
+
+        // the computer's event log still holds the old logon: it is not taken in again
+        App.Store.RecordInventory(ga, Collector.Normalize((JsonObject)inv.DeepClone()));
+        Assert.Equal(["nagy.bela"], App.Users().Select(r => (string)r["name"]!));
+        // a new logon after the removal lists the user again
+        App.Store.AddLogons(ga, [Ev("kovacs.anna", DateTimeOffset.UtcNow.AddMinutes(1))]);
+        Assert.Equal(2, App.Users().Count);
+        Assert.Equal(0, App.RemoveUsers([]));
+    }
+
+    [Fact]
+    public void RemovingAnImportedAdUserDropsTheImport()
+    {
+        App.SyncAdUsers(baseDn: $"OU=Users,{Demo.Domain}");
+        var first = App.Users()[0];
+        Assert.Equal(1, App.RemoveUsers([(string)first["key"]!]));
+        Assert.Equal(7, App.Users().Count);
+        Assert.DoesNotContain(App.Users(), r => (string)r["key"]! == (string)first["key"]!);
+        Assert.Equal(8, App.SyncAdUsers(baseDn: $"OU=Users,{Demo.Domain}")["total"]);     // a new import brings it back
+        Assert.Equal(8, App.Users().Count);
+    }
+
+    [Fact]
     public void AdUsersImportByOu()
     {
         var r = App.SyncAdUsers(baseDn: $"OU=Users,{Demo.Domain}");
@@ -701,10 +779,37 @@ public sealed class ServiceTests : IDisposable
         var checkedAt = (string)st["checked"]!;
         Assert.Contains("offline", (string)st["error"]!);
         Assert.False((bool)st["available"]!);
+        Assert.True((bool)App.AppUpdateState()["fresh"]!);
         App.ForgetAppUpdateCheck();                                       // as after a restart
         Assert.Equal(checkedAt, App.AppUpdateState()["checked"]);
+        Assert.False((bool)App.AppUpdateState()["fresh"]!);              // only an earlier run's time: no answer yet
         Assert.Equal(Config.AppUpdateUrl, App.AppUpdateState()["url"]);
         Assert.ThrowsAny<ArgumentException>(() => App.AppUpdateInstall());    // not an installed Windows program
+    }
+
+    [Fact]
+    public void StartupCheckGivesTheNewVersionWithItsNotes()
+    {
+        var calls = 0;
+        App.AppUpdateChecker = (_, _, _) =>
+        {
+            Interlocked.Increment(ref calls);
+            return (new JsonObject { ["version"] = "99.0.0" }, new AppUpdateInfo("99.0.0", "- faster scans\n- new pop-up", true, null));
+        };
+        using var stop = new CancellationTokenSource();
+        var loop = new Thread(() => App.AppUpdateLoop(stop.Token, firstDelaySeconds: 0)) { IsBackground = true };
+        loop.Start();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!(App.AppUpdateState()["fresh"] is true) && sw.Elapsed < TimeSpan.FromSeconds(10)) Thread.Sleep(20);
+        stop.Cancel();
+        loop.Join(TimeSpan.FromSeconds(10));
+        var st = App.AppUpdateState();
+        Assert.True((bool)st["fresh"]!);
+        Assert.True((bool)st["available"]!);
+        Assert.Equal("99.0.0", st["latest"]);
+        Assert.Equal("- faster scans\n- new pop-up", st["notes"]);
+        Assert.Equal(1, calls);                                           // one check at start-up, the next one a day later
+        Assert.Equal(3, typeof(AdmiralService).GetMethod("AppUpdateLoop")!.GetParameters()[1].DefaultValue is double d ? (int)d : -1);
     }
 
     [Fact]

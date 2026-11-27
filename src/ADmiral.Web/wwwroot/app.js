@@ -512,14 +512,27 @@ const RAIL = [
   ["rail.tools", [["remote", "ra"], ["message", "message"]]],
 ];
 
+/* The rail can be folded to its icons (remembered in this browser); the labels then show as tooltips. */
+const railCollapsed = () => store.get("rail.collapsed", false) === true;
+
 function renderRail() {
-  $("#rail").innerHTML = `<div class="rail-brand"><img src="/static/favicon.svg" width="24" height="24" alt=""><span>ADmiral</span></div>`
-    + `<div class="rail-sep"></div><div class="rail-it${S.section === "overview" ? " on" : ""}" data-sec="overview" role="button">${icon("home", 18)}<span>${esc(t("nav.overview"))}</span></div>`
+  const rail = $("#rail"), folded = railCollapsed();
+  rail.classList.toggle("collapsed", folded);
+  const ver = S.status?.version || "";
+  // the label is the tooltip when only the icon shows
+  const item = (attrs, ic, label, on = false) =>
+    `<div class="rail-it${on ? " on" : ""}" ${attrs} role="button"${folded ? ` title="${esc(label)}" aria-label="${esc(label)}"` : ""}>${icon(ic, 18)}<span>${esc(label)}</span></div>`;
+  const toggle = folded ? t("rail.expand") : t("rail.collapse");
+  rail.innerHTML = `<div class="rail-brand"${folded && ver ? ` title="ADmiral ${esc(ver)}"` : ""}><img src="/static/favicon.svg" width="24" height="24" alt="">`
+    + `<span class="rail-title">ADmiral</span>${ver ? `<span class="rail-ver">${esc(ver)}</span>` : ""}`
+    + `<button class="rail-fold" type="button" data-rail="fold" title="${esc(toggle)}" aria-label="${esc(toggle)}" aria-expanded="${!folded}">${icon("chevron", 16)}</button></div>`
+    + `<div class="rail-sep"></div>` + item(`data-sec="overview"`, "home", t("nav.overview"), S.section === "overview")
     + RAIL.map(([sec, items]) => `<div class="rail-sec">${esc(t(sec))}</div>` + items.map(([id, ic, soon]) => id === "-" ? `<div class="rail-sep"></div>` :
-      `<div class="rail-it${S.section === id ? " on" : ""}${soon ? " soon" : ""}" ${soon ? `title="${esc(t("rail.soon"))}"` : `data-sec="${id}"`} role="button">${icon(ic, 18)}<span>${esc(t("nav." + id))}</span></div>`).join("")).join("")
+      soon ? `<div class="rail-it soon" title="${esc(t("rail.soon"))}" role="button">${icon(ic, 18)}<span>${esc(t("nav." + id))}</span></div>`
+           : item(`data-sec="${id}"`, ic, t("nav." + id), S.section === id)).join("")).join("")
     + `<div class="rail-grow"></div>`
-    + `<div class="rail-it" data-rail="support" role="button">${icon("coffee", 18)}<span>${esc(t("nav.support"))}</span></div>`
-    + `<div class="rail-it" data-sec="settings" role="button">${icon("settings", 18)}<span>${esc(t("nav.settings"))}</span></div>`;
+    + item(`data-rail="support"`, "coffee", t("nav.support"))
+    + item(`data-sec="settings"`, "settings", t("nav.settings"), S.section === "settings");
 }
 
 function applySection() {
@@ -1417,6 +1430,64 @@ function confirmDialog(text, opts = {}) {
   });
 }
 
+/* At every start the program looks for a new version (a few seconds after it starts); once that check of this run
+   has an answer, a new version is offered in a dialog with its release notes. Shown once per page load. */
+async function appUpdatePrompt() {
+  if (S.auPrompted) return;
+  S.auPrompted = true;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 60; i++) {                       // at most ~3 minutes (a slow proxy)
+    let u = null;
+    try { u = await api("GET", "/api/appupdate"); } catch (_) { return; }
+    if (!u.enabled) return;
+    if (u.fresh) { if (u.available && !u.error) await appUpdateDialog(u); return; }
+    await wait(3000);
+  }
+}
+
+function appUpdateDialog(u) {
+  return new Promise((resolve) => {
+    const layer = document.createElement("div");
+    layer.className = "dlg-layer au-layer";
+    const notes = (u.notes || "").trim();
+    layer.innerHTML = `<div class="dlg cfm au-dlg" role="alertdialog" aria-modal="true" aria-labelledby="au-dlg-title">
+      <div class="dlg-title"><span id="au-dlg-title">${esc(t("au.title"))}</span></div>
+      <div class="dlg-body">
+        <div>${esc(tText("au.text", { v: u.latest, cur: u.current }))}</div>
+        <div class="fsec" style="margin-top:10px">${esc(t("au.changes"))}</div>
+        <div class="au-notes">${notes ? esc(notes) : `<span class="faint">${esc(t("au.no_notes"))}</span>`}</div>
+        ${u.can_install ? `<div class="faint">${esc(t("au.restart"))}</div>` : `<div class="faint">${esc(t("s.au_cannot"))}</div>`}
+      </div>
+      <div class="dlg-foot"><button class="btn" data-no type="button">${esc(t("au.later"))}</button>
+      ${u.can_install ? `<button class="btn primary" data-yes type="button">${esc(tText("s.au_install", { v: u.latest }))}</button>` : ""}</div></div>`;
+    const done = async (install) => {
+      document.removeEventListener("keydown", onKey, true);
+      if (!install) { layer.remove(); return resolve(false); }
+      const yes = layer.querySelector("[data-yes]"), no = layer.querySelector("[data-no]");
+      yes.disabled = no.disabled = true;
+      yes.textContent = t("s.au_downloading");
+      try {
+        const r = await api("POST", "/api/appupdate/install", { rollback: false });
+        layer.remove();
+        toast(tText("s.au_installing", { v: r.version }));
+        resolve(true);
+      } catch (e) {
+        layer.remove();
+        toast(String(e && e.message || e), true);
+        resolve(false);
+      }
+    };
+    // Escape and Enter close it: installing (the program restarts) always takes the explicit button
+    const onKey = (e) => { if (e.key === "Escape" || e.key === "Enter") { e.preventDefault(); e.stopPropagation(); done(false); } };
+    layer.querySelector("[data-no]").onclick = () => done(false);
+    const yes = layer.querySelector("[data-yes]");
+    if (yes) yes.onclick = () => done(true);
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(layer);
+    layer.querySelector("[data-no]").focus();
+  });
+}
+
 function aboutDialog() {
   dialog(t("m.about"), `<div style="display:flex;gap:14px;align-items:center"><img src="/static/logo.svg" width="96" height="96" alt="">
     <div><div style="font-size:18px">ADmiral ${esc(S.status?.version || "")}</div><div class="muted">${esc(t("about.text"))}</div>
@@ -1877,31 +1948,59 @@ function fleetEditor(fleet, preset) {
 }
 
 /* ================================================================== settings page */
-// Left column of the Settings page: quick jumps to the categories (built from the rendered sections).
+// The Settings page shows one group of sections at a time; the left column lists the groups with their sections.
+// A click on a group shows it from the top, a click on a section shows its group scrolled to that section.
+const SETTINGS_GROUPS = [
+  ["general", ["appearance"]],
+  ["connections", ["directory", "proxy", "sync"]],
+  ["inventory", ["scanning", "collect", "winrm", "offline", "logins", "retry"]],     // retry: re-queries the computers
+  ["security", ["vulns", "updates"]],
+  ["deploy", ["packages", "deploy"]],
+  ["troubleshoot", ["diag", "logs"]],
+  ["appupd", ["appupd"], true],                          // kept on its own, at the bottom of the column
+];
+
 function settingsNav() {
   const host = $("#settings");
-  const items = $$(".section, .fsec", host).map((el, i) => {
-    el.id = "ssec-" + i;
-    const sub = el.classList.contains("fsec");
-    const label = (sub ? el.textContent : (el.querySelector("h3")?.childNodes[0]?.textContent || "")).trim();
-    return { id: el.id, label, sub, bottom: el.classList.contains("pin-bottom") };
-  });
+  const sections = new Map($$(".section[data-sk]", host).map((el) => [el.dataset.sk, el]));
+  const groups = SETTINGS_GROUPS.map(([id, keys, bottom]) => ({ id, bottom, keys: keys.filter((k) => sections.has(k)) }))
+    .filter((g) => g.keys.length);
+  // the sections in group order (moving the nodes keeps their handlers); the file paths stay at the end
+  const tail = host.lastElementChild?.matches(".section") ? null : host.lastElementChild;
+  for (const g of groups) for (const k of g.keys) { const el = sections.get(k); el.id = "ssec-" + k; host.insertBefore(el, tail); }
+  const label = (k) => (sections.get(k).querySelector("h3")?.childNodes[0]?.textContent || "").trim();
+  // a group lists its sections; the program update (on its own at the bottom) is one item
+  const flat = (g) => g.bottom;
+  const name = (g) => flat(g) ? label(g.keys[0]) : t("sg." + g.id);
   const tree = $("#tree");
-  tree.innerHTML = `<div class="snav-col">${items.map((it) => `<div class="tn snav${it.sub ? " sub" : ""}${it.bottom ? " bottom" : ""}" data-snav="${it.id}" role="treeitem"><span class="lbl">${esc(it.label)}</span></div>`).join("")}</div>`;
-  const mark = (id) => $$(".snav", tree).forEach((n) => n.classList.toggle("sel", n.dataset.snav === id));
+  tree.innerHTML = `<div class="snav-col">${groups.map((g) =>
+    `<div class="tn snav grp${g.bottom ? " bottom" : ""}" data-sgrp="${g.id}" role="treeitem"><span class="lbl">${esc(name(g))}</span></div>`
+    + (!flat(g) ? g.keys.map((k) => `<div class="tn snav sub" data-sgrp="${g.id}" data-snav="${k}" role="treeitem"><span class="lbl">${esc(label(k))}</span></div>`).join("") : "")).join("")}</div>`;
+  const mark = (gid, key) => $$(".snav", tree).forEach((n) => n.classList.toggle("sel", n.dataset.sgrp === gid && (n.dataset.snav || null) === (key || null)));
+  const show = (gid, key) => {
+    const g = groups.find((x) => x.id === gid) || groups[0];
+    S.settingsGroup = g.id;
+    for (const [k, el] of sections) el.hidden = !g.keys.includes(k);
+    if (tail) tail.hidden = !g.bottom && g.id !== "general";       // the data paths: with the general settings
+    const target = key && sections.get(key);
+    if (target) target.scrollIntoView({ block: "start" }); else host.scrollTop = 0;
+    mark(g.id, !flat(g) && key ? key : null);
+  };
   tree.onclick = (e) => {
-    const n = e.target.closest("[data-snav]");
-    if (!n) return;
-    const target = document.getElementById(n.dataset.snav);
-    if (target) { target.scrollIntoView({ block: "start", behavior: "smooth" }); mark(n.dataset.snav); }
+    const n = e.target.closest("[data-sgrp]");
+    if (n) show(n.dataset.sgrp, n.dataset.snav);
   };
-  host.onscroll = () => {                                 // highlight the category being read
+  host.onscroll = () => {                                 // highlight the section being read
+    const g = groups.find((x) => x.id === S.settingsGroup);
+    if (!g || flat(g)) return;
     const top = host.getBoundingClientRect().top + 12;
-    let cur = items[0]?.id;
-    for (const it of items) if (document.getElementById(it.id).getBoundingClientRect().top <= top) cur = it.id;
-    mark(cur);
+    let cur = null;
+    for (const k of g.keys) if (sections.get(k).getBoundingClientRect().top <= top) cur = k;
+    mark(g.id, cur);
   };
-  mark(items[0]?.id);
+  // reveal the section holding an element (used by a jump from elsewhere, and by the tests)
+  window.settingsReveal = (el) => { const sec = el?.closest(".section[data-sk]"); const g = sec && groups.find((x) => x.keys.includes(sec.dataset.sk)); if (g) show(g.id, sec.dataset.sk); };
+  show(S.settingsGroup);
 }
 
 function renderSettings(el) {
@@ -1917,11 +2016,11 @@ function renderSettings(el) {
     const sel = (id, label, value, opts) => `<label class="fld"><span>${esc(label)}</span><select id="${id}" ${ro}>${opts.map(([v, l]) => `<option value="${v}" ${v === value ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
     $("#settings").innerHTML = `
       ${cfg.editable ? "" : `<div class="callout">${esc(t("s.readonly"))}</div>`}
-      <div class="section"><h3>${t("s.appearance")}</h3><div class="in grid3">
+      <div class="section" data-sk="appearance"><h3>${t("s.appearance")}</h3><div class="in grid3">
         ${sel("st-lang", t("s.language"), cfg.language, [["hu", "Magyar"], ["en", "English"]])}
         ${sel("st-theme", t("s.theme"), cfg.theme, [["system", t("m.theme_system")], ["light", t("m.theme_light")], ["dark", t("m.theme_dark")]])}
       </div></div>
-      <div class="section"><h3>${t("s.directory")}</h3>
+      <div class="section" data-sk="directory"><h3>${t("s.directory")}</h3>
         <div class="in" id="st-ldap">
           <div class="grid3">
             ${inp("ldap-server", t("s.dc"), cfg.ldap.server, 'placeholder="dc01.corp.local"')}
@@ -1937,19 +2036,19 @@ function renderSettings(el) {
           <div class="chk"><button class="btn" id="st-test" type="button">${icon("ping", 16)}${t("s.test")}</button><span id="st-test-out" class="muted"></span></div>
           <div class="faint">${esc(t("s.ad_hint"))}</div>
         </div></div>
-      <div class="section"><h3>${t("s.collect")}</h3><div class="in"><div class="grid2">
+      <div class="section" data-sk="collect"><h3>${t("s.collect")}</h3><div class="in"><div class="grid2">
           ${sel("collect-method", t("s.collect_method"), cfg.collect.method, [["pdq", t("s.collect_pdq")], ["winrm", "WinRM"]])}
           ${inp("collect-timeout", t("s.collect_timeout"), cfg.collect.smb_timeout, 'type="number" min="5" max="600"')}
           ${inp("collect-response", t("s.collect_response"), cfg.collect.response_timeout, 'type="number" min="5" max="3600"')}
           ${inp("collect-delay", t("s.collect_delay"), cfg.collect.cleanup_delay, 'type="number" min="0" max="600"')}
         </div><div class="chk" style="gap:18px">${chk("collect-fb", t("s.collect_fb"), cfg.collect.winrm_fallback)}</div><div class="faint">${esc(t("s.collect_hint"))}</div></div></div>
-      <div class="section"><h3>${t("s.winrm")}</h3><div class="in"><div class="grid2">
+      <div class="section" data-sk="winrm"><h3>${t("s.winrm")}</h3><div class="in"><div class="grid2">
           ${inp("winrm-user", t("s.winrm_user"), cfg.winrm.user, 'placeholder="CORP\\svc-admiral"')}
           ${pw("winrm-pw", t("s.bind_pw"), cfg.winrm.password_set)}
           ${sel("winrm-transport", t("s.auth"), cfg.winrm.transport, [["kerberos", t("s.auth_kerberos")], ["ntlm", "NTLM"], ["credssp", "CredSSP"], ["basic", "Basic"]])}
           ${inp("winrm-workers", t("s.parallel"), cfg.winrm.workers, 'type="number" min="1" max="128"')}
         </div><div class="chk" style="gap:18px">${chk("winrm-https", t("s.https"), cfg.winrm.use_https)}${chk("winrm-verify", t("s.verify"), cfg.winrm.verify_cert)}${chk("winrm-ntlm", t("s.ntlm_fb"), cfg.winrm.ntlm_fallback)}</div><div class="faint">${esc(t("s.auth_hint"))}</div></div></div>
-      <div class="section"><h3>${t("s.scanning")}</h3><div class="in grid2">
+      <div class="section" data-sk="scanning"><h3>${t("s.scanning")}</h3><div class="in grid2">
           ${inp("scan-ports", t("s.ports"), cfg.scan.ports.join(", "), 'class="mono"')}
           ${inp("scan-timeout", t("s.timeout"), cfg.scan.timeout, 'type="number" step="0.1" min="0.1"')}
           ${inp("scan-workers", t("s.probes"), cfg.scan.workers, 'type="number" min="1" max="512"')}
@@ -1957,7 +2056,7 @@ function renderSettings(el) {
           <div class="faint" style="grid-column:1/-1">${esc(t("s.ping_hint"))}</div>
           ${inp("stale-days", t("s.stale"), cfg.stale_days, 'type="number" min="1"')}
       </div></div>
-      <div class="section"><h3>${t("s.vulns")}</h3><div class="in">
+      <div class="section" data-sk="vulns"><h3>${t("s.vulns")}</h3><div class="in">
           <div class="chk" style="gap:18px">${chk("vuln-enabled", t("s.vuln_enabled"), cfg.vulns.enabled)}</div>
           <div class="grid2">
             ${inp("vuln-days", t("s.vuln_days"), cfg.vulns.refresh_days, 'type="number" min="1" max="90"')}
@@ -1966,15 +2065,15 @@ function renderSettings(el) {
           <div class="faint">${esc(t("s.vuln_hint"))}</div>
           <div class="chk" style="gap:10px;margin-top:6px"><button class="btn" id="vuln-run" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.vuln_run"))}</button></div>
         </div></div>
-      <div class="section"><h3>${t("s.packages")}</h3><div class="in">
+      <div class="section" data-sk="packages"><h3>${t("s.packages")}</h3><div class="in">
           ${inp("pk-folder", t("s.pk_folder"), cfg.packages.folder, 'class="mono" placeholder="D:\\ADmiral\\packages"')}
           <div class="faint">${esc(t("s.pk_hint"))}</div>
         </div></div>
-      <div class="section"><h3>${t("s.deploy")}</h3><div class="in">
+      <div class="section" data-sk="deploy"><h3>${t("s.deploy")}</h3><div class="in">
           ${inp("dep-timeout", t("s.dep_timeout"), cfg.deploy.timeout_minutes, 'type="number" min="1" max="1440"')}
           <div class="faint">${esc(t("s.dep_hint"))}</div>
         </div></div>
-      <div class="section"><h3>${t("s.offline")}</h3><div class="in">
+      <div class="section" data-sk="offline"><h3>${t("s.offline")}</h3><div class="in">
           ${inp("off-inbox", t("s.off_inbox"), cfg.filecollect.inbox, 'class="mono" placeholder="\\\\server\\admiral-inbox"')}
           <div class="faint">${esc(t("s.off_hint"))}</div>
           ${shareAclBox()}
@@ -1983,7 +2082,7 @@ function renderSettings(el) {
           <div id="off-out" class="faint" style="margin:6px 0"></div>
           <div class="chk" style="gap:10px"><button class="btn" id="off-run" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.off_run"))}</button><button class="btn" id="off-script" type="button">${esc(t("s.off_script"))}</button></div>
         </div></div>
-      <div class="section"><h3>${t("s.logins")}</h3><div class="in">
+      <div class="section" data-sk="logins"><h3>${t("s.logins")}</h3><div class="in">
           <div class="chk" style="gap:18px">${chk("lg-track", t("s.lg_enabled"), cfg.logins.enabled)}</div>
           <div class="grid2">
             ${inp("lg-path", t("s.lg_path"), cfg.logins.path, 'class="mono" placeholder="\\\\server\\logins$"')}
@@ -1995,7 +2094,7 @@ function renderSettings(el) {
           <div id="lg-out" class="faint" style="margin:6px 0"></div>
           <div class="chk" style="gap:10px"><button class="btn" id="lg-run" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.lg_run"))}</button><button class="btn" id="lg-script" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.lg_script"))}</button></div>
         </div></div>
-      <div class="section"><h3>${t("s.updates")}</h3><div class="in">
+      <div class="section" data-sk="updates"><h3>${t("s.updates")}</h3><div class="in">
           <div class="chk" style="gap:18px">${chk("upd-enabled", t("s.upd_enabled"), cfg.updates.enabled)}</div>
           <div class="grid2">
             ${inp("upd-hours", t("s.upd_hours"), cfg.updates.refresh_hours, 'type="number" min="1" max="720"')}
@@ -2005,7 +2104,7 @@ function renderSettings(el) {
           <div id="upd-status" class="faint" style="margin:6px 0"></div>
           <div class="chk" style="gap:10px"><button class="btn" id="upd-run" type="button" ${cfg.editable ? "" : "disabled"}>${esc(t("s.upd_run"))}</button></div>
         </div></div>
-      <div class="section"><h3>${t("s.proxy")}</h3><div class="in">
+      <div class="section" data-sk="proxy"><h3>${t("s.proxy")}</h3><div class="in">
           <div class="grid2">
             ${inp("proxy-url", t("s.proxy_url"), cfg.proxy.url, 'placeholder="http://proxy.corp.local:8080"')}
             ${inp("proxy-pac", t("s.proxy_pac"), cfg.proxy.pac || "", 'placeholder="C:\\wpad.dat / http://wpad/wpad.dat / auto"')}
@@ -2017,7 +2116,7 @@ function renderSettings(el) {
           <div class="chk" style="gap:10px"><button class="btn" id="proxy-test" type="button" ${cfg.editable ? "" : "disabled"}>${icon("ping", 16)}${esc(t("s.proxy_test"))}</button></div>
           <div id="proxy-test-out" class="muted" style="white-space:pre-line"></div>
         </div></div>
-      <div class="section"><h3>${t("s.retry")}</h3><div class="in">
+      <div class="section" data-sk="retry"><h3>${t("s.retry")}</h3><div class="in">
           <div class="grid2">${inp("retry-interval", t("s.retry_interval"), cfg.retry.interval_minutes, 'type="number" min="1" max="1440"')}</div>
           <div class="chk" style="gap:18px">${chk("retry-offline", t("s.retry_offline"), cfg.retry.offline)}${chk("retry-failed", t("s.retry_failed"), cfg.retry.failed)}</div>
           <div class="faint">${esc(t("s.retry_hint"))}</div>
@@ -2028,7 +2127,7 @@ function renderSettings(el) {
           </div>
           <div class="chk" style="gap:10px" id="svc-buttons"></div>
         </div></div>
-      <div class="section"><h3>${t("s.sync")}</h3><div class="in">
+      <div class="section" data-sk="sync"><h3>${t("s.sync")}</h3><div class="in">
           <div class="chk" style="gap:18px">${chk("sy-enabled", t("s.sy_enabled"), cfg.sync.enabled)}</div>
           <div class="grid2">
             ${inp("sy-peer", t("s.sy_peer"), cfg.sync.peer, 'placeholder="10.1.2.3, pc02:8766, pc03"')}
@@ -2044,12 +2143,12 @@ function renderSettings(el) {
           <div class="faint" style="margin-top:8px">${esc(t("s.sy_fw_hint"))}</div>
           <div class="chk" style="gap:10px"><button class="btn" id="sy-fw" type="button" ${cfg.editable ? "" : "disabled"}>${icon("shield", 14)}${esc(t("s.sy_fw"))}</button><button class="btn" id="sy-fw-save" type="button">${esc(t("s.sy_fw_save"))}</button><span id="sy-fw-out" class="muted"></span></div>
         </div></div>
-      <div class="section"><h3>${t("s.diag")}</h3><div class="in">
+      <div class="section" data-sk="diag"><h3>${t("s.diag")}</h3><div class="in">
           <div class="faint">${esc(t("s.diag_hint"))}</div>
           <div class="chk" style="gap:10px"><button class="btn" id="dg-show" type="button">${t("s.diag_show")}</button><button class="btn" id="dg-copy" type="button">${t("s.diag_copy")}</button><button class="btn" id="dg-clear" type="button">${t("s.diag_clear")}</button><span id="dg-out" class="muted"></span></div>
           <textarea id="dg-text" class="mono" readonly rows="12" style="width:100%;display:none"></textarea>
         </div></div>
-      <div class="section"><h3>${t("s.logs")}</h3><div class="in">
+      <div class="section" data-sk="logs"><h3>${t("s.logs")}</h3><div class="in">
           <div class="faint">${esc(t("s.logs_hint"))}</div>
           ${chk("lg-debug", t("s.logs_debug"), cfg.debug_log !== false)}
           <div class="chk" style="gap:10px;flex-wrap:wrap">
@@ -2060,7 +2159,7 @@ function renderSettings(el) {
           <div class="chk" style="gap:10px;flex-wrap:wrap"><button class="btn" id="lg-pack" type="button">${esc(t("s.lp_make"))}</button><span id="lp-out" class="muted"></span></div>
           <div id="lp-result" style="display:none"></div>
         </div></div>
-      <div class="section pin-bottom"><h3>${t("s.appupd")}</h3><div class="in">
+      <div class="section pin-bottom" data-sk="appupd"><h3>${t("s.appupd")}</h3><div class="in">
           <div class="chk" style="gap:18px">${chk("au-enabled", t("s.au_enabled"), cfg.appupdate.enabled)}${chk("au-proxy", t("s.au_proxy"), cfg.appupdate.use_proxy)}</div>
           <div class="faint">${esc(t("s.au_hint"))}</div>
           <div id="au-status" class="faint" style="margin:6px 0"></div>
@@ -2376,6 +2475,7 @@ function renderSettings(el) {
 /* ================================================================== chrome */
 function renderAll() {
   $("#tree-filter").placeholder = t("tree.filter");
+  $("#splitter").title = t("tree.splitter");
   renderRail();
   applySection();
   renderToolbar();
@@ -2412,16 +2512,20 @@ function bindGlobal() {
   $("#tree-filter").oninput = (e) => { S.treeFilter = e.target.value; renderTree(); };
   $("#sb-right").onclick = (e) => { e.preventDefault(); selectNode("log"); };
 
-  // tree / page splitter
-  const sp = $("#splitter");
-  const w0 = store.get("treeW", 270);
-  document.querySelector(".workspace").style.setProperty("--tree-w", w0 + "px");
+  // tree / page splitter: the tree column fits its text (CSS); a drag sets a width of its own until the page is
+  // reloaded, a double click goes back to fitting the text
+  const sp = $("#splitter"), ws = document.querySelector(".workspace");
+  const setTreeW = (w) => { if (w == null) ws.style.removeProperty("--tree-w"); else ws.style.setProperty("--tree-w", w + "px"); };
+  sp.addEventListener("dblclick", () => setTreeW(null));
   sp.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
     e.preventDefault();
+    // relative to where the drag started: the column keeps its width under the pointer (no jump)
+    const x0 = e.clientX, w0 = document.querySelector(".tree-pane").getBoundingClientRect().width;
+    const max = () => Math.max(160, ws.getBoundingClientRect().width * 0.7);
     const move = (ev) => {
-      const w = Math.max(180, Math.min(520, ev.clientX - 6));
-      document.querySelector(".workspace").style.setProperty("--tree-w", w + "px");
-      store.set("treeW", w);
+      const w = Math.round(Math.max(140, Math.min(max(), w0 + ev.clientX - x0)));
+      setTreeW(w);
     };
     const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
     window.addEventListener("mousemove", move);
@@ -2462,6 +2566,7 @@ function bindGlobal() {
   bindSoftwareWindows();
   $("#rail").addEventListener("click", (e) => {
     const act = e.target.closest("[data-rail]");
+    if (act?.dataset.rail === "fold") { store.set("rail.collapsed", !railCollapsed()); return renderRail(); }
     if (act) return supportDialog();
     const it = e.target.closest("[data-sec]"); if (it) setSection(it.dataset.sec);
   });
@@ -2487,6 +2592,7 @@ async function boot() {
   if (!findNode(buildTree(), S.node)) S.node = "all";
   renderAll();
   if (S.section === "devices") selectNode(S.node);     // otherwise renderAll already showed the remembered page (e.g. the overview)
+  appUpdatePrompt();
   const running = (S.status.jobs || []).find((j) => j.status === "running");
   if (running) pollJob(running.id);
   // the background check runs shortly after start-up: tell once if a new version was found

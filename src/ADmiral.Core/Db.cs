@@ -221,6 +221,14 @@ public static class Db
         DELETE FROM update_ref;
         DELETE FROM update_meta WHERE k IN ('fetched_at', 'attempted_at', 'kbs', 'months');
         """,
+        // 15: users taken off the Users list: their logon events up to removed_at are not kept (the computers' event
+        // logs would bring them back at the next collection); a newer logon shows the user again
+        """
+        CREATE TABLE IF NOT EXISTS user_removed (
+            key        TEXT PRIMARY KEY,     -- lower('DOMAIN\user')
+            removed_at TEXT NOT NULL
+        );
+        """,
     ];
 
     /// <summary>The computer fields that come from Active Directory (replaced by every AD sync).</summary>
@@ -673,14 +681,16 @@ public sealed class Store : IDisposable
 
     /// <summary>Union of the stored logon events and <paramref name="rows"/> (newest first, no duplicates, capped, none
     /// older than the retention). Runs inside the caller's transaction.</summary>
-    private void MergeLogons(string guid, IEnumerable<JsonNode?> rows)
+    private void MergeLogons(string guid, IEnumerable<JsonNode?> rows, IEnumerable<JsonNode?>? accounts = null)
     {
         var old = Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'logons' ORDER BY pos", guid)
             .Select(r => ParseJson(r["data"]));
-        // local accounts of the computer are not kept (also cleans what an older version stored)
-        var name = Query("SELECT name FROM computers WHERE guid = ?", guid).Select(r => r["name"] as string).FirstOrDefault();
+        // local accounts of the computer are not kept (also cleans what an older version stored), nor the logons of
+        // a user removed from the Users list up to the removal
         var cutoff = LogonCutoff();
-        var merged = CollectorModel.CleanLogons(rows.Concat(old), name).Where(e => KeepLogon(e, cutoff)).ToList();
+        var removed = RemovedUsers();
+        var merged = CollectorModel.CleanLogons(rows.Concat(old), LocalDomains(guid, accounts))
+            .Where(e => KeepLogon(e, cutoff) && !IsRemoved(e, removed)).ToList();
         Execute("DELETE FROM computer_items WHERE guid = ? AND kind = 'logons'", guid);
         for (var i = 0; i < merged.Count; i++)
             Execute("INSERT INTO computer_items (guid, kind, pos, data) VALUES (?, 'logons', ?, ?)", guid, i, merged[i].ToJsonString());
@@ -689,6 +699,80 @@ public sealed class Store : IDisposable
     private static bool KeepLogon(JsonObject e, string cutoff) =>
         Db.ParseIso(e["time"]?.GetValue<string>()) is not { } t || t >= Db.ParseIso(cutoff)!.Value;
 
+    /// <summary>The names that mark a local account of computer <paramref name="guid"/> in a logon event
+    /// (<see cref="CollectorModel.LocalDomains"/>): every known computer's name (hidden ones too) and the domain of this
+    /// computer's local accounts, from <paramref name="accounts"/> (a fresh <c>user_accounts</c> list) or the stored one.</summary>
+    private HashSet<string> LocalDomains(string guid, IEnumerable<JsonNode?>? accounts = null)
+    {
+        accounts ??= Query("SELECT data FROM computer_items WHERE guid = ? AND kind = 'user_accounts'", guid).Select(r => ParseJson(r["data"]));
+        return CollectorModel.LocalDomains(AllComputerNames(), CollectorModel.LocalAccountDomains(accounts));
+    }
+
+    private IEnumerable<string?> AllComputerNames() =>
+        Query("SELECT name, dns_hostname FROM computers").SelectMany(r => new[] { r["name"] as string, r["dns_hostname"] as string });
+
+    /// <summary>guid -> the local-account names of that computer (one pass over the data, for reading every logon).</summary>
+    private Dictionary<string, HashSet<string>> LocalDomainsByComputer()
+    {
+        var names = AllComputerNames().ToList();
+        var domains = new Dictionary<string, List<string?>>();
+        foreach (var r in Query("SELECT guid, data FROM computer_items WHERE kind = 'user_accounts'"))
+        {
+            var g = (string)r["guid"]!;
+            if (!domains.TryGetValue(g, out var l)) domains[g] = l = [];
+            l.AddRange(CollectorModel.LocalAccountDomains([ParseJson(r["data"])]));
+        }
+        var all = CollectorModel.LocalDomains(names);
+        return Query("SELECT guid FROM computers").Select(r => (string)r["guid"]!).Distinct()
+            .ToDictionary(g => g, g => domains.TryGetValue(g, out var d) ? CollectorModel.LocalDomains(names, d) : all);
+    }
+
+    /// <summary>lower('DOMAIN\user') of a logon event.</summary>
+    public static string LogonUserKey(JsonObject e) =>
+        $"{((string?)e["domain"] ?? "").Trim().ToLowerInvariant()}\\{((string?)e["user"] ?? "").Trim().ToLowerInvariant()}";
+
+    /// <summary>The users removed from the Users list: key -> removal time.</summary>
+    private Dictionary<string, DateTimeOffset> RemovedUsers() =>
+        Query("SELECT key, removed_at FROM user_removed")
+            .Select(r => ((string)r["key"]!, Db.ParseIso(r["removed_at"] as string)))
+            .Where(x => x.Item2 is not null).ToDictionary(x => x.Item1, x => x.Item2!.Value, StringComparer.Ordinal);
+
+    /// <summary>A logon of a removed user from before the removal (an event without a readable time counts as old).</summary>
+    private static bool IsRemoved(JsonObject e, Dictionary<string, DateTimeOffset> removed) =>
+        removed.TryGetValue(LogonUserKey(e), out var at)
+        && (Db.ParseIso(e["time"]?.GetValue<string>()) is not { } t || t <= at);
+
+    /// <summary>Take users off the Users list (keys: lower 'DOMAIN\user'): their stored logon events are deleted from
+    /// every computer, the ones still in the computers' event logs are not taken in again, and an imported AD record
+    /// (<paramref name="adKeys"/>: lower sAMAccountName) is dropped. A logon after the removal lists the user again.
+    /// Returns the number of logon events deleted.</summary>
+    public int RemoveUsers(IReadOnlyCollection<string> keys, IReadOnlyCollection<string> adKeys) => InTx(() =>
+    {
+        Bump();
+        var now = Db.UtcNow();
+        var set = keys.Select(k => k.ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
+        foreach (var k in set)
+            Execute("INSERT INTO user_removed (key, removed_at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET removed_at = excluded.removed_at", k, now);
+        foreach (var k in adKeys) Execute("DELETE FROM users WHERE key = ?", k.ToLowerInvariant());
+        var drop = Query("SELECT rowid AS id, data FROM computer_items WHERE kind = 'logons'")
+            .Where(r => set.Contains(LogonUserKey(ParseObject(r["data"])))).Select(r => (long)r["id"]!).ToList();
+        foreach (var id in drop) Execute("DELETE FROM computer_items WHERE rowid = ?", id);
+        return drop.Count;
+    });
+
+    /// <summary>Delete the stored logon events of local accounts (what an older version kept, or what became local
+    /// once the computer's local accounts were collected). Returns how many were deleted.</summary>
+    public int PurgeLocalLogons() => InTx(() =>
+    {
+        var local = LocalDomainsByComputer();
+        var drop = Query("SELECT rowid AS id, guid, data FROM computer_items WHERE kind = 'logons'")
+            .Where(r => local.TryGetValue((string)r["guid"]!, out var d) && CollectorModel.IsLocalLogon(ParseObject(r["data"]), d))
+            .Select(r => (long)r["id"]!).ToList();
+        foreach (var id in drop) Execute("DELETE FROM computer_items WHERE rowid = ?", id);
+        if (drop.Count > 0) Bump();
+        return drop.Count;
+    });
+
     /// <summary>Drop the logon events older than the retention from every computer. Returns how many were dropped.</summary>
     public int PruneLogons() => InTx(() =>
     {
@@ -696,6 +780,8 @@ public sealed class Store : IDisposable
         var drop = Query("SELECT rowid AS id, data FROM computer_items WHERE kind = 'logons'")
             .Where(r => !KeepLogon(ParseObject(r["data"]), cutoff)).Select(r => (long)r["id"]!).ToList();
         foreach (var id in drop) Execute("DELETE FROM computer_items WHERE rowid = ?", id);
+        // a removal older than the retention guards nothing any more (older events are not kept anyway)
+        Execute("DELETE FROM user_removed WHERE removed_at < ?", cutoff);
         if (drop.Count > 0) Bump();
         return drop.Count;
     });
@@ -760,7 +846,9 @@ public sealed class Store : IDisposable
             // the user logged on while the computer was scanned goes into the logon history too (once a day)
             var current = CurrentUserLogon(guid, scalars["logged_on_user"] is JsonValue cu && cu.GetValueKind() == JsonValueKind.String ? cu.GetValue<string>() : null,
                                            DateTimeOffset.UtcNow);
-            if (current is not null && !inventory.ContainsKey("logons")) MergeLogons(guid, [current]);
+            // this collection's local accounts (the logons are written before them)
+            var freshAccounts = inventory["user_accounts"] is JsonArray ua ? ua.ToList() : null;
+            if (current is not null && !inventory.ContainsKey("logons")) MergeLogons(guid, [current], freshAccounts);
             foreach (var kind in Db.ListKinds)
             {
                 if (!inventory.TryGetPropertyValue(kind, out var section)) continue;   // section failed: keep the old rows
@@ -774,7 +862,7 @@ public sealed class Store : IDisposable
                 if (kind == "logons")
                 {
                     if (current is not null) list = [.. list, current];
-                    MergeLogons(guid, list);                  // event log + login-tracking files: merge, do not replace
+                    MergeLogons(guid, list, freshAccounts);                  // event log + login-tracking files: merge, do not replace
                     continue;
                 }
                 Execute("DELETE FROM computer_items WHERE guid = ? AND kind = ?", guid, kind);
@@ -819,11 +907,17 @@ public sealed class Store : IDisposable
         Query("SELECT kind, COUNT(*) AS n FROM computer_items WHERE guid = ? GROUP BY kind", guid)
             .ToDictionary(r => (string)r["kind"]!, r => (int)(long)r["n"]!);
 
-    /// <summary>Every stored logon event of the visible computers: (computer guid, event).</summary>
-    public List<(string Guid, JsonObject Event)> LogonRows() =>
-        [.. Query("SELECT i.guid, i.data FROM computer_items i JOIN computers c ON c.guid = i.guid "
-                  + "WHERE i.kind = 'logons' AND c.hidden = 0")
-            .Select(r => ((string)r["guid"]!, ParseObject(r["data"])))];
+    /// <summary>Every stored logon event of the visible computers: (computer guid, event). Local accounts and removed
+    /// users are never returned (even if stored before the rules applied).</summary>
+    public List<(string Guid, JsonObject Event)> LogonRows()
+    {
+        var local = LocalDomainsByComputer();
+        var removed = RemovedUsers();
+        return [.. Query("SELECT i.guid, i.data FROM computer_items i JOIN computers c ON c.guid = i.guid "
+                         + "WHERE i.kind = 'logons' AND c.hidden = 0")
+            .Select(r => ((string)r["guid"]!, ParseObject(r["data"])))
+            .Where(x => !(local.TryGetValue(x.Item1, out var d) && CollectorModel.IsLocalLogon(x.Item2, d)) && !IsRemoved(x.Item2, removed))];
+    }
 
     /// <summary>The visible computers whose collected hotfix list names <paramref name="kb"/> ("KB5043080").</summary>
     public HashSet<string> ComputersWithHotfix(string kb) =>

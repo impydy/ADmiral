@@ -176,7 +176,7 @@ $xp = '*[System[(EventID=4624)]] and *[EventData[Data[@Name="LogonType"]="2" or 
 $r.logons = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 3000 | Where-Object {
     $u = [string]$_.Properties[5].Value; $d = [string]$_.Properties[6].Value
     $u -and $u -notmatch '\$$' -and $u -notmatch '^(DWM|UMFD)-\d+$' -and
-    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host', $env:COMPUTERNAME, '.') -and
+    $d -notin @('NT AUTHORITY', 'NT SERVICE', 'Window Manager', 'Font Driver Host', 'MicrosoftAccount', $env:COMPUTERNAME, '.') -and
     $u -notin @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE', 'ANONYMOUS LOGON') } |
   Select-Object -First 300 | ForEach-Object {
   [ordered]@{ time = D $_.TimeCreated; user = [string]$_.Properties[5].Value; domain = [string]$_.Properties[6].Value;

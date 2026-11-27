@@ -152,6 +152,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         Store = store ?? new Store(settings.DbPath);
         Store.LogonRetentionDays = settings.Logins.RetentionDays;
         Store.PruneLogons();                                                 // the history is kept for logins.retention_days
+        Store.PurgeLocalLogons();                                            // local accounts are never part of the history
         Directory = directory ?? MakeDirectory(settings);
         ConfigPath = configPath;
         Secrets = secrets ?? new SecretStore(null);
@@ -2192,8 +2193,9 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         }
     }
 
-    /// <summary>At start-up (after a short pause) and then every 24 hours: look for a new version.</summary>
-    public void AppUpdateLoop(CancellationToken stop, double firstDelaySeconds = 20)
+    /// <summary>At start-up (after a few seconds, so the window opens first) and then every 24 hours: look for a new
+    /// version. The page asks for the result of this first check and offers the update in a dialog.</summary>
+    public void AppUpdateLoop(CancellationToken stop, double firstDelaySeconds = 3)
     {
         if (Wait(TimeSpan.FromSeconds(firstDelaySeconds), stop)) return;
         while (true)
@@ -2241,11 +2243,13 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         ["checked"] = checkedAt, ["error"] = null, ["latest"] = null, ["available"] = false, ["previous"] = null, ["notes"] = "",
     };
 
-    /// <summary>{checked, error, latest, available, previous, notes, current, enabled, url, can_install, has_key}.</summary>
+    /// <summary>{checked, fresh, error, latest, available, previous, notes, current, enabled, url, can_install, has_key};
+    /// fresh: the result is from a check of this run (not only the time of an earlier run's check).</summary>
     public Row AppUpdateState()
     {
         Row st;
         lock (_appUpdateLock) st = new Row(_appUpdate);
+        st["fresh"] = st["checked"] is not null;
         if (st["checked"] is null)                     // the last check of an earlier run (kept in the database)
             st["checked"] = Store.UpdateReference().Meta.GetValueOrDefault("app_checked") is { Length: > 0 } c ? c : null;
         var cfg = Settings.AppUpdate;
@@ -2621,7 +2625,6 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         public required string Key { get; init; }
         public required string Name { get; init; }
         public required string Domain { get; init; }
-        public bool Local { get; init; }
         public JsonObject? Ad { get; init; }
         public Dictionary<string, CompAgg> Computers { get; } = [];
         public List<JsonObject> Events { get; } = [];
@@ -2649,13 +2652,12 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             var domain = Str(ev["domain"]);
             var user = Str(ev["user"]);
             var time = Str(ev["time"]);
-            var local = string.Equals(domain, host, StringComparison.OrdinalIgnoreCase);      // a local account of that computer
             var key = $"{domain.ToLowerInvariant()}\\{user.ToLowerInvariant()}";
             if (!users.TryGetValue(key, out var u))
             {
-                var rec = local ? null : ad.GetValueOrDefault(user.ToLowerInvariant());
+                var rec = ad.GetValueOrDefault(user.ToLowerInvariant());
                 if (rec is not null && Db.Truthy(rec["missing"])) rec = null;
-                users[key] = u = new UserAgg { Key = key, Name = user, Domain = domain, Local = local, Ad = rec };
+                users[key] = u = new UserAgg { Key = key, Name = user, Domain = domain, Ad = rec };
             }
             if (!u.Computers.TryGetValue(guid, out var c))
                 u.Computers[guid] = c = new CompAgg { Guid = guid, Name = host, First = time, Last = time };
@@ -2669,13 +2671,13 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
             u.Events.Add(e);
         }
         // users imported from an Active Directory OU who never logged on to a collected computer
-        var seen = users.Values.Where(u => !u.Local).Select(u => u.Name.ToLowerInvariant()).ToHashSet();
+        var seen = users.Values.Select(u => u.Name.ToLowerInvariant()).ToHashSet();
         var netbios = IsDemo ? "CONTOSO" : Kerberos.RealmFromBaseDn(Settings.Ldap.BaseDn).Split('.')[0].ToUpperInvariant();
         foreach (var (sam, rec) in ad)
         {
             if (Db.Truthy(rec["missing"]) || !Db.Truthy(rec["imported"]) || seen.Contains(sam)) continue;
             var key = $"{netbios.ToLowerInvariant()}\\{sam}";
-            users[key] = new UserAgg { Key = key, Name = Str(rec["sam"]) is { Length: > 0 } s ? s : sam, Domain = netbios, Local = false, Ad = rec };
+            users[key] = new UserAgg { Key = key, Name = Str(rec["sam"]) is { Length: > 0 } s ? s : sam, Domain = netbios, Ad = rec };
         }
         return users;
     }
@@ -2697,7 +2699,7 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         string Text(string k) => AdValue(ad, k) is string s ? s : "";
         return new Row
         {
-            ["key"] = u.Key, ["name"] = u.Name, ["domain"] = u.Domain, ["local"] = u.Local,
+            ["key"] = u.Key, ["name"] = u.Name, ["domain"] = u.Domain,
             ["display_name"] = Text("display_name"), ["department"] = Text("department"), ["title"] = Text("title"), ["mail"] = Text("mail"),
             ["enabled"] = AdValue(ad, "enabled"),
             ["in_ad"] = ad is { Count: > 0 }, ["computers"] = comps.Count, ["logons"] = comps.Sum(c => c.Count),
@@ -2706,7 +2708,24 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         };
     }
 
-    /// <summary>Every user seen in the logon history (or imported from AD), by display name.</summary>
+    /// <summary>Take users off the Users list (keys as listed: lower 'DOMAIN\user'). Their logon events are deleted and
+    /// not taken in again from the computers' event logs; an imported AD record is dropped. A later logon (or a new AD
+    /// import) lists the user again. Unknown keys are ignored. Returns the number of users removed.</summary>
+    public int RemoveUsers(IReadOnlyList<string> keys)
+    {
+        var index = UserIndex();
+        var found = keys.Select(k => (k ?? "").Trim().ToLowerInvariant()).Distinct()
+            .Select(k => index.GetValueOrDefault(k)).OfType<UserAgg>().ToList();
+        if (found.Count == 0) return 0;
+        var adKeys = found.Where(u => u.Ad is { } a && Db.Truthy(a["imported"])).Select(u => u.Name.ToLowerInvariant()).ToList();
+        var events = Store.RemoveUsers([.. found.Select(u => u.Key)], adKeys);
+        DataChanged();
+        Store.Log("remove-users", T("log.remove_users", ("n", found.Count), ("events", events)));
+        return found.Count;
+    }
+
+    /// <summary>Every user seen in the logon history (or imported from AD), by display name. Local accounts of the
+    /// computers are never listed.</summary>
     public List<Row> Users() =>
         [.. UserIndex().Values.Select(UserRow)
             .OrderBy(r => ((string)r["display_name"]! is { Length: > 0 } d ? d : (string)r["name"]!).ToLowerInvariant(), StringComparer.Ordinal)];
@@ -2738,7 +2757,6 @@ public sealed partial class AdmiralService : ISyncHost, IDisposable
         var need = new List<string>();
         foreach (var u in index.Values)
         {
-            if (u.Local) continue;
             var fresh = known.TryGetValue(u.Name.ToLowerInvariant(), out var old) && Db.ParseIso(Str(old["synced_at"])) is { } at && at > limit;
             if (force || !fresh) need.Add(u.Name);
         }

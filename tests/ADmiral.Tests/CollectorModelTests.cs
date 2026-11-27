@@ -71,4 +71,20 @@ public class CollectorModelTests
         Assert.Equal(CollectorModel.MaxLogons, clean.Count);
         Assert.Equal("2026-01-01T00:06:39", (string?)clean[0]["time"]);
     }
+
+    [Fact]
+    public void LocalDomainsCoverNetbiosDnsAndMicrosoftAccounts()
+    {
+        var d = CollectorModel.LocalDomains(["WORKSTATION-LONGNAME-01", "pc2.corp.local"],
+                                            CollectorModel.LocalAccountDomains([new JsonObject { ["type"] = "local", ["domain"] = "REALNAME" },
+                                                                                new JsonObject { ["type"] = "domain", ["domain"] = "CORP" }]));
+        Assert.Contains("workstation-lon", d);           // the 15-character NetBIOS name
+        Assert.Contains("PC2", d);
+        Assert.Contains("REALNAME", d);
+        Assert.Contains("microsoftaccount", d);
+        Assert.Contains(".", d);
+        Assert.DoesNotContain("CORP", d);                // a profile of a domain user is not a local domain
+        Assert.True(CollectorModel.IsLocalLogon(new JsonObject { ["domain"] = " realname " }, d));
+        Assert.False(CollectorModel.IsLocalLogon(new JsonObject { ["domain"] = "CORP" }, d));
+    }
 }

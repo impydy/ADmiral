@@ -131,8 +131,11 @@ a:hover { text-decoration: underline; }
 .tb-sep { width: 1px; background: var(--border-soft); margin: 4px 5px; flex: none; }
 
 /* ---------------------------------------------------------------- workspace */
-.workspace { display: grid; grid-template-columns: var(--tree-w, 270px) 5px 1fr; min-height: 0; padding: 6px 6px 0; }
-.tree-pane { display: flex; flex-direction: column; gap: 4px; min-height: 0; min-width: 0; }
+/* the tree column is as narrow as its longest visible line (at most 45% of the window); a drag overrides it until reload */
+.workspace { display: grid; grid-template-columns: var(--tree-w, fit-content(45vw)) 5px 1fr; min-height: 0; padding: 6px 6px 0; }
+.tree-pane { display: flex; flex-direction: column; gap: 4px; min-height: 0; min-width: 140px; }
+.tree-pane .tree-filter { width: 100%; min-width: 0; box-sizing: border-box; }
+.tree { scrollbar-gutter: stable; }
 .splitter { cursor: col-resize; }
 .tree-filter, .page-filter, .field-in {
   font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--field-border); padding: 3px 6px; border-radius: 0;
@@ -151,6 +154,8 @@ a:hover { text-decoration: underline; }
 .tn .lbl { overflow: hidden; text-overflow: ellipsis; }
 .tn.snav { padding: 4px 10px; cursor: pointer; }
 .tn.snav.sub { padding-left: 24px; color: var(--muted); }
+.tn.snav.grp { font-weight: 600; margin-top: 4px; }
+.tn.snav.grp:first-child { margin-top: 0; }
 .snav-col { display: flex; flex-direction: column; min-height: 100%; }
 .tn.snav.bottom { margin-top: auto; border-top-color: var(--border); }      /* pinned to the bottom of the column */
 .st-actions { display: inline-flex; gap: 8px; }
@@ -401,7 +406,25 @@ table.grid th.ts-th:hover { background: var(--head-hover); }
 .rail .rail-it.soon { opacity: .5; cursor: default; }
 .rail .rail-it.soon:hover { background: none; }
 .rail .rail-grow { flex: 1; }
+.au-dlg { max-width: 640px; }
+.au-notes { white-space: pre-line; max-height: 320px; overflow: auto; border: 1px solid var(--border); background: var(--panel-2); padding: 8px 10px; margin: 4px 0 10px; overflow-wrap: anywhere; }
 .rail .rail-sep { height: 1px; background: var(--border); margin: 7px 6px; }
+.rail .rail-brand .rail-ver { font-size: 11px; color: var(--faint); align-self: flex-end; padding-bottom: 2px; white-space: nowrap; }
+.rail .rail-fold { margin-left: auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0;
+  border: 1px solid transparent; border-radius: 4px; background: none; color: var(--faint); cursor: pointer; flex: none; }
+.rail .rail-fold:hover { background: var(--hover); color: var(--text); }
+.rail .rail-fold:focus-visible { outline: 2px solid var(--sel-border); outline-offset: 1px; }
+.rail .rail-fold .ic { transform: rotate(180deg); }
+/* folded: only the icons, a little larger */
+.rail.collapsed { width: 60px; padding: 10px 6px; overflow-x: hidden; }
+.rail.collapsed .rail-brand { flex-direction: column; gap: 8px; padding: 2px 0 8px; }
+.rail.collapsed .rail-brand img { width: 28px; height: 28px; }
+.rail.collapsed .rail-title, .rail.collapsed .rail-ver, .rail.collapsed .rail-it > span { display: none; }
+.rail.collapsed .rail-fold { margin-left: 0; }
+.rail.collapsed .rail-fold .ic { transform: none; }
+.rail.collapsed .rail-sec { font-size: 0; padding: 0; height: 1px; background: var(--border); margin: 8px 6px; }
+.rail.collapsed .rail-it { justify-content: center; padding: 8px 0; }
+.rail.collapsed .rail-it .ic { width: 24px; height: 24px; }
 .workspace.no-tree { grid-template-columns: 1fr; }
 .workspace.no-tree .tree-pane, .workspace.no-tree .splitter { display: none; }
 

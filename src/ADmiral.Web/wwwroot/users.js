@@ -2,7 +2,7 @@
    and the computers they used. Loaded after app.js (shares its helpers: $, api, t, esc, icon, S, ...). */
 "use strict";
 
-const US = { list: null, sort: store.get("usort", { key: "name", dir: 1 }), filter: "" };
+const US = { list: null, sort: store.get("usort", { key: "name", dir: 1 }), filter: "", picked: new Set() };
 
 const logonType = (n) => t("lt." + n);
 const userLabel = (u) => u.display_name || u.name;
@@ -28,7 +28,6 @@ const USER_COLS = [
 ];
 
 function adState(u) {
-  if (u.local) return ["faint", t("u.local")];
   if (!u.in_ad) return ["faint", t("u.not_in_ad")];
   return u.enabled === false ? ["st-bad", t("v.disabled")] : ["st-ok", t("v.enabled")];
 }
@@ -50,7 +49,7 @@ function drawUsers() {
   const rows = usersFiltered();
   US.shown = rows;
   const head = `<th class="rn"></th>` + USER_COLS.map((c) => `<th data-usort="${c.id}">${esc(t("ucol." + c.id))}${US.sort.key === c.id ? `<span class="arr">${US.sort.dir > 0 ? "▲" : "▼"}</span>` : ""}</th>`).join("");
-  const body = rows.slice(0, 2000).map((u, i) => `<tr data-ukey="${esc(u.key)}" data-i="${i}"${US.sel === u.key ? ' class="sel"' : ""}><td class="rn"></td>${USER_COLS.map((c) => `<td class="${c.num ? "num" : ""}">${c.html(u)}</td>`).join("")}</tr>`).join("");
+  const body = rows.slice(0, 2000).map((u, i) => `<tr data-ukey="${esc(u.key)}" data-i="${i}"${US.picked.has(u.key) ? ' class="sel"' : ""}><td class="rn"></td>${USER_COLS.map((c) => `<td class="${c.num ? "num" : ""}">${c.html(u)}</td>`).join("")}</tr>`).join("");
   wrap.innerHTML = rows.length ? `<table class="grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>` : `<div class="empty">${esc(t("u.empty"))}</div>`;
   if (S.section === "users") $("#sb-left").textContent = tText("sb.users", { n: rows.length });   // the status bar shows the count
 }
@@ -60,6 +59,7 @@ function renderUsersPage(el) {
     `<button class="btn" data-uact="refresh">${icon("sync", 16)}${esc(t("u.refresh"))}</button>
      <button class="btn" data-uact="import">${icon("sync", 16)}${esc(t("u.import"))}</button>
      <button class="btn" data-uact="details">${icon("details", 16)}${esc(t("tb.details"))}</button>
+     <button class="btn" data-uact="remove">${icon("block", 16)}${esc(t("u.remove"))}</button>
      <input class="page-filter" id="users-filter" type="search" placeholder="${esc(t("page.filter"))}" value="${esc(US.filter)}">`)
     + `<div class="grid-wrap" id="ugrid" tabindex="0"></div>`;
   $("#sb-left").textContent = t("u.loading");
@@ -74,15 +74,28 @@ function renderUsersPage(el) {
     }
     const tr = e.target.closest("tr[data-ukey]");
     if (!tr) return;
-    US.sel = tr.dataset.ukey;
-    $$("#ugrid tbody tr").forEach((r) => r.classList.toggle("sel", r === tr));
+    const key = tr.dataset.ukey;
+    if (e.shiftKey && US.sel) {                    // a range from the last clicked row
+      const keys = (US.shown || []).map((u) => u.key);
+      const [a, b] = [keys.indexOf(US.sel), keys.indexOf(key)].sort((x, y) => x - y);
+      if (a >= 0) { if (!e.ctrlKey && !e.metaKey) US.picked.clear(); keys.slice(a, b + 1).forEach((k) => US.picked.add(k)); }
+    } else if (e.ctrlKey || e.metaKey) {
+      if (US.picked.has(key)) US.picked.delete(key); else US.picked.add(key);
+      US.sel = key;
+    } else {
+      US.picked = new Set([key]);
+      US.sel = key;
+    }
+    $$("#ugrid tbody tr").forEach((r) => r.classList.toggle("sel", US.picked.has(r.dataset.ukey)));
   });
+  grid.addEventListener("keydown", (e) => { if (e.key === "Delete" && US.picked.size) { e.preventDefault(); removeUsers([...US.picked]); } });
   grid.addEventListener("dblclick", (e) => { const tr = e.target.closest("tr[data-ukey]"); if (tr) openUser(tr.dataset.ukey); });
   let tmr;
   $("#users-filter").oninput = (e) => { clearTimeout(tmr); tmr = setTimeout(() => { US.filter = e.target.value; drawUsers(); }, 120); };
   $$("[data-uact]", el).forEach((b) => (b.onclick = async () => {
     if (b.dataset.uact === "details") { if (US.sel) openUser(US.sel); return; }
     if (b.dataset.uact === "import") return adBrowserDialog("users");
+    if (b.dataset.uact === "remove") return removeUsers([...US.picked]);
     const r = await guard(() => api("POST", "/api/users/refresh"));
     if (r) { toast(tText("u.refreshed", { n: r.updated })); await loadUsers(); drawUsers(); renderTree(); }
   }));
@@ -98,6 +111,27 @@ function renderUsersPage(el) {
       if (S.section === "users") $("#sb-left").textContent = tText("sb.users", { n: (US.shown || US.list || []).length });
     }
   })();
+}
+
+/* Take users off the list (their stored logons are deleted; a later logon lists them again). */
+async function removeUsers(keys) {
+  // the rows on screen (US.list is dropped whenever a background job ends, while the grid still shows them)
+  const rows = US.shown || US.list || [];
+  const shown = new Set(rows.map((u) => u.key));
+  keys = keys.filter((k) => shown.has(k) || S.uw?.key === k);
+  if (!keys.length) return toast(t("u.remove_none"), true);
+  const one = keys.length === 1 ? rows.find((u) => u.key === keys[0]) || S.uw?.data : null;
+  const text = one ? tText("u.remove_confirm_one", { name: `${userLabel(one)} (${userAccount(one)})` }) : tText("u.remove_confirm", { n: keys.length });
+  if (!(await confirmDialog(text, { safe: true, yes: t("u.remove") }))) return;
+  const r = await guard(() => api("POST", "/api/users/remove", { keys }));
+  if (!r) return;
+  toast(tText("u.removed", { n: r.removed }));
+  US.picked.clear();
+  US.sel = null;
+  if (S.uw) closeUser();
+  await loadUsers();
+  drawUsers();
+  renderTree();
 }
 
 /* ------------------------------------------------------------------ user window */
@@ -135,7 +169,7 @@ function uwStep(d) {
 function renderUwToolbar() {
   const b = (id, ic, label) => `<button class="tb" data-uw="${id}">${icon(ic, 30)}<span>${esc(t(label))}</span></button>`;
   $("#uwin-toolbar").innerHTML = b("prev", "prev", "u.prev") + b("next", "next", "u.next") + `<span class="tb-sep"></span>`
-    + b("copy", "copy", "tb.copy") + b("close", "back", "cw.close");
+    + b("copy", "copy", "tb.copy") + b("remove", "block", "u.remove") + b("close", "back", "cw.close");
 }
 
 function renderUser() {
@@ -150,7 +184,7 @@ function renderUser() {
   $("#uwin-head").innerHTML = `${icon("user", 30)}<span>${esc(userLabel(u))}</span><span class="faint">${esc(userAccount(u))}</span><span class="grow"></span><span class="${cls}">${esc(label)}</span>`;
   const msg = $("#uwin-msg");
   msg.className = "cwin-msg";
-  msg.hidden = u.in_ad || u.local;
+  msg.hidden = u.in_ad;
   if (!msg.hidden) msg.innerHTML = `${icon("info", 16)}${esc(t("u.no_ad"))}`;
   $("#uwin-status").textContent = u.last_logon ? `${t("u.last_seen")}: ${fmtDate(u.last_logon)} – ${u.last_computer}` : "";
   renderUwContent();
@@ -212,6 +246,7 @@ function bindUserWindow() {
       ({
         close: closeUser, prev: () => uwStep(-1), next: () => uwStep(1),
         copy: async () => { await copyText(userAccount(u)); toast(tText("copied", { n: 1 })); },
+        remove: () => removeUsers([S.uw.key]),
       })[b.dataset.uw]?.();
       return;
     }

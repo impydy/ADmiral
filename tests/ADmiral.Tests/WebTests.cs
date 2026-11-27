@@ -218,6 +218,10 @@ public sealed class WebTests : IDisposable
         Assert.NotEmpty(one["computer_list"]!.AsArray());
         Assert.Equal(404, W.Get("/api/users/nope").Code());
         Assert.True((int)WebFixture.Json(W.Post("/api/users/refresh"))["updated"]! >= 1);
+        Assert.Equal(1, (int)WebFixture.Json(W.Post("/api/users/remove", new { keys = new[] { key } }))["removed"]!);
+        Assert.DoesNotContain(W.GetJson("/api/users").AsArray(), r => (string)r!["key"]! == key);
+        Assert.Equal(404, W.Get("/api/users/" + Uri.EscapeDataString(key)).Code());
+        Assert.Equal(422, W.Post("/api/users/remove", new { keys = "x" }).Code());   // not a list
     }
 
     // ---------------------------------------------------------------- test_software.py

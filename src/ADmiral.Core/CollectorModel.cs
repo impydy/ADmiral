@@ -46,6 +46,36 @@ public static partial class CollectorModel
         return d == "." || string.Equals(d, computerName.Trim(), StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>The account-database names that mean "a local account of this computer" in a logon event: ".", the
+    /// computer's name (also cut to the 15-character NetBIOS name, and the first label of its DNS name), the domain of
+    /// its collected local accounts (Win32_UserAccount: the real COMPUTERNAME, even when the AD name differs), every
+    /// other known computer's name (a renamed or cloned computer's older events) and "MicrosoftAccount" (a Microsoft
+    /// account signed in to Windows is a local account of that computer).</summary>
+    public static HashSet<string> LocalDomains(IEnumerable<string?> computerNames, IEnumerable<string?>? accountDomains = null)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".", "MicrosoftAccount" };
+        void Add(string? n)
+        {
+            var v = (n ?? "").Trim();
+            if (v.Length == 0) return;
+            var dot = v.IndexOf('.', StringComparison.Ordinal);
+            if (dot > 0) v = v[..dot];
+            set.Add(v);
+            if (v.Length > 15) set.Add(v[..15]);
+        }
+        foreach (var n in computerNames) Add(n);
+        foreach (var d in accountDomains ?? []) Add(d);
+        return set;
+    }
+
+    /// <summary>The domains of the local accounts in a collected <c>user_accounts</c> list (rows with type "local").</summary>
+    public static IEnumerable<string?> LocalAccountDomains(IEnumerable<JsonNode?>? accounts) =>
+        (accounts ?? []).OfType<JsonObject>().Where(a => Str(a["type"]) == "local").Select(a => Str(a["domain"]));
+
+    /// <summary>Is the logon event <paramref name="e"/> ({domain, ...}) one of a local account?</summary>
+    public static bool IsLocalLogon(JsonObject e, ISet<string> localDomains) =>
+        localDomains.Contains((Str(e["domain"]) ?? "").Trim());
+
     /// <summary>"COMPUTER\\user" / ".\\user" of that computer's own (local) account?</summary>
     public static bool IsLocalAccountName(string? account, string? computerName)
     {
@@ -57,7 +87,12 @@ public static partial class CollectorModel
     /// <summary>Keep real users' interactive logons, newest first, without duplicates, at most <see cref="MaxLogons"/>.
     /// Each result is <c>{time, user, domain, type, ip}</c>. With <paramref name="computerName"/>, the logons of that
     /// computer's local accounts (domain = the computer name, or ".") are dropped too.</summary>
-    public static List<JsonObject> CleanLogons(IEnumerable<JsonNode?>? rows, string? computerName = null)
+    public static List<JsonObject> CleanLogons(IEnumerable<JsonNode?>? rows, string? computerName = null) =>
+        CleanLogons(rows, string.IsNullOrWhiteSpace(computerName) ? null : LocalDomains([computerName]));
+
+    /// <summary><see cref="CleanLogons(IEnumerable{JsonNode?}?, string?)"/> with the local domains given
+    /// (<see cref="LocalDomains"/>); null drops no account as local.</summary>
+    public static List<JsonObject> CleanLogons(IEnumerable<JsonNode?>? rows, ISet<string>? localDomains)
     {
         var seen = new HashSet<(string, string, string, int)>();
         var outList = new List<JsonObject>();
@@ -66,7 +101,7 @@ public static partial class CollectorModel
             if (node is not JsonObject r) continue;
             var user = Str(r["user"]);
             var domain = Str(r["domain"]);
-            if (!RealUser(domain, user) || IsLocalDomain(domain, computerName)) continue;
+            if (!RealUser(domain, user) || (localDomains is not null && localDomains.Contains((domain ?? "").Trim()))) continue;
             if (Int(r["type"]) is not { } typ || !LogonTypes.ContainsKey(typ)) continue;
             var time = Str(r["time"]);
             if (string.IsNullOrEmpty(time)) continue;

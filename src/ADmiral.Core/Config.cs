@@ -638,8 +638,9 @@ public static class Config
         refresh_days = 7
 
         [packages]
-        # Package library: installers (.msi / .exe) added by hand on the Packages page, with their versions. The
-        # folder gets a packages.json with the SHA-256 of every file. Empty = a "packages" folder next to the database.
+        # Package library: the installers (.msi / .exe, per version) and Windows updates (.msu / .cab, per Windows build)
+        # added on the Package library page; the chains of the Packages page use them. The folder gets a packages.json
+        # with the size and SHA-256 of every file, checked before a deployment. Empty = a "packages" folder next to the database.
         folder = ""
 
         [deploy]

@@ -258,6 +258,75 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
     await p.fill("#users-filter", "zz-no-such-user");
     await p.waitForSelector("#ugrid .empty");
     await p.fill("#users-filter", "");
+    await p.waitForSelector("#ugrid tbody tr");
+  });
+  await step("a user can be removed from the users list (after a confirmation)", async () => {
+    await p.evaluate(() => { US.list = null; });                // as after a background job: the grid still shows the rows
+    const before = await p.locator("#ugrid tbody tr").count();
+    const key = await p.getAttribute("#ugrid tbody tr:first-child", "data-ukey");
+    await p.click("#ugrid tbody tr:first-child td:nth-child(2)");
+    await p.click("[data-uact='remove']");
+    await p.waitForSelector(".cfm-layer", { timeout: 5000 }).catch(async (e) => {
+      throw new Error("no dialog: " + JSON.stringify(await p.evaluate(() => [[...US.picked], US.sel, (US.list || []).length,
+        document.querySelectorAll("#ugrid tbody tr.sel").length, [...document.querySelectorAll(".toast")].map((x) => x.textContent)])));
+    });
+    await p.keyboard.press("Enter");                         // Enter means Cancel in this dialog: nothing removed
+    await p.waitForSelector(".cfm-layer", { state: "detached" });
+    check((await p.locator("#ugrid tbody tr").count()) === before, "cancel keeps the user");
+    await p.click("[data-uact='remove']");
+    await p.click(".cfm-layer [data-yes]");
+    await p.waitForFunction((k) => !document.querySelector(`#ugrid tr[data-ukey="${CSS.escape(k)}"]`), key);
+    check((await p.locator("#ugrid tbody tr").count()) === before - 1, "one user fewer");
+    await p.click(".rail-it[data-sec='devices']");
+  });
+  await step("a new version found at start-up is offered with its notes", async () => {
+    const fake = { enabled: true, fresh: true, available: true, error: null, latest: "99.0.0", current: "0.7.0",
+                   notes: "- faster scans\n<b>not bold</b>", can_install: false, previous: null };
+    await p.route("**/api/appupdate", (r) => r.request().method() === "GET"
+      ? r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fake) }) : r.continue());
+    await p.evaluate(() => { S.auPrompted = false; appUpdatePrompt(); });
+    await p.waitForSelector(".au-layer .au-notes");
+    const notes = await p.textContent(".au-layer .au-notes");
+    check(notes.includes("- faster scans") && notes.includes("<b>not bold</b>"), "release notes shown as text");
+    check((await p.textContent(".au-layer")).includes("99.0.0"), "new version named");
+    check(!(await p.locator(".au-layer [data-yes]").count()), "no install button where the program cannot update itself");
+    await p.keyboard.press("Enter");                                // Enter never installs: it closes
+    await p.waitForSelector(".au-layer", { state: "detached" });
+    await p.unroute("**/api/appupdate");
+  });
+  await step("the tree column fits its text and the splitter drags without a jump", async () => {
+    await p.click(".rail-it[data-sec='devices']");
+    await p.waitForSelector("#tree .tn");
+    check(await p.evaluate(() => [...document.querySelectorAll("#tree .lbl")].every((l) => l.scrollWidth <= l.clientWidth)), "no tree label cut");
+    const box = await p.locator("#splitter").boundingBox();
+    const w0 = (await p.locator(".tree-pane").boundingBox()).width;
+    const x = box.x + box.width / 2, y = box.y + 80;
+    await p.mouse.move(x, y);
+    await p.mouse.down();
+    await p.mouse.move(x + 1, y);
+    const w1 = (await p.locator(".tree-pane").boundingBox()).width;
+    check(Math.abs(w1 - w0 - 1) < 2, `no jump on grab (${w0} -> ${w1})`);
+    await p.mouse.move(x + 61, y);
+    const w2 = (await p.locator(".tree-pane").boundingBox()).width;
+    check(Math.abs(w2 - w0 - 61) < 2, `follows the pointer (${w0} -> ${w2})`);
+    await p.mouse.up();
+    await p.dblclick("#splitter");                                // back to fitting the text
+    check(Math.abs((await p.locator(".tree-pane").boundingBox()).width - w0) < 2, "double click fits the text again");
+  });
+  await step("the rail shows the version and folds to its icons", async () => {
+    check(/^\d+\.\d+/.test((await p.textContent("#rail .rail-ver")) || ""), "version after the title");
+    const wide = (await p.locator("#rail").boundingBox()).width;
+    await p.click("#rail [data-rail='fold']");
+    await p.waitForSelector("#rail.collapsed");
+    check((await p.locator("#rail").boundingBox()).width < wide / 2, "folded rail is narrow");
+    check(!(await p.isVisible("#rail .rail-it[data-sec='users'] span")), "labels hidden");
+    check((await p.getAttribute("#rail .rail-it[data-sec='users']", "title")) !== null, "label as tooltip");
+    await p.click("#rail .rail-it[data-sec='users']");            // the icons still navigate
+    await p.waitForSelector("#ugrid");
+    await p.reload();
+    await p.waitForSelector("#rail.collapsed");                     // remembered
+    await p.click("#rail [data-rail='fold']");
+    await p.waitForSelector("#rail:not(.collapsed) .rail-title");
     await p.click(".rail-it[data-sec='devices']");
   });
   await step("dark theme via menu", async () => {
@@ -273,14 +342,21 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); };
   });
   await step("settings page test connection", async () => {
     await p.click(".rail-it[data-sec='settings']");          // Settings live at the bottom of the left rail
+    await p.waitForSelector("#tree .snav.grp");
+    check((await p.locator(".snav.grp").count()) >= 6, "settings groups in the left column");
+    // one group at a time: a section's item shows its group only
+    await p.click("#tree [data-snav='directory']");
     await p.waitForSelector("#st-test");
-    check((await p.locator(".snav").count()) > 5, "settings category jump list");
+    check(await p.evaluate(() => [...document.querySelectorAll("#settings .section:not([hidden])")].map((x) => x.dataset.sk).join()) === "directory,proxy,sync",
+          "only the Connections group is shown");
+    check(await p.isHidden("#ssec-appearance"), "other groups hidden");
     check(await p.isVisible("#st-save") || !(await p.locator("#st-save").count()), "save button visible");
     await p.click("#st-test");
     await p.waitForFunction(() => document.querySelector("#st-test-out").textContent.includes("✓"));
     check((await p.inputValue("#st-theme")) === "dark", "theme persisted");
   });
   await step("untrusted PAC switch asks for confirmation", async () => {
+    await p.click("#tree [data-snav='proxy']");
     // Cancel (and Enter, which means Cancel here) leaves it off; only the explicit button turns it on
     await p.click("#proxy-untrusted-pac");
     await p.waitForSelector(".cfm-layer");

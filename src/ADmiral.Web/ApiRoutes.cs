@@ -416,6 +416,9 @@ public static partial class WebApp
         app.MapGet("/api/winupdates", () => J(a.WinUpdates()));
         app.MapGet("/api/users", () => J(a.Users()));
         app.MapPost("/api/users/refresh", () => J(Obj(("updated", a.SyncUsers(force: true)))));
+        // a block body: an expression lambda of only HttpContext would bind as a RequestDelegate and drop the result
+        app.MapPost("/api/users/remove", async (HttpContext ctx) => { return
+            J(Obj(("removed", a.RemoveUsers((await JsonBody.ReadAsync(ctx)).StrList("keys"))))); });
         app.MapGet("/api/users/{**key}", (HttpContext ctx) => J(a.User(PathRest(ctx, "/api/users/"))));
 
         // ----------------------------------------------------------------- sync, retry service, AD browser

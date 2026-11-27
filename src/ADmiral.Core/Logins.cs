@@ -148,11 +148,11 @@ if ($new.Count) {
         return (computer, events[0]);
     }
 
-    /// <summary>A logon of a local account of that computer (its domain is the computer name, or "."), not a domain user.</summary>
+    /// <summary>A logon of a local account of that computer (its domain is the computer name, ".", or MicrosoftAccount),
+    /// not a domain user.</summary>
     public static bool IsLocalAccount(string computer, JsonObject ev)
     {
-        var domain = ((string?)ev["domain"] ?? "").Trim();
-        return domain == "." || string.Equals(domain, computer.Trim(), StringComparison.OrdinalIgnoreCase);
+        return CollectorModel.IsLocalLogon(ev, CollectorModel.LocalDomains([computer]));
     }
 
     /// <summary>The files of the script before 0.6.2 (<c>&lt;computer&gt;_&lt;time&gt;_&lt;session&gt;.tmp</c>), left
@@ -282,7 +282,7 @@ if ($new.Count) {
                 ("names", string.Join(", ", oldScript.Take(Shown)) + (oldScript.Count > Shown ? $" (+{oldScript.Count - Shown})" : ""))));
         }
         if (outp.Imported > 0 || outp.Failed > 0)
-            store.Log("logins", I18n.T("log.logins", ("imported", outp.Imported), ("found", outp.Found),
+            store.Log("logins", I18n.T("log.logins", ("imported", outp.Imported), ("found", outp.Found - outp.Local),
                                        ("unknown", outp.Unknown), ("failed", outp.Failed)));
         return outp;
     }
